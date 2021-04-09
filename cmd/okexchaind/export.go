@@ -33,7 +33,7 @@ func export(ctx *server.Context) {
 	version := fromRs.LastCommitID().Version
 	log.Println("export app version ", version)
 
-	err := fromRs.Export(toRs, version)
+	err := fromRs.Export(toRs, version-1)
 	if err != nil {
 		panicError(err)
 	}
