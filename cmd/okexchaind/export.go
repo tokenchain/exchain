@@ -30,7 +30,10 @@ func export(ctx *server.Context) {
 	fromRs, _ := fromApp.BaseApp.GetCms().(*rootmulti.Store)
 	toRs := toApp.BaseApp.GetCms().(*rootmulti.Store)
 
-	err := fromRs.Export(toRs, fromRs.LastCommitID().Version)
+	version := fromRs.LastCommitID().Version
+	log.Println("export app version ", version)
+
+	err := fromRs.Export(toRs, version)
 	if err != nil {
 		panicError(err)
 	}
