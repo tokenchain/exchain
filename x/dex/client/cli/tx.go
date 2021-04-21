@@ -298,7 +298,7 @@ func getCmdRegisterOperator(cdc *codec.Codec) *cobra.Command {
 		Args:  cobra.ExactArgs(0),
 		Long: strings.TrimSpace(`Register a dex operator:
 
-$ okexchaincli tx dex register-operator --website http://xxx/operator.json --handling-fee-address addr --from mykey
+$ exchaincli tx dex register-operator --website http://xxx/operator.json --handling-fee-address addr --from mykey
 `),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cliCtx := context.NewCLIContext().WithCodec(cdc)
@@ -341,7 +341,7 @@ func getCmdEditOperator(cdc *codec.Codec) *cobra.Command {
 		Args:  cobra.ExactArgs(0),
 		Long: strings.TrimSpace(`Edit a dex operator:
 
-$ okexchaincli tx dex edit-operator --website http://xxx/operator.json --handling-fee-address addr --from mykey
+$ exchaincli tx dex edit-operator --website http://xxx/operator.json --handling-fee-address addr --from mykey
 `),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cliCtx := context.NewCLIContext().WithCodec(cdc)
