@@ -53,37 +53,37 @@ func pruningCmd(ctx *server.Context) *cobra.Command {
 			config := ctx.Config
 			config.SetRoot(viper.GetString(flags.FlagHome))
 			log.Println("--------- pruning start ---------")
-			blockStoreDB, stateDB, appDB, err := initDBs(config, node.DefaultDBProvider)
+			_, _, appDB, err := initDBs(config, node.DefaultDBProvider)
 			if err != nil {
 				return err
 			}
 
-			blockStore := store.NewBlockStore(blockStoreDB)
-			baseHeight := blockStore.Base()
-			size := blockStore.Size()
-			retainHeight := baseHeight + size - 2
-			log.Printf("Data info: baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
-
-			start := viper.GetInt64(flagStart)
-			if start < baseHeight || start >= retainHeight {
-				start = baseHeight
-			}
-			end := viper.GetInt64(flagEnd)
-			if end <= start || end >= retainHeight || end <= baseHeight {
-				end = retainHeight
-			}
-			log.Printf("Pruning info: start=%d, end=%d\n", start, end)
-
-			if viper.GetBool(flagBlock) {
-				wg.Add(2)
-				go pruneBlocks(blockStore, start, end)
-				go pruneStates(stateDB, start, end)
-			}
-			if viper.GetBool(flagApp) {
-				wg.Add(1)
-				go pruneApp(appDB, start, end)
-			}
-			wg.Wait()
+			//blockStore := store.NewBlockStore(blockStoreDB)
+			//baseHeight := blockStore.Base()
+			//size := blockStore.Size()
+			//retainHeight := baseHeight + size - 2
+			//log.Printf("Data info: baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
+			//
+			//start := viper.GetInt64(flagStart)
+			//if start < baseHeight || start >= retainHeight {
+			//	start = baseHeight
+			//}
+			//end := viper.GetInt64(flagEnd)
+			//if end <= start || end >= retainHeight || end <= baseHeight {
+			//	end = retainHeight
+			//}
+			//log.Printf("Pruning info: start=%d, end=%d\n", start, end)
+			//
+			//if viper.GetBool(flagBlock) {
+			//	wg.Add(2)
+			//	go pruneBlocks(blockStore, start, end)
+			//	go pruneStates(stateDB, start, end)
+			//}
+			//if viper.GetBool(flagApp) {
+			//	wg.Add(1)
+			pruneApp(appDB, 0, 0)
+			//}
+			//wg.Wait()
 			log.Println("--------- pruning end ---------")
 			return nil
 		},
@@ -97,15 +97,15 @@ func pruningCmd(ctx *server.Context) *cobra.Command {
 }
 
 func initDBs(config *cfg.Config, dbProvider node.DBProvider) (blockStoreDB, stateDB, appDB dbm.DB, err error) {
-	blockStoreDB, err = dbProvider(&node.DBContext{"blockstore", config})
-	if err != nil {
-		return
-	}
-
-	stateDB, err = dbProvider(&node.DBContext{"state", config})
-	if err != nil {
-		return
-	}
+	//blockStoreDB, err = dbProvider(&node.DBContext{"blockstore", config})
+	//if err != nil {
+	//	return
+	//}
+	//
+	//stateDB, err = dbProvider(&node.DBContext{"state", config})
+	//if err != nil {
+	//	return
+	//}
 
 	appDB, err = dbProvider(&node.DBContext{"application", config})
 	if err != nil {
@@ -149,25 +149,18 @@ func pruneStates(stateDB dbm.DB, from, to int64) {
 
 // pruneApp deletes app states between the given heights (including from, excluding to).
 func pruneApp(appDB dbm.DB, from, to int64) {
-	defer wg.Done()
-
-	if to <= from {
-		return
-	}
-
 	rs := initAppStore(appDB)
 	latestV := rs.GetLatestVersion()
-	if to > latestV {
-		return
-	}
+
+	log.Println("LatestVersion=", latestV)
 	versions := rs.GetVersions()
-	if len(versions) == 0 {
-		return
-	}
+	log.Println("Versions=", versions)
+
 	pruneHeights := rs.GetPruningHeights()
+	log.Println("pruneHeights=", pruneHeights)
 
 	for _, v := range versions {
-		if v >= to {
+		if v >= latestV {
 			break
 		}
 		pruneHeights = append(pruneHeights, v)
@@ -181,13 +174,14 @@ func pruneApp(appDB dbm.DB, from, to int64) {
 			// it to get the underlying IAVL store.
 			store = rs.GetCommitKVStore(key)
 
-			if err := store.(*iavl.Store).DeleteVersions(pruneHeights...); err != nil {
+			if err := store.(*iavl.Store).DeleteVersions(pruneHeights[0]); err != nil {
 				log.Printf("failed to delete version: %s", err)
 			}
 		}
 	}
 
-	pruneHeights = make([]int64, 0)
+	pruneHeights = pruneHeights[1:]
+	log.Println("pruneHeights=", pruneHeights)
 	rs.FlushPruneHeights(pruneHeights, versions)
 	log.Println("Prune app store end!")
 }
