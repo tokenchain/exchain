@@ -40,29 +40,77 @@ import (
 
 func pruningCmd(ctx *server.Context) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "pruning",
-		Short: "Pruning blocks",
+		Use:   "pruning [all|app|block|state]",
+		Short: "Pruning store",
+		Long: `all   : pruning all of application, blockstore and state db
+app   : only pruning application db
+block : only pruning blockstore db
+state : only pruning state db
+`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return fmt.Errorf("invalid args")
+			}
+
 			config := ctx.Config
 			config.SetRoot(viper.GetString(flags.FlagHome))
-			log.Println("--------- pruning start ---------")
 			blockStoreDB, stateDB, appDB, err := initDBs(config, node.DefaultDBProvider)
 			if err != nil {
 				return err
 			}
 
-			blockStore := store.NewBlockStore(blockStoreDB)
-			baseHeight := blockStore.Base()
-			size := blockStore.Size()
-			retainHeight := baseHeight + size - 2
-			log.Printf("baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
+			switch args[0] {
+			case "app":
+				log.Println("--------- pruning app start ---------")
+				blockStore := store.NewBlockStore(blockStoreDB)
+				baseHeight := blockStore.Base()
+				size := blockStore.Size()
+				retainHeight := baseHeight + size - 2
+				log.Printf("baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
 
-			wg.Add(3)
-			go pruneBlocks(blockStore, baseHeight, retainHeight)
-			go pruneStates(stateDB, baseHeight, retainHeight)
-			go pruneApp(appDB, baseHeight, retainHeight)
-			wg.Wait()
-			log.Println("--------- pruning end ---------")
+				wg.Add(1)
+				go pruneApp(appDB, baseHeight, retainHeight)
+				wg.Wait()
+				log.Println("--------- pruning app end ---------")
+			case "block":
+				log.Println("--------- pruning block start ---------")
+				blockStore := store.NewBlockStore(blockStoreDB)
+				baseHeight := blockStore.Base()
+				size := blockStore.Size()
+				retainHeight := baseHeight + size - 2
+				log.Printf("baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
+
+				wg.Add(1)
+				go pruneBlocks(blockStore, baseHeight, retainHeight)
+				wg.Wait()
+				log.Println("--------- pruning block end ---------")
+			case "state":
+				log.Println("--------- pruning state start ---------")
+				blockStore := store.NewBlockStore(blockStoreDB)
+				baseHeight := blockStore.Base()
+				size := blockStore.Size()
+				retainHeight := baseHeight + size - 2
+				log.Printf("baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
+
+				wg.Add(1)
+				go pruneStates(stateDB, baseHeight, retainHeight)
+				wg.Wait()
+				log.Println("--------- pruning state end ---------")
+			case "all":
+				log.Println("--------- pruning all start ---------")
+				blockStore := store.NewBlockStore(blockStoreDB)
+				baseHeight := blockStore.Base()
+				size := blockStore.Size()
+				retainHeight := baseHeight + size - 2
+				log.Printf("baseHeight=%d, size=%d, retainHeight=%d\n", baseHeight, size, retainHeight)
+
+				wg.Add(3)
+				go pruneBlocks(blockStore, baseHeight, retainHeight)
+				go pruneStates(stateDB, baseHeight, retainHeight)
+				go pruneApp(appDB, baseHeight, retainHeight)
+				wg.Wait()
+				log.Println("--------- pruning all end ---------")
+			}
 			return nil
 		},
 	}
