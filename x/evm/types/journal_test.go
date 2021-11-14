@@ -5,20 +5,20 @@ import (
 	"os"
 	"testing"
 
-	"github.com/cosmos/cosmos-sdk/x/bank"
-	"github.com/cosmos/cosmos-sdk/x/supply"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/bank"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/supply"
 
 	"github.com/stretchr/testify/suite"
 
-	abci "github.com/tendermint/tendermint/abci/types"
-	tmlog "github.com/tendermint/tendermint/libs/log"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	tmlog "github.com/okex/exchain/libs/tendermint/libs/log"
 	tmdb "github.com/tendermint/tm-db"
 
-	sdkcodec "github.com/cosmos/cosmos-sdk/codec"
-	"github.com/cosmos/cosmos-sdk/store"
-	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/cosmos/cosmos-sdk/x/auth"
-	"github.com/cosmos/cosmos-sdk/x/gov/types"
+	sdkcodec "github.com/okex/exchain/libs/cosmos-sdk/codec"
+	"github.com/okex/exchain/libs/cosmos-sdk/store"
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/gov/types"
 	"github.com/okex/exchain/x/params"
 
 	ethcmn "github.com/ethereum/go-ethereum/common"
@@ -294,29 +294,25 @@ func (suite *JournalTestSuite) TestJournal_preimage_revert() {
 func (suite *JournalTestSuite) TestJournal_createObjectChange_revert() {
 	addr := ethcmn.BytesToAddress([]byte("addr"))
 
-	suite.stateDB.stateObjects = []stateEntry{
-		{
+	suite.stateDB.stateObjects = map[ethcmn.Address]*stateEntry{
+		addr: {
 			address: addr,
 			stateObject: &stateObject{
 				address: addr,
 			},
 		},
-		{
+		ethcmn.BytesToAddress([]byte("addr1")): {
 			address: ethcmn.BytesToAddress([]byte("addr1")),
 			stateObject: &stateObject{
 				address: ethcmn.BytesToAddress([]byte("addr1")),
 			},
 		},
-		{
+		ethcmn.BytesToAddress([]byte("addr2")): {
 			address: ethcmn.BytesToAddress([]byte("addr2")),
 			stateObject: &stateObject{
 				address: ethcmn.BytesToAddress([]byte("addr2")),
 			},
 		},
-	}
-
-	for i, so := range suite.stateDB.stateObjects {
-		suite.stateDB.addressToObjectIndex[so.address] = i
 	}
 
 	change := createObjectChange{
@@ -326,13 +322,12 @@ func (suite *JournalTestSuite) TestJournal_createObjectChange_revert() {
 	// delete first entry
 	change.revert(suite.stateDB)
 	suite.Require().Len(suite.stateDB.stateObjects, 2)
-	suite.Require().Equal(len(suite.stateDB.stateObjects), len(suite.stateDB.addressToObjectIndex))
+	suite.Require().Equal(len(suite.stateDB.stateObjects), len(suite.stateDB.stateObjects))
 
-	for i, entry := range suite.stateDB.stateObjects {
-		suite.Require().Equal(ethcmn.BytesToAddress([]byte(fmt.Sprintf("addr%d", i+1))).String(), entry.address.String())
-		idx, found := suite.stateDB.addressToObjectIndex[entry.address]
+	for k, entry := range suite.stateDB.stateObjects {
+		suite.Require().Equal(k.String(), entry.address.String())
+		_, found := suite.stateDB.stateObjects[entry.address]
 		suite.Require().True(found)
-		suite.Require().Equal(i, idx)
 	}
 }
 

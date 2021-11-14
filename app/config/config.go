@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"sync"
 
-	tmconfig "github.com/tendermint/tendermint/config"
+	tmconfig "github.com/okex/exchain/libs/tendermint/config"
 
 	"github.com/spf13/viper"
 )
@@ -64,9 +64,6 @@ func RegisterDynamicConfig() {
 	// set the dynamic config
 	oecConfig := GetOecConfig()
 	tmconfig.SetDynamicConfig(oecConfig)
-
-	//download pprof
-	PprofDownload()
 }
 
 func (c *OecConfig) loadFromConfig() {

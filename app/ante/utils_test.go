@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	sdk "github.com/cosmos/cosmos-sdk/types"
-	"github.com/cosmos/cosmos-sdk/x/auth"
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
 
 	"github.com/okex/exchain/app"
 	ante "github.com/okex/exchain/app/ante"
@@ -19,8 +19,8 @@ import (
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
-	abci "github.com/tendermint/tendermint/abci/types"
-	tmcrypto "github.com/tendermint/tendermint/crypto"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	tmcrypto "github.com/okex/exchain/libs/tendermint/crypto"
 )
 
 type AnteTestSuite struct {
