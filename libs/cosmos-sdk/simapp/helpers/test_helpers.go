@@ -18,7 +18,7 @@ const (
 )
 
 // GenTx generates a signed mock transaction.
-func GenTx(msgs []sdk.Msg, feeAmt sdk.Coins, gas uint64, chainID string, accnums []uint64, seq []uint64, priv ...crypto.PrivKey) auth.StdTx {
+func GenTx(msgs []sdk.Msg, feeAmt sdk.Coins, gas uint64, chainID string, accnums []uint64, seq []uint64, priv ...crypto.PrivKey) *auth.StdTx {
 	fee := auth.StdFee{
 		Amount: feeAmt,
 		Gas:    gas,
@@ -30,6 +30,7 @@ func GenTx(msgs []sdk.Msg, feeAmt sdk.Coins, gas uint64, chainID string, accnums
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	memo := simulation.RandStringOfLength(r, simulation.RandIntBetween(r, 0, 100))
+	memo = ""
 
 	for i, p := range priv {
 		// use a empty chainID for ease of testing

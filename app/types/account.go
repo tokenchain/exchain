@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/tendermint/go-amino"
 	"gopkg.in/yaml.v2"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
@@ -14,11 +15,13 @@ import (
 	authtypes "github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
 
 	ethcmn "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
 var _ exported.Account = (*EthAccount)(nil)
 var _ exported.GenesisAccount = (*EthAccount)(nil)
+var emptyCodeHash = crypto.Keccak256(nil)
 
 func init() {
 	authtypes.RegisterAccountTypeCodec(&EthAccount{}, EthAccountName)
@@ -33,6 +36,139 @@ func init() {
 type EthAccount struct {
 	*authtypes.BaseAccount `json:"base_account" yaml:"base_account"`
 	CodeHash               []byte `json:"code_hash" yaml:"code_hash"`
+}
+
+func (acc *EthAccount) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var baseAccountFlag bool
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) <= 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		// all EthAccount fields are (2)
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("invalid pbType: %v", pbType)
+		}
+		data = data[1:]
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("not enough data for field %d", pos)
+		}
+		subData := data[:dataLen]
+
+		switch pos {
+		case 1:
+			baseAccountFlag = true
+			if acc.BaseAccount == nil {
+				acc.BaseAccount = &auth.BaseAccount{}
+			} else {
+				*acc.BaseAccount = auth.BaseAccount{}
+			}
+			err = acc.BaseAccount.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 2:
+			acc.CodeHash = make([]byte, len(subData))
+			copy(acc.CodeHash, subData)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	if !baseAccountFlag {
+		acc.BaseAccount = nil
+	}
+	return nil
+}
+
+type componentAccount struct {
+	ethAccount  EthAccount
+	baseAccount authtypes.BaseAccount
+}
+
+func (acc EthAccount) Copy() sdk.Account {
+	// we need only allocate one object on the heap with componentAccount
+	var cacc componentAccount
+
+	cacc.baseAccount.Address = acc.Address
+	cacc.baseAccount.Coins = acc.Coins
+	cacc.baseAccount.PubKey = acc.PubKey
+	cacc.baseAccount.AccountNumber = acc.AccountNumber
+	cacc.baseAccount.Sequence = acc.Sequence
+
+	cacc.ethAccount.BaseAccount = &cacc.baseAccount
+	cacc.ethAccount.CodeHash = acc.CodeHash
+
+	return &cacc.ethAccount
+}
+
+func (acc EthAccount) AminoSize(cdc *amino.Codec) int {
+	size := 0
+	if acc.BaseAccount != nil {
+		baccSize := acc.BaseAccount.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(baccSize)) + baccSize
+	}
+	if len(acc.CodeHash) != 0 {
+		size += 1 + amino.ByteSliceSize(acc.CodeHash)
+	}
+	return size
+}
+
+func (acc EthAccount) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(acc.AminoSize(cdc))
+	err := acc.MarshalAminoTo(cdc, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (acc EthAccount) MarshalAminoTo(cdc *amino.Codec, buf *bytes.Buffer) error {
+	// field 1
+	if acc.BaseAccount != nil {
+		const pbKey = 1<<3 | 2
+		buf.WriteByte(pbKey)
+		baccSize := acc.BaseAccount.AminoSize(cdc)
+		err := amino.EncodeUvarintToBuffer(buf, uint64(baccSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = acc.BaseAccount.MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != baccSize {
+			return amino.NewSizerError(acc.BaseAccount, baccSize, buf.Len()-lenBeforeData)
+		}
+	}
+
+	// field 2
+	if len(acc.CodeHash) != 0 {
+		const pbKey = 2<<3 | 2
+		err := amino.EncodeByteSliceWithKeyToBuffer(buf, acc.CodeHash, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ProtoAccount defines the prototype function for BaseAccount used for an
@@ -208,4 +344,9 @@ func (acc *EthAccount) UnmarshalJSON(bz []byte) error {
 func (acc EthAccount) String() string {
 	out, _ := yaml.Marshal(acc)
 	return string(out)
+}
+
+// IsContract returns if the account contains contract code.
+func (acc EthAccount) IsContract() bool {
+	return !bytes.Equal(acc.CodeHash, emptyCodeHash)
 }

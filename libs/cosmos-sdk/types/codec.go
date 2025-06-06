@@ -1,9 +1,17 @@
 package types
 
-import "github.com/okex/exchain/libs/cosmos-sdk/codec"
+import (
+	"github.com/okex/exchain/libs/cosmos-sdk/codec"
+)
+
+const (
+	// MsgInterfaceProtoName defines the protobuf name of the cosmos Msg interface
+	MsgInterfaceProtoName = "cosmos.base.v1beta1.Msg"
+)
 
 // Register the sdk message type
 func RegisterCodec(cdc *codec.Codec) {
 	cdc.RegisterInterface((*Msg)(nil), nil)
+	cdc.RegisterInterface((*MsgProtoAdapter)(nil), nil)
 	cdc.RegisterInterface((*Tx)(nil), nil)
 }

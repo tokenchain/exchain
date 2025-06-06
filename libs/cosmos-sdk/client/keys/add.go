@@ -40,7 +40,6 @@ const (
 	// DefaultKeyPass contains the default key password for genesis transactions
 	DefaultKeyPass = "12345678"
 	flagMnemonic   = "mnemonic"
-
 )
 
 // AddKeyCommand defines a keys command to add a generated or recovered private key to keybase.
@@ -85,7 +84,7 @@ the flag --nosort is set.
 	cmd.Flags().String(flagKeyAlgo, string(keys.Secp256k1), "Key signing algorithm to generate keys for")
 
 	cmd.Flags().BoolP(flagYes, "y", false, "Overwrite the existing account without confirmation")
-	cmd.Flags().StringP(flagMnemonic, "m", "", "Mnemonic words")
+	cmd.Flags().StringP(flagMnemonic, "m", "", "Mnemonic words or private key")
 	return cmd
 }
 
@@ -296,13 +295,11 @@ func RunAddCmd(cmd *cobra.Command, args []string, kb keys.Keybase, inBuf *bufio.
 		showMnemonic = false
 		mnemonic = ""
 	}
-
 	return printCreate(cmd, info, showMnemonic, mnemonic)
 }
 
 func printCreate(cmd *cobra.Command, info keys.Info, showMnemonic bool, mnemonic string) error {
 	output := viper.Get(cli.OutputFlag)
-
 	switch output {
 	case OutputFormatText:
 		cmd.PrintErrln()

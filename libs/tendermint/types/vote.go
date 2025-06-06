@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tendermint/go-amino"
+
 	"github.com/okex/exchain/libs/tendermint/crypto"
 	tmbytes "github.com/okex/exchain/libs/tendermint/libs/bytes"
 	tmproto "github.com/okex/exchain/libs/tendermint/proto/types"
@@ -55,6 +57,143 @@ type Vote struct {
 	ValidatorAddress Address       `json:"validator_address"`
 	ValidatorIndex   int           `json:"validator_index"`
 	Signature        []byte        `json:"signature"`
+	HasVC            bool          `json:"has_vc"` // enterNewRoundAVC at this Height
+}
+
+func (vote Vote) AminoSize(cdc *amino.Codec) int {
+	var size = 0
+
+	if vote.Type != 0 {
+		size += 1 + amino.UvarintSize(uint64(vote.Type))
+	}
+
+	if vote.Height != 0 {
+		size += 1 + amino.UvarintSize(uint64(vote.Height))
+	}
+
+	if vote.Round != 0 {
+		size += 1 + amino.UvarintSize(uint64(vote.Round))
+	}
+
+	blockIDSize := vote.BlockID.AminoSize(cdc)
+	if blockIDSize != 0 {
+		size += 1 + amino.UvarintSize(uint64(blockIDSize)) + blockIDSize
+	}
+
+	timestampSize := amino.TimeSize(vote.Timestamp)
+	if timestampSize != 0 {
+		size += 1 + amino.UvarintSize(uint64(timestampSize)) + timestampSize
+	}
+
+	if len(vote.ValidatorAddress) != 0 {
+		size += 1 + amino.ByteSliceSize(vote.ValidatorAddress)
+	}
+
+	if vote.ValidatorIndex != 0 {
+		size += 1 + amino.UvarintSize(uint64(vote.ValidatorIndex))
+	}
+
+	if len(vote.Signature) != 0 {
+		size += 1 + amino.ByteSliceSize(vote.Signature)
+	}
+	if vote.HasVC {
+		size += 1 + 1
+	}
+
+	return size
+}
+
+func (vote *Vote) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+	var timestampUpdated bool
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			vote.Type = SignedMsgType(u64)
+			dataLen = uint64(n)
+		case 2:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			vote.Height = int64(u64)
+			dataLen = uint64(n)
+		case 3:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			vote.Round = int(u64)
+			dataLen = uint64(n)
+		case 4:
+			err = vote.BlockID.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 5:
+			vote.Timestamp, _, err = amino.DecodeTime(subData)
+			if err != nil {
+				return err
+			}
+			timestampUpdated = true
+		case 6:
+			vote.ValidatorAddress = make([]byte, len(subData))
+			copy(vote.ValidatorAddress, subData)
+		case 7:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			vote.ValidatorIndex = int(u64)
+			dataLen = uint64(n)
+		case 8:
+			vote.Signature = make([]byte, len(subData))
+			copy(vote.Signature, subData)
+		case 9:
+			var n int
+			vote.HasVC, n, err = amino.DecodeBool(data)
+			if err != nil {
+				return err
+			}
+			dataLen = uint64(n)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	if !timestampUpdated {
+		vote.Timestamp = amino.ZeroTime
+	}
+	return nil
 }
 
 // CommitSig converts the Vote to a CommitSig.
@@ -82,7 +221,17 @@ func (vote *Vote) CommitSig() CommitSig {
 }
 
 func (vote *Vote) SignBytes(chainID string) []byte {
-	bz, err := cdc.MarshalBinaryLengthPrefixed(CanonicalizeVote(chainID, vote))
+	if HigherThanVenus1(vote.Height) {
+		return vote.ibcSignBytes(chainID)
+	}
+	return vote.originSignBytes(chainID)
+}
+
+func (vote *Vote) ibcSignBytes(chainID string) []byte {
+	return VoteSignBytes(chainID, vote)
+}
+func (vote *Vote) originSignBytes(chainId string) []byte {
+	bz, err := cdc.MarshalBinaryLengthPrefixed(CanonicalizeVote(chainId, vote))
 	if err != nil {
 		panic(err)
 	}
@@ -192,7 +341,7 @@ func (vote *Vote) ToProto() *tmproto.Vote {
 	}
 }
 
-//FromProto converts a proto generetad type to a handwritten type
+// FromProto converts a proto generetad type to a handwritten type
 // return type, nil if everything converts safely, otherwise nil, error
 func VoteFromProto(pv *tmproto.Vote) (*Vote, error) {
 	if pv == nil {

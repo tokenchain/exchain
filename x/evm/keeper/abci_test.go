@@ -1,24 +1,25 @@
 package keeper_test
 
 import (
+	"math/big"
+	"os"
+	"time"
+
 	ethcmn "github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/okex/exchain/app/crypto/ethsecp256k1"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/x/evm/types"
 	"github.com/okex/exchain/x/evm/watcher"
 	"github.com/spf13/viper"
-	abci "github.com/okex/exchain/libs/tendermint/abci/types"
-	"math/big"
-	"os"
-	"time"
 )
 
 func (suite *KeeperTestSuite) TestBeginBlock() {
 	req := abci.RequestBeginBlock{
 		Header: abci.Header{
 			LastBlockId: abci.BlockID{
-				Hash: []byte("hash"),
+				Hash: ethcmn.FromHex(hex),
 			},
 			Height: 10,
 		},
@@ -43,7 +44,8 @@ func (suite *KeeperTestSuite) TestBeginBlock() {
 
 	suite.Require().Equal(int64(initialConsumed), int64(suite.ctx.GasMeter().GasConsumed()))
 
-	lastHeight, found := suite.app.EvmKeeper.GetBlockHash(suite.ctx, req.Header.LastBlockId.Hash)
+	blockHash := ethcmn.BytesToHash(req.Header.LastBlockId.Hash)
+	lastHeight, found := suite.app.EvmKeeper.GetBlockHeight(suite.ctx, blockHash)
 	suite.Require().True(found)
 	suite.Require().Equal(int64(9), lastHeight)
 }
@@ -66,13 +68,15 @@ func (suite *KeeperTestSuite) TestEndBlock() {
 func (suite *KeeperTestSuite) TestEndBlockWatcher() {
 	// update the counters
 	suite.app.EvmKeeper.Bloom.SetInt64(10)
+	suite.app.EvmKeeper.Watcher.SetFirstUse(true)
 
 	store := suite.ctx.KVStore(suite.app.EvmKeeper.GetStoreKey())
 	store.Set(types.GetContractDeploymentWhitelistMemberKey(suite.address.Bytes()), []byte(""))
 	store.Set(types.GetContractBlockedListMemberKey(suite.address.Bytes()), []byte(""))
 	viper.Set(watcher.FlagFastQueryLru, 100)
 	_ = suite.app.EvmKeeper.EndBlock(suite.ctx, abci.RequestEndBlock{Height: 10})
-	time.Sleep(time.Millisecond)
+	suite.app.Commit(abci.RequestCommit{})
+	time.Sleep(100 * time.Millisecond)
 	querier := watcher.NewQuerier()
 	res1 := querier.HasContractDeploymentWhitelist(suite.address.Bytes())
 	res2 := querier.HasContractBlockedList(suite.address.Bytes())

@@ -86,6 +86,10 @@ moniker = "{{ .BaseConfig.Moniker }}"
 # and verifying their commits
 fast_sync = {{ .BaseConfig.FastSyncMode }}
 
+# AutoFastSync allows this node switches from consensus mode to fast-sync mode automatically
+# when it is many blocks behind the tip of the chain.
+auto_fast_sync = {{ .BaseConfig.AutoFastSync }}
+
 # Database backend: goleveldb | cleveldb | boltdb | rocksdb
 # * goleveldb (github.com/syndtr/goleveldb - most popular implementation)
 #   - pure go
@@ -299,7 +303,6 @@ dial_timeout = "{{ .P2P.DialTimeout }}"
 recheck = {{ .Mempool.Recheck }}
 force_recheck_gap = {{ .Mempool.ForceRecheckGap }}
 broadcast = {{ .Mempool.Broadcast }}
-wal_dir = "{{ js .Mempool.WalPath }}"
 
 # Maximum number of transactions in the mempool
 size = {{ .Mempool.Size }}
@@ -325,6 +328,9 @@ sort_tx_by_gp = {{ .Mempool.SortTxByGp }}
 # Minimum price bump percentage to replace an already existing transaction (nonce)
 tx_price_bump = {{ .Mempool.TxPriceBump }}
 
+# Node key whitelist used in mempool to reduce CPU and Memory tradeoff 
+node_key_whitelist = [{{ range .Mempool.NodeKeyWhitelist }}{{ printf "%q, " . }}{{end}}]
+
 ##### fast sync configuration options #####
 [fastsync]
 
@@ -346,6 +352,7 @@ timeout_prevote_delta = "{{ .Consensus.TimeoutPrevoteDelta }}"
 timeout_precommit = "{{ .Consensus.TimeoutPrecommit }}"
 timeout_precommit_delta = "{{ .Consensus.TimeoutPrecommitDelta }}"
 timeout_commit = "{{ .Consensus.TimeoutCommit }}"
+waiting = "{{ .Consensus.Waiting }}"
 
 # Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
 skip_timeout_commit = {{ .Consensus.SkipTimeoutCommit }}
@@ -465,6 +472,24 @@ func ResetTestRootWithChainID(testName string, chainID string) *Config {
 var testGenesisFmt = `{
   "genesis_time": "2018-10-10T08:20:13.695936996Z",
   "chain_id": "%s",
+  "consensus_params": {
+	"block": {
+		"max_bytes": "22020096",
+		"max_gas": "-1",
+		"time_iota_ms": "10"
+	},
+	"evidence": {
+		"max_age_num_blocks": "100000",
+		"max_age_duration": "172800000000000",
+		"max_num": 50
+	},
+	"validator": {
+		"pub_key_types": [
+			"ed25519"
+		]
+	},
+	"version": {}
+  },
   "validators": [
     {
       "pub_key": {

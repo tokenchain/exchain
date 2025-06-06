@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	amino "github.com/tendermint/go-amino"
 	cryptoamino "github.com/okex/exchain/libs/tendermint/crypto/encoding/amino"
 	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	amino "github.com/tendermint/go-amino"
 )
 
 // amino codec to marshal/unmarshal
@@ -62,4 +62,9 @@ func init() {
 	RegisterCrypto(cdc)
 	RegisterEvidences(cdc)
 	Cdc = cdc.Seal()
+}
+
+type CdcAbstraction interface {
+	UnmarshalBinaryLengthPrefixedWithRegisteredUbmarshaller(bz []byte, ptr interface{}) (interface{}, error)
+	UnmarshalBinaryLengthPrefixed(bz []byte, ptr interface{}) error
 }

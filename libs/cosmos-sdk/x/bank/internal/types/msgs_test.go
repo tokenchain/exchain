@@ -51,6 +51,45 @@ func TestMsgSendValidation(t *testing.T) {
 	}
 }
 
+func TestMsgSendAmino(t *testing.T) {
+	cdc := ModuleCdc
+
+	testCases := []MsgSend{
+		{},
+		{
+			FromAddress: sdk.AccAddress("from"),
+			ToAddress:   sdk.AccAddress("to"),
+			Amount:      sdk.NewCoins(sdk.NewInt64Coin("atom", 10), sdk.NewInt64Coin("eth", 20)),
+		},
+		{
+			FromAddress: []byte{},
+			ToAddress:   []byte{},
+			Amount:      sdk.Coins{},
+		},
+	}
+
+	for _, msg := range testCases {
+		data, err := cdc.MarshalBinaryBare(msg)
+		require.NoError(t, err)
+
+		var msg2 MsgSend
+		err = cdc.UnmarshalBinaryBare(data, &msg2)
+		require.NoError(t, err)
+
+		var msg3 MsgSend
+		v, err := cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(data, &msg3)
+		require.NoError(t, err)
+		msg3 = v.(MsgSend)
+
+		require.EqualValues(t, msg2, msg3)
+
+		var msg4 MsgSend
+		err = msg4.UnmarshalFromAmino(cdc, data[4:])
+		require.NoError(t, err)
+		require.EqualValues(t, msg2, msg4)
+	}
+}
+
 func TestMsgSendGetSignBytes(t *testing.T) {
 	addr1 := sdk.AccAddress([]byte("input"))
 	addr2 := sdk.AccAddress([]byte("output"))

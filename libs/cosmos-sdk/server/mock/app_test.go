@@ -3,6 +3,7 @@ package mock
 import (
 	"testing"
 
+	appconfig "github.com/okex/exchain/app/config"
 	"github.com/okex/exchain/libs/tendermint/types"
 
 	"github.com/stretchr/testify/require"
@@ -30,7 +31,7 @@ func TestInitApp(t *testing.T) {
 		AppStateBytes: appState,
 	}
 	app.InitChain(req)
-	app.Commit()
+	app.Commit(abci.RequestCommit{})
 
 	// make sure we can query these values
 	query := abci.RequestQuery{
@@ -44,6 +45,7 @@ func TestInitApp(t *testing.T) {
 
 // TextDeliverTx ensures we can write a tx
 func TestDeliverTx(t *testing.T) {
+	appconfig.GetOecConfig().SetDynamicGpMode(0)
 	// set up an app
 	app, closer, err := SetupApp()
 	// closer may need to be run, even when error in later stage
@@ -51,6 +53,13 @@ func TestDeliverTx(t *testing.T) {
 		defer closer()
 	}
 	require.NoError(t, err)
+
+	appState, err := AppGenState(nil, types.GenesisDoc{}, nil)
+	require.NoError(t, err)
+	req := abci.RequestInitChain{
+		AppStateBytes: appState,
+	}
+	app.InitChain(req)
 
 	key := "my-special-key"
 	value := "top-secret-data!!"
@@ -65,7 +74,7 @@ func TestDeliverTx(t *testing.T) {
 	dres := app.DeliverTx(abci.RequestDeliverTx{Tx: txBytes})
 	require.Equal(t, uint32(0), dres.Code, dres.Log)
 	app.EndBlock(abci.RequestEndBlock{})
-	cres := app.Commit()
+	cres := app.Commit(abci.RequestCommit{})
 	require.NotEmpty(t, cres.Data)
 
 	// make sure we can query these values

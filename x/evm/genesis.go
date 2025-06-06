@@ -3,14 +3,14 @@ package evm
 import (
 	"fmt"
 
+	ethcmn "github.com/ethereum/go-ethereum/common"
+	ethermint "github.com/okex/exchain/app/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/server"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	authexported "github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
-	ethcmn "github.com/ethereum/go-ethereum/common"
-	ethermint "github.com/okex/exchain/app/types"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/x/evm/types"
 	"github.com/spf13/viper"
-	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 )
 
 // InitGenesis initializes genesis state based on exported genesis
@@ -78,19 +78,15 @@ func InitGenesis(ctx sdk.Context, k Keeper, accountKeeper types.AccountKeeper, d
 	csdb.SetContractDeploymentWhitelist(data.ContractDeploymentWhitelist)
 
 	// set contract blocked list into store
+	csdb.InsertContractMethodBlockedList(data.ContractMethodBlockedList)
+
+	// set contract blocked list into store
 	csdb.SetContractBlockedList(data.ContractBlockedList)
 
 	logger.Debug("Import finished", "code", codeCount, "storage", storageCount)
 
 	// set state objects and code to store
 	_, err := csdb.Commit(false)
-	if err != nil {
-		panic(err)
-	}
-
-	// set storage to store
-	// NOTE: don't delete empty object to prevent import-export simulation failure
-	err = csdb.Finalise(false)
 	if err != nil {
 		panic(err)
 	}
@@ -161,11 +157,18 @@ func ExportGenesis(ctx sdk.Context, k Keeper, ak types.AccountKeeper) GenesisSta
 	logger.Debug("Export finished", "code", codeCount, "storage", storageCount)
 
 	config, _ := k.GetChainConfig(ctx)
+	bcml := csdb.GetContractMethodBlockedList()
+	for i := 0; i < len(bcml); i++ {
+		if bcml[i].IsAllMethodBlocked() {
+			bcml = append(bcml[:i], bcml[i+1:]...)
+		}
+	}
 	return GenesisState{
 		Accounts:                    ethGenAccounts,
 		ChainConfig:                 config,
 		Params:                      k.GetParams(ctx),
 		ContractDeploymentWhitelist: csdb.GetContractDeploymentWhitelist(),
 		ContractBlockedList:         csdb.GetContractBlockedList(),
+		ContractMethodBlockedList:   bcml,
 	}
 }

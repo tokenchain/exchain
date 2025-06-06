@@ -7,11 +7,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"unsafe"
 
 	"github.com/pkg/errors"
 
-	amino "github.com/tendermint/go-amino"
 	"github.com/okex/exchain/libs/tendermint/crypto/tmhash"
+	amino "github.com/tendermint/go-amino"
 )
 
 // Node represents a node in a Tree.
@@ -30,12 +31,42 @@ type Node struct {
 	prePersisted bool
 }
 
+// NodeToNodeJson get NodeJson from Node
+func NodeToNodeJson(node *Node) *NodeJson {
+	if node == nil {
+		return &NodeJson{}
+	}
+	return nodeToNodeJsonUnsafe(node)
+}
+
+func nodeToNodeJsonUnsafe(node *Node) *NodeJson {
+	return (*NodeJson)(unsafe.Pointer(node))
+}
+
+// NodeJsonToNode get Node from NodeJson
+func NodeJsonToNode(nj *NodeJson) *Node {
+	if nj == nil {
+		return nil
+	}
+	return &Node{
+		key:          nj.Key,
+		value:        nj.Value,
+		hash:         nj.Hash,
+		leftHash:     nj.LeftHash,
+		rightHash:    nj.RightHash,
+		version:      nj.Version,
+		size:         nj.Size,
+		height:       nj.Height,
+		persisted:    nj.Persisted,
+		prePersisted: nj.PrePersisted,
+	}
+}
+
 // NewNode returns a new node from a key, value and version.
 func NewNode(key []byte, value []byte, version int64) *Node {
 	return &Node{
 		key:     key,
 		value:   value,
-		height:  0,
 		size:    1,
 		version: version,
 	}
@@ -128,12 +159,10 @@ func (node *Node) clone(version int64) *Node {
 		height:    node.height,
 		version:   version,
 		size:      node.size,
-		hash:      nil,
 		leftHash:  node.leftHash,
 		leftNode:  node.leftNode,
 		rightHash: node.rightHash,
 		rightNode: node.rightNode,
-		persisted: false,
 	}
 }
 
@@ -194,6 +223,8 @@ func (node *Node) getByIndex(t *ImmutableTree, index int64) (key []byte, value [
 	return node.getRightNode(t).getByIndex(t, index-leftNode.size)
 }
 
+var nodeHashBufferPool = amino.NewBufferPool()
+
 // Computes the hash of the node without computing its descendants. Must be
 // called on nodes which have descendant node hashes already computed.
 func (node *Node) _hash() []byte {
@@ -202,8 +233,10 @@ func (node *Node) _hash() []byte {
 	}
 
 	h := tmhash.New()
-	buf := new(bytes.Buffer)
-	if err := node.writeHashBytes(buf); err != nil {
+	buf := nodeHashBufferPool.Get()
+	defer nodeHashBufferPool.Put(buf)
+	buf.Grow(node.aminoHashSize())
+	if err := node.writeHashBytesToBuffer(buf); err != nil {
 		panic(err)
 	}
 	_, err := h.Write(buf.Bytes())
@@ -325,6 +358,66 @@ func (node *Node) writeHashBytes(w io.Writer) error {
 	return nil
 }
 
+func (node *Node) writeHashBytesToBuffer(w *bytes.Buffer) error {
+	err := amino.EncodeInt8ToBuffer(w, node.height)
+	if err != nil {
+		return errors.Wrap(err, "writing height")
+	}
+	err = amino.EncodeVarintToBuffer(w, node.size)
+	if err != nil {
+		return errors.Wrap(err, "writing size")
+	}
+	err = amino.EncodeVarintToBuffer(w, node.version)
+	if err != nil {
+		return errors.Wrap(err, "writing version")
+	}
+
+	// Key is not written for inner nodes, unlike writeBytes.
+
+	if node.isLeaf() {
+		err = amino.EncodeByteSliceToBuffer(w, node.key)
+		if err != nil {
+			return errors.Wrap(err, "writing key")
+		}
+		// Indirection needed to provide proofs without values.
+		// (e.g. ProofLeafNode.ValueHash)
+		valueHash := tmhash.Sum(node.value)
+		err = amino.EncodeByteSliceToBuffer(w, valueHash)
+		if err != nil {
+			return errors.Wrap(err, "writing value")
+		}
+	} else {
+		if node.leftHash == nil || node.rightHash == nil {
+			panic("Found an empty child hash")
+		}
+		err = amino.EncodeByteSliceToBuffer(w, node.leftHash)
+		if err != nil {
+			return errors.Wrap(err, "writing left hash")
+		}
+		err = amino.EncodeByteSliceToBuffer(w, node.rightHash)
+		if err != nil {
+			return errors.Wrap(err, "writing right hash")
+		}
+	}
+
+	return nil
+}
+
+func (node *Node) aminoHashSize() int {
+	n := 1 +
+		amino.VarintSize(node.size) +
+		amino.VarintSize(node.version)
+
+	if node.isLeaf() {
+		n += amino.ByteSliceSize(node.key) +
+			1 + 32 // 1 byte for varint, 32 bytes for value hash (sha256)
+	} else {
+		n += 1 + 32 + // 1 byte for varint, 32 bytes for left hash
+			1 + 32 // 1 byte for varint, 32 bytes for right hash
+	}
+	return n
+}
+
 // Writes the node's hash to the given io.Writer.
 // This function has the side-effect of calling hashWithCount.
 func (node *Node) writeHashBytesRecursively(w io.Writer) (hashCount int64, err error) {
@@ -403,6 +496,51 @@ func (node *Node) writeBytes(w io.Writer) error {
 	return nil
 }
 
+func (node *Node) writeBytesToBuffer(w *bytes.Buffer) error {
+	cause := amino.EncodeInt8ToBuffer(w, node.height)
+	if cause != nil {
+		return errors.Wrap(cause, "writing height")
+	}
+	cause = amino.EncodeVarintToBuffer(w, node.size)
+	if cause != nil {
+		return errors.Wrap(cause, "writing size")
+	}
+	cause = amino.EncodeVarintToBuffer(w, node.version)
+	if cause != nil {
+		return errors.Wrap(cause, "writing version")
+	}
+
+	// Unlike writeHashBytes, key is written for inner nodes.
+	cause = amino.EncodeByteSliceToBuffer(w, node.key)
+	if cause != nil {
+		return errors.Wrap(cause, "writing key")
+	}
+
+	if node.isLeaf() {
+		cause = amino.EncodeByteSliceToBuffer(w, node.value)
+		if cause != nil {
+			return errors.Wrap(cause, "writing value")
+		}
+	} else {
+		if node.leftHash == nil {
+			panic("node.leftHash was nil in writeBytes")
+		}
+		cause = amino.EncodeByteSliceToBuffer(w, node.leftHash)
+		if cause != nil {
+			return errors.Wrap(cause, "writing left hash")
+		}
+
+		if node.rightHash == nil {
+			panic("node.rightHash was nil in writeBytes")
+		}
+		cause = amino.EncodeByteSliceToBuffer(w, node.rightHash)
+		if cause != nil {
+			return errors.Wrap(cause, "writing right hash")
+		}
+	}
+	return nil
+}
+
 func (node *Node) getLeftNode(t *ImmutableTree) *Node {
 	if node.leftNode != nil {
 		return node.leftNode
@@ -419,8 +557,10 @@ func (node *Node) getRightNode(t *ImmutableTree) *Node {
 
 // NOTE: mutates height and size
 func (node *Node) calcHeightAndSize(t *ImmutableTree) {
-	node.height = maxInt8(node.getLeftNode(t).height, node.getRightNode(t).height) + 1
-	node.size = node.getLeftNode(t).size + node.getRightNode(t).size
+	left := node.getLeftNode(t)
+	right := node.getRightNode(t)
+	node.height = maxInt8(left.height, right.height) + 1
+	node.size = left.size + right.size
 }
 
 func (node *Node) calcBalance(t *ImmutableTree) int {

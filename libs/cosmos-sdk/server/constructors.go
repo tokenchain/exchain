@@ -9,7 +9,7 @@ import (
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
 	tmtypes "github.com/okex/exchain/libs/tendermint/types"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 )
@@ -28,7 +28,7 @@ type (
 
 func openDB(rootDir string) (dbm.DB, error) {
 	dataDir := filepath.Join(rootDir, "data")
-	db, err := sdk.NewLevelDB("application", dataDir)
+	db, err := sdk.NewDB("application", dataDir)
 	return db, err
 }
 

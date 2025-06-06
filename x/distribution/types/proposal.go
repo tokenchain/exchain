@@ -19,7 +19,13 @@ var _ govtypes.Content = CommunityPoolSpendProposal{}
 
 func init() {
 	govtypes.RegisterProposalType(ProposalTypeCommunityPoolSpend)
+	govtypes.RegisterProposalType(ProposalTypeChangeDistributionType)
+	govtypes.RegisterProposalType(ProposalTypeWithdrawRewardEnabled)
+	govtypes.RegisterProposalType(ProposalTypeRewardTruncatePrecision)
 	govtypes.RegisterProposalTypeCodec(CommunityPoolSpendProposal{}, "okexchain/distribution/CommunityPoolSpendProposal")
+	govtypes.RegisterProposalTypeCodec(ChangeDistributionTypeProposal{}, "okexchain/distribution/ChangeDistributionTypeProposal")
+	govtypes.RegisterProposalTypeCodec(WithdrawRewardEnabledProposal{}, "okexchain/distribution/WithdrawRewardEnabledProposal")
+	govtypes.RegisterProposalTypeCodec(RewardTruncatePrecisionProposal{}, "okexchain/distribution/RewardTruncatePrecisionProposal")
 }
 
 // CommunityPoolSpendProposal spends from the community pool
@@ -27,7 +33,7 @@ type CommunityPoolSpendProposal struct {
 	Title       string         `json:"title" yaml:"title"`
 	Description string         `json:"description" yaml:"description"`
 	Recipient   sdk.AccAddress `json:"recipient" yaml:"recipient"`
-	Amount      sdk.SysCoins      `json:"amount" yaml:"amount"`
+	Amount      sdk.SysCoins   `json:"amount" yaml:"amount"`
 }
 
 // NewCommunityPoolSpendProposal creates a new community pool spned proposal.

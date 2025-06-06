@@ -4,10 +4,12 @@ import (
 	"testing"
 	"time"
 
+	blockindexer "github.com/okex/exchain/libs/tendermint/state/indexer/block/kv"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	db "github.com/tendermint/tm-db"
+	db "github.com/okex/exchain/libs/tm-db"
 
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
@@ -27,8 +29,10 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	// tx indexer
 	store := db.NewMemDB()
 	txIndexer := kv.NewTxIndex(store, kv.IndexAllEvents())
+	bStore := db.NewMemDB()
+	blockIndexer := blockindexer.New(bStore)
 
-	service := txindex.NewIndexerService(txIndexer, eventBus)
+	service := txindex.NewIndexerService(txIndexer, blockIndexer, eventBus)
 	service.SetLogger(log.TestingLogger())
 	err = service.Start()
 	require.NoError(t, err)
@@ -57,10 +61,10 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// check the result
-	res, err := txIndexer.Get(types.Tx("foo").Hash())
+	res, err := txIndexer.Get(types.Tx("foo").Hash(txResult1.Height))
 	assert.NoError(t, err)
 	assert.Equal(t, txResult1, res)
-	res, err = txIndexer.Get(types.Tx("bar").Hash())
+	res, err = txIndexer.Get(types.Tx("bar").Hash(txResult2.Height))
 	assert.NoError(t, err)
 	assert.Equal(t, txResult2, res)
 }

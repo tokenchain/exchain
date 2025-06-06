@@ -1,13 +1,17 @@
 package types
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
 
+	"github.com/gogo/protobuf/proto"
+
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
+	"github.com/tendermint/go-amino"
 
 	ctypes "github.com/okex/exchain/libs/tendermint/rpc/core/types"
 )
@@ -55,24 +59,110 @@ type ABCIMessageLog struct {
 	Events StringEvents `json:"events"`
 }
 
+func (log ABCIMessageLog) MarshalJsonToBuffer(buf *bytes.Buffer) error {
+	var err error
+
+	err = buf.WriteByte('{')
+	if err != nil {
+		return err
+	}
+
+	buf.WriteString(`"msg_index":`)
+	blob, err := json.Marshal(log.MsgIndex)
+	if err != nil {
+		return err
+	}
+	_, err = buf.Write(blob)
+	if err != nil {
+		return err
+	}
+	err = buf.WriteByte(',')
+	if err != nil {
+		return err
+	}
+
+	buf.WriteString(`"log":`)
+	blob, err = json.Marshal(log.Log)
+	if err != nil {
+		return err
+	}
+	_, err = buf.Write(blob)
+	if err != nil {
+		return err
+	}
+	err = buf.WriteByte(',')
+	if err != nil {
+		return err
+	}
+
+	buf.WriteString(`"events":`)
+	err = log.Events.MarshalJsonToBuffer(buf)
+	if err != nil {
+		return err
+	}
+
+	return buf.WriteByte('}')
+}
+
 func NewABCIMessageLog(i uint16, log string, events Events) ABCIMessageLog {
 	return ABCIMessageLog{
 		MsgIndex: i,
 		Log:      log,
-		Events:   StringifyEvents(events.ToABCIEvents()),
+		Events:   StringifyEvents(events),
 	}
 }
 
 // String implements the fmt.Stringer interface for the ABCIMessageLogs type.
 func (logs ABCIMessageLogs) String() (str string) {
 	if logs != nil {
-		raw, err := codec.Cdc.MarshalJSON(logs)
+		raw, err := logs.MarshalToJson()
+		if err != nil {
+			raw, err = codec.Cdc.MarshalJSON(logs)
+		}
 		if err == nil {
 			str = string(raw)
 		}
 	}
 
 	return str
+}
+
+var abciMessageLogsBufferPool = amino.NewBufferPool()
+
+func (logs ABCIMessageLogs) MarshalToJson() ([]byte, error) {
+	buf := abciMessageLogsBufferPool.Get()
+	defer abciMessageLogsBufferPool.Put(buf)
+	err := logs.MarshalJsonToBuffer(buf)
+	if err != nil {
+		return nil, err
+	}
+	return amino.GetBytesBufferCopy(buf), nil
+}
+
+func (logs ABCIMessageLogs) MarshalJsonToBuffer(buf *bytes.Buffer) error {
+	var err error
+	if logs == nil {
+		_, err = buf.WriteString("null")
+		return err
+	}
+
+	err = buf.WriteByte('[')
+	if err != nil {
+		return err
+	}
+	for i, log := range logs {
+		if i != 0 {
+			err = buf.WriteByte(',')
+			if err != nil {
+				return err
+			}
+		}
+		err = log.MarshalJsonToBuffer(buf)
+		if err != nil {
+			return err
+		}
+	}
+	return buf.WriteByte(']')
 }
 
 // TxResponse defines a structure containing relevant tx data and metadata. The
@@ -271,4 +361,31 @@ func NewSearchTxsResult(totalCount, count, page, limit int, txs []TxResponse) Se
 func ParseABCILogs(logs string) (res ABCIMessageLogs, err error) {
 	err = json.Unmarshal([]byte(logs), &res)
 	return res, err
+}
+
+// WrapServiceResult wraps a result from a protobuf RPC service method call in
+// a Result object or error. This method takes care of marshaling the res param to
+// protobuf and attaching any events on the ctx.EventManager() to the Result.
+func WrapServiceResult(ctx Context, res proto.Message, err error) (*Result, error) {
+	if err != nil {
+		return nil, err
+	}
+
+	var data []byte
+	if res != nil {
+		data, err = proto.Marshal(res)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var events []Event
+	if evtMgr := ctx.EventManager(); evtMgr != nil {
+		events = evtMgr.Events()
+	}
+
+	return &Result{
+		Data:   data,
+		Events: events,
+	}, nil
 }

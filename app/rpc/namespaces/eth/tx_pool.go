@@ -1,7 +1,6 @@
 package eth
 
 import (
-	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -9,19 +8,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	rpctypes "github.com/okex/exchain/app/rpc/types"
+	ethermint "github.com/okex/exchain/app/types"
 	clientcontext "github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
 	authclient "github.com/okex/exchain/libs/cosmos-sdk/x/auth/client/utils"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/rlp"
-	rpctypes "github.com/okex/exchain/app/rpc/types"
-	ethermint "github.com/okex/exchain/app/types"
+	authtypes "github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
+	"github.com/okex/exchain/libs/tendermint/types"
+	tmdb "github.com/okex/exchain/libs/tm-db"
 	evmtypes "github.com/okex/exchain/x/evm/types"
 	"github.com/spf13/viper"
-	"github.com/okex/exchain/libs/tendermint/crypto/tmhash"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
-	tmdb "github.com/tendermint/tm-db"
 )
 
 const (
@@ -73,7 +72,7 @@ func NewTxPool(clientCtx clientcontext.CLIContext, api *PublicEthereumAPI) *TxPo
 func openDB() (tmdb.DB, error) {
 	rootDir := viper.GetString("home")
 	dataDir := filepath.Join(rootDir, "data")
-	return sdk.NewLevelDB(txPoolDb, dataDir)
+	return sdk.NewDB(txPoolDb, dataDir)
 }
 
 func (pool *TxPool) initDB(api *PublicEthereumAPI) error {
@@ -97,7 +96,7 @@ func (pool *TxPool) initDB(api *PublicEthereumAPI) error {
 		}
 
 		tx := new(evmtypes.MsgEthereumTx)
-		if err = rlp.DecodeBytes(txBytes, tx); err != nil {
+		if err = authtypes.EthereumTxDecode(txBytes, tx); err != nil {
 			return err
 		}
 		if int(tx.Data.AccountNonce) != txNonce {
@@ -122,17 +121,24 @@ func (pool *TxPool) initDB(api *PublicEthereumAPI) error {
 }
 
 func broadcastTxByTxPool(api *PublicEthereumAPI, tx *evmtypes.MsgEthereumTx, txBytes []byte) (common.Hash, error) {
+	//TODO: to delete after venus height
+	lastHeight, err := api.clientCtx.Client.LatestBlockNumber()
+	if err != nil {
+		return common.Hash{}, err
+	}
 	// Get sender address
 	chainIDEpoch, err := ethermint.ParseChainID(api.clientCtx.ChainID)
 	if err != nil {
 		return common.Hash{}, err
 	}
-	fromSigCache, err := tx.VerifySig(chainIDEpoch, api.clientCtx.Height, sdk.EmptyContext().SigCache())
+	err = tx.VerifySig(chainIDEpoch, api.clientCtx.Height)
 	if err != nil {
 		return common.Hash{}, err
 	}
 
-	from := fromSigCache.GetFrom()
+	txHash := common.BytesToHash(types.Tx(txBytes).Hash(lastHeight))
+	tx.Data.Hash = &txHash
+	from := common.HexToAddress(tx.GetFrom())
 	api.txPool.mu.Lock()
 	defer api.txPool.mu.Unlock()
 	if err = api.txPool.CacheAndBroadcastTx(api, from, tx); err != nil {
@@ -140,7 +146,7 @@ func broadcastTxByTxPool(api *PublicEthereumAPI, tx *evmtypes.MsgEthereumTx, txB
 		return common.Hash{}, err
 	}
 
-	return common.HexToHash(strings.ToUpper(hex.EncodeToString(tmhash.Sum(txBytes)))), nil
+	return txHash, nil
 }
 
 func (pool *TxPool) CacheAndBroadcastTx(api *PublicEthereumAPI, address common.Address, tx *evmtypes.MsgEthereumTx) error {
@@ -239,14 +245,17 @@ func (pool *TxPool) continueBroadcast(api *PublicEthereumAPI, currentNonce uint6
 		if !strings.Contains(err.Error(), sdkerrors.ErrMempoolIsFull.Error()) &&
 			!strings.Contains(err.Error(), sdkerrors.ErrInvalidSequence.Error()) {
 			// tx has err, and err is not mempoolfull, the tx should be dropped
-			err = fmt.Errorf("%s, nonce %d of tx has been dropped, please send again",
-				err.Error(), pool.addressTxsPool[address][i].Data.AccountNonce)
+			err = fmt.Errorf("broadcast failed and tx dropped. err:%s; data:%v; address:%s\n",
+				err.Error(), pool.addressTxsPool[address][i].Data, address.String())
 			pool.dropTxs(i+1, address)
 		} else {
-			err = fmt.Errorf("%s, nonce %d :", err.Error(), pool.addressTxsPool[address][i].Data.AccountNonce)
+			err = fmt.Errorf("broadcast failed. err:%s; data:%v; address:%s\n",
+				err.Error(), pool.addressTxsPool[address][i].Data, address.String())
 			pool.dropTxs(i, address)
 		}
 		pool.logger.Error(err.Error())
+	} else {
+		pool.dropTxs(i, address)
 	}
 
 	return err
@@ -260,7 +269,18 @@ func (pool *TxPool) dropTxs(index int, address common.Address) {
 }
 
 func (pool *TxPool) broadcast(tx *evmtypes.MsgEthereumTx) error {
-	txEncoder := authclient.GetTxEncoder(pool.clientCtx.Codec)
+	// TODO: to delete after venus height
+	lastHeight, err := pool.clientCtx.Client.LatestBlockNumber()
+	if err != nil {
+		return err
+	}
+	var txEncoder sdk.TxEncoder
+	if types.HigherThanVenus(lastHeight) {
+		txEncoder = authclient.GetTxEncoder(nil, authclient.WithEthereumTx())
+	} else {
+		txEncoder = authclient.GetTxEncoder(pool.clientCtx.Codec)
+	}
+
 	txBytes, err := txEncoder(tx)
 	if err != nil {
 		return err
@@ -282,7 +302,9 @@ func (pool *TxPool) broadcast(tx *evmtypes.MsgEthereumTx) error {
 func (pool *TxPool) writeTxInDB(address common.Address, tx *evmtypes.MsgEthereumTx) error {
 	key := []byte(address.Hex() + "|" + strconv.Itoa(int(tx.Data.AccountNonce)))
 
-	txBytes, err := rlp.EncodeToBytes(tx)
+	txEncoder := authclient.GetTxEncoder(nil, authclient.WithEthereumTx())
+	// Encode transaction by RLP encoder
+	txBytes, err := txEncoder(tx)
 	if err != nil {
 		return err
 	}

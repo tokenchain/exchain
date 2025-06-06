@@ -392,7 +392,10 @@ func (l *CList) PushBack(v interface{}) *CElement {
 // NOTE: As per the contract of CList, removed elements cannot be added back.
 func (l *CList) Remove(e *CElement) interface{} {
 	l.mtx.Lock()
-
+	if e.removed {
+		l.mtx.Unlock()
+		return e.Value
+	}
 	prev := e.Prev()
 	next := e.Next()
 
@@ -474,6 +477,8 @@ func (l *CList) InsertElement(ele *CElement) *CElement {
 			if ele.Nonce < cur.Nonce {
 				// small Nonce put ahead
 				cur = cur.prev
+			} else if ele.Nonce == cur.Nonce {
+				panic(fmt.Sprintf("should not happen: insert same nonce transactions, ele=%+v,cur=%+v", ele, cur))
 			} else {
 				// The tx of the same Nonce has been processed in checkElement, and there are only cases of big nonce
 				// Big Nonce’s transaction, regardless of gasPrice, has to be in the back
@@ -580,8 +585,7 @@ func (l *CList) DetachElement(ele *CElement) interface{} {
 	return ele.Value
 }
 
-func (l *CList) AddTxWithExInfo(v interface{}, addr string, gasPrice *big.Int, nonce uint64) *CElement {
-	// Construct a new element
+func NewCElement(v interface{}, addr string, gasPrice *big.Int, nonce uint64) *CElement {
 	e := &CElement{
 		prev:       nil,
 		prevWg:     waitGroup1(),
@@ -595,8 +599,5 @@ func (l *CList) AddTxWithExInfo(v interface{}, addr string, gasPrice *big.Int, n
 		GasPrice:   gasPrice,
 		Nonce:      nonce,
 	}
-
-	l.InsertElement(e)
-
 	return e
 }

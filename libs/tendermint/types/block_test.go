@@ -1,10 +1,13 @@
 package types
 
 import (
+	stdbytes "bytes"
 	// it is ok to use math/rand here: we do not need a cryptographically secure random
 	// number generator here and we can run the tests a bit faster
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"math"
 	"os"
 	"reflect"
@@ -113,6 +116,20 @@ func TestBlockMakePartSet(t *testing.T) {
 	assert.Equal(t, 1, partSet.Total())
 }
 
+func TestBlock_MakePartSetByExInfo(t *testing.T) {
+	assert.Nil(t, (*Block)(nil).MakePartSetByExInfo(nil))
+	block := MakeBlock(int64(3), []Tx{Tx("Hello World")}, nil, nil)
+	assert.NotNil(t, block.MakePartSetByExInfo(nil))
+
+	partSet := block.MakePartSetByExInfo(&BlockExInfo{BlockPartSize: 1024})
+	assert.NotNil(t, partSet)
+	assert.Equal(t, 1, partSet.Total())
+
+	partSet = block.MakePartSetByExInfo(&BlockExInfo{BlockPartSize: 1024, BlockCompressType: 2, BlockCompressFlag: 0})
+	assert.NotNil(t, partSet)
+	assert.Equal(t, 1, partSet.Total())
+}
+
 func TestBlockMakePartSetWithEvidence(t *testing.T) {
 	assert.Nil(t, (*Block)(nil).MakePartSet(2))
 
@@ -144,7 +161,7 @@ func TestBlockHashesTo(t *testing.T) {
 	evList := []Evidence{ev}
 
 	block := MakeBlock(h, []Tx{Tx("Hello World")}, commit, evList)
-	block.ValidatorsHash = valSet.Hash()
+	block.ValidatorsHash = valSet.Hash(block.Height)
 	assert.False(t, block.HashesTo([]byte{}))
 	assert.False(t, block.HashesTo([]byte("something else")))
 	assert.True(t, block.HashesTo(block.Hash()))
@@ -202,8 +219,8 @@ func TestNilHeaderHashDoesntCrash(t *testing.T) {
 }
 
 func TestNilDataHashDoesntCrash(t *testing.T) {
-	assert.Equal(t, []byte((*Data)(nil).Hash()), nilBytes)
-	assert.Equal(t, []byte(new(Data).Hash()), nilBytes)
+	assert.Equal(t, []byte((*Data)(nil).Hash(0)), nilBytes)
+	assert.Equal(t, []byte(new(Data).Hash(0)), nilBytes)
 }
 
 func TestCommit(t *testing.T) {
@@ -732,5 +749,410 @@ func TestCommitProtoBuf(t *testing.T) {
 		} else {
 			require.Error(t, err, tc.msg)
 		}
+	}
+}
+
+var blockIDTestCases = []BlockID{
+	{},
+	{Hash: []byte{}},
+	{[]byte("hashhashhashhashhashhash"), PartSetHeader{}},
+	{[]byte("hashhashhashhashhashhash"), PartSetHeader{Total: 1, Hash: []byte("part_set_hash")}},
+}
+
+func TestBlockIDAmino(t *testing.T) {
+	for _, tc := range blockIDTestCases {
+		bz, err := cdc.MarshalBinaryBare(tc)
+		require.NoError(t, err)
+
+		var tc2 BlockID
+		err = cdc.UnmarshalBinaryBare(bz, &tc2)
+		require.NoError(t, err)
+
+		var tc3 BlockID
+		err = tc3.UnmarshalFromAmino(cdc, bz)
+		require.NoError(t, err)
+
+		require.EqualValues(t, tc2, tc3)
+		require.EqualValues(t, len(bz), tc.AminoSize(cdc))
+	}
+}
+
+var headerAminoTestCases = []Header{
+	{},
+	{Version: version.Consensus{Block: 1, App: 1}},
+	{ChainID: "ChainID"},
+	{Height: 1},
+	{Height: math.MaxInt64},
+	{Height: math.MinInt64},
+	{Time: time.Now()},
+	{LastBlockID: BlockID{[]byte("Hash"), PartSetHeader{1, []byte("Hash")}}},
+	{LastCommitHash: []byte("LastCommitHash")},
+	{DataHash: []byte("DataHash")},
+	{ValidatorsHash: []byte("ValidatorsHash")},
+	{NextValidatorsHash: []byte("NextValidatorsHash")},
+	{ConsensusHash: []byte("ConsensusHash")},
+	{AppHash: []byte("AppHash")},
+	{LastResultsHash: []byte("LastResultsHash")},
+	{EvidenceHash: []byte("EvidenceHash")},
+	{ProposerAddress: []byte("ProposerAddress")},
+}
+
+func TestHeaderAmino(t *testing.T) {
+	for _, header := range headerAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(header)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), header.AminoSize(cdc))
+
+		var expectValue Header
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue Header
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+func BenchmarkHeaderAminoUnmarshal(b *testing.B) {
+	testData := make([][]byte, len(headerAminoTestCases))
+	for i, header := range headerAminoTestCases {
+		data, err := cdc.MarshalBinaryBare(header)
+		require.NoError(b, err)
+		testData[i] = data
+	}
+	b.ResetTimer()
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, data := range testData {
+				var header Header
+				err := cdc.UnmarshalBinaryBare(data, &header)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("unmarshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, data := range testData {
+				var header Header
+				err := header.UnmarshalFromAmino(cdc, data)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+}
+
+func TestDataAmino(t *testing.T) {
+	var testCases = []Data{
+		{},
+		{Txs: []Tx{}},
+		{Txs: []Tx{{}}},
+		{Txs: []Tx{nil}},
+		{Txs: []Tx{{}, []byte("tx1"), []byte("tx2"), nil}},
+		{hash: []byte("hash")},
+	}
+
+	for _, d := range testCases {
+		expectData, err := cdc.MarshalBinaryBare(d)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), d.AminoSize(cdc))
+
+		var expectValue Data
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue Data
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+var commitSigAminoTestCases = []CommitSig{
+	{},
+	{125, []byte("ValidatorAddress"), time.Now(), []byte("Signature")},
+	{math.MaxUint8, []byte(""), time.Now(), []byte("")},
+}
+
+func TestCommitSigAmino(t *testing.T) {
+	for _, cs := range commitSigAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(cs)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), cs.AminoSize(cdc))
+
+		var expectValue CommitSig
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue CommitSig
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+var commitAminoTestCases = []Commit{
+	{},
+	{
+		Height:     123456,
+		Round:      10,
+		BlockID:    BlockID{Hash: []byte("hash"), PartsHeader: PartSetHeader{Total: 123, Hash: []byte("hash")}},
+		Signatures: commitSigAminoTestCases,
+	},
+	{
+		Height:     math.MaxInt64,
+		Round:      math.MaxInt,
+		Signatures: []CommitSig{},
+	},
+	{
+		Height: math.MinInt64,
+		Round:  math.MinInt,
+	},
+}
+
+func TestCommitAmino(t *testing.T) {
+	for _, commit := range commitAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(commit)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), commit.AminoSize(cdc))
+
+		var expectValue Commit
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue Commit
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+func TestEvidenceDataAmino(t *testing.T) {
+	evidenceDataAminoTestCases := []EvidenceData{
+		{},
+		{[]Evidence{}, []byte("hash")},
+		{Evidence: []Evidence{nil, nil}},
+		{
+			Evidence: []Evidence{
+				nil,
+				&DuplicateVoteEvidence{VoteA: nil},
+				MockRandomEvidence{},
+				MockEvidence{},
+			},
+		},
+	}
+	for _, evi := range evidenceDataAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(evi)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), evi.AminoSize(cdc))
+
+		var expectValue EvidenceData
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue EvidenceData
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+var blockAminoTestCases = []Block{
+	{},
+	{
+		Header: Header{LastBlockID: BlockID{[]byte("Hash"), PartSetHeader{1, []byte("Hash")}}},
+		Data:   Data{Txs: []Tx{{}, []byte("tx1"), []byte("tx2"), nil}},
+		Evidence: EvidenceData{
+			Evidence: []Evidence{
+				&DuplicateVoteEvidence{VoteA: &Vote{
+					0, 12345, 123,
+					BlockID{[]byte("hash"), PartSetHeader{8, []byte("hash")}},
+					time.Now(),
+					[]byte("ValidatorAddress"),
+					23,
+					[]byte("Signature"), false,
+				}},
+			},
+		},
+		LastCommit: &Commit{
+			Height:     123456,
+			Round:      10,
+			BlockID:    BlockID{Hash: []byte("hash"), PartsHeader: PartSetHeader{Total: 123, Hash: []byte("hash")}},
+			Signatures: commitSigAminoTestCases,
+		},
+	},
+	{
+		LastCommit: &Commit{},
+	},
+}
+
+func TestBlockAmino(t *testing.T) {
+	for _, block := range blockAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(block)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), block.AminoSize(cdc))
+
+		var expectValue Block
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue Block
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}
+
+func BenchmarkBlockAminoUnmarshal(b *testing.B) {
+	testData := make([][]byte, len(blockAminoTestCases))
+	for i, block := range blockAminoTestCases {
+		data, err := cdc.MarshalBinaryBare(block)
+		require.NoError(b, err)
+		testData[i] = data
+	}
+	b.ResetTimer()
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, d := range testData {
+				var block Block
+				err := cdc.UnmarshalBinaryBare(d, &block)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.Run("unmarshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, d := range testData {
+				var block Block
+				err := block.UnmarshalFromAmino(cdc, d)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+}
+
+func Test_compressBlock(t *testing.T) {
+	bzShort := []byte("short bz value")
+	bzLarge := make([]byte, BlockCompressThreshold+1)
+	type args struct {
+		bz                  []byte
+		oldBlockComressType int
+		before              func()
+	}
+	tests := []struct {
+		name string
+		args args
+		want []byte
+		ret  func(got []byte) bool
+	}{
+		{"block compress type zero", args{bz: bzShort, oldBlockComressType: BlockCompressType, before: func() {}}, bzShort, func([]byte) bool { return true }},
+		{"block compress with short length", args{bz: bzShort, oldBlockComressType: BlockCompressType, before: func() { BlockCompressType = 1 }}, bzShort, func([]byte) bool { return true }},
+		{"block compress with large length", args{bz: bzLarge, oldBlockComressType: BlockCompressType, before: func() { BlockCompressType = 1 }}, nil, func(got []byte) bool { return len(got) < len(bzLarge) }},
+		{"block compress with unknown compress type", args{bz: bzLarge, oldBlockComressType: BlockCompressType, before: func() { BlockCompressType = 9 }}, nil, func(got []byte) bool { return len(got) > len(bzLarge) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.args.before()
+			got := compressBlock(tt.args.bz, BlockCompressType, 0)
+			assert.NotNil(t, got)
+			assert.True(t, tt.ret(got))
+			BlockCompressType = tt.args.oldBlockComressType
+		})
+	}
+}
+
+func TestUncompressBlockFromReader(t *testing.T) {
+	unCompressedContent, _ := cdc.MarshalBinaryBare([]byte("this is unCompressed content"))
+	unCompressedReader := stdbytes.NewReader(unCompressedContent)
+
+	compressedBytes := make([]byte, BlockCompressThreshold+1)
+	content, _ := cdc.MarshalBinaryBare(compressedBytes)
+	oldCompressType := BlockCompressType
+	BlockCompressType = 1
+	compressedContent := compressBlock(content, BlockCompressType, 0)
+	compressedReader := stdbytes.NewReader(compressedContent)
+
+	type args struct {
+		pbpReader io.Reader
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    []byte
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{"uncompressed from not compressed reader", args{pbpReader: unCompressedReader}, unCompressedContent, assert.NoError},
+		{"uncompressed from compressed reader", args{pbpReader: compressedReader}, content, assert.NoError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := UncompressBlockFromReader(tt.args.pbpReader)
+			if !tt.wantErr(t, err, fmt.Sprintf("UncompressBlockFromReader(%v)", tt.args.pbpReader)) {
+				return
+			}
+			gotBytes := make([]byte, BlockCompressThreshold+BlockCompressThreshold)
+			n, _ := got.Read(gotBytes)
+			assert.Equalf(t, tt.want, gotBytes[:n], "UncompressBlockFromReader(%v)", tt.args.pbpReader)
+		})
+	}
+	BlockCompressType = oldCompressType
+}
+
+func TestUncompressBlockFromBytes(t *testing.T) {
+	unCompressedContent, _ := cdc.MarshalBinaryBare([]byte("this is unCompressed content"))
+
+	compressedBytes := make([]byte, BlockCompressThreshold+1)
+	content, _ := cdc.MarshalBinaryBare(compressedBytes)
+	BlockCompressType = 1
+	compressedContent := compressBlock(content, BlockCompressType, 0)
+
+	type args struct {
+		payload []byte
+	}
+	tests := []struct {
+		name             string
+		args             args
+		wantRes          []byte
+		wantCompressType int
+		wantErr          assert.ErrorAssertionFunc
+	}{
+		{"uncompressed from not compressed bytes", args{payload: unCompressedContent}, unCompressedContent, 0, assert.NoError},
+		{"uncompressed from compressed bytes", args{payload: compressedContent}, content, 1, assert.NoError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRes, gotCompressSign, err := UncompressBlockFromBytes(tt.args.payload)
+			if !tt.wantErr(t, err, fmt.Sprintf("UncompressBlockFromBytes(%v)", tt.args.payload)) {
+				return
+			}
+			gotCompressType := gotCompressSign / CompressDividing
+			assert.Equalf(t, tt.wantRes, gotRes, "UncompressBlockFromBytes(%v)", tt.args.payload)
+			assert.Equalf(t, tt.wantCompressType, gotCompressType, "UncompressBlockFromBytes(%v)", tt.args.payload)
+		})
 	}
 }

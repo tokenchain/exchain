@@ -1,12 +1,16 @@
 package common
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/client/context"
+	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
-
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/x/distribution/types"
+	staking "github.com/okex/exchain/x/staking/types"
 )
 
 // QueryParams actually queries distribution params
@@ -27,7 +31,46 @@ func QueryParams(cliCtx context.CLIContext, queryRoute string) (params types.Par
 	}
 	cliCtx.Codec.MustUnmarshalJSON(bytes, &withdrawAddrEnabled)
 
-	return types.NewParams(communityTax, withdrawAddrEnabled), err
+	var distributionType uint32
+	route = fmt.Sprintf("custom/%s/params/%s", queryRoute, types.ParamDistributionType)
+	bytes, _, err = cliCtx.QueryWithData(route, []byte{})
+	if err == nil {
+		cliCtx.Codec.MustUnmarshalJSON(bytes, &distributionType)
+	} else if !ignoreError(err.Error()) {
+		return
+	}
+
+	var withdrawRewardEnabled bool
+	route = fmt.Sprintf("custom/%s/params/%s", queryRoute, types.ParamWithdrawRewardEnabled)
+	bytes, _, err = cliCtx.QueryWithData(route, []byte{})
+	if err == nil {
+		cliCtx.Codec.MustUnmarshalJSON(bytes, &withdrawRewardEnabled)
+	} else if !ignoreError(err.Error()) {
+		return
+	}
+
+	var rewardTruncatePrecision int64
+	route = fmt.Sprintf("custom/%s/params/%s", queryRoute, types.ParamRewardTruncatePrecision)
+	bytes, _, err = cliCtx.QueryWithData(route, []byte{})
+	if err == nil {
+		cliCtx.Codec.MustUnmarshalJSON(bytes, &rewardTruncatePrecision)
+	} else if !ignoreError(err.Error()) {
+		return
+	}
+
+	return types.NewParams(communityTax, withdrawAddrEnabled, distributionType, withdrawRewardEnabled, rewardTruncatePrecision), nil
+}
+
+func ignoreError(err string) bool {
+	type ParamsError struct {
+		Code uint32 `json:"code"`
+	}
+	var paramsError ParamsError
+	jsonErr := json.Unmarshal([]byte(err), &paramsError)
+	if jsonErr != nil {
+		return false
+	}
+	return paramsError.Code == types.CodeUnknownDistributionParamType
 }
 
 // QueryValidatorCommission returns a validator's commission.
@@ -49,4 +92,79 @@ func WithdrawValidatorRewardsAndCommission(validatorAddr sdk.ValAddress) ([]sdk.
 	}
 
 	return []sdk.Msg{commissionMsg}, nil
+}
+
+type WrapError struct {
+	Code      uint32 `json:"code"`
+	Log       string `json:"log"`
+	Codespace string `json:"codespace"`
+	Changed   bool   `json:"-"`
+	RawError  error  `json:"-"`
+}
+
+func (e *WrapError) Error() string {
+	data, jsonErr := json.Marshal(e)
+	if jsonErr != nil {
+		fmt.Fprintf(os.Stderr, "Trans wrap error, marshal err=%v\n", jsonErr)
+		return ""
+	}
+	return string(data)
+}
+
+func (e *WrapError) setLog(log string) {
+	e.Log = log
+}
+
+func (e *WrapError) Trans(code uint32, newLog string) {
+	if e.Code == abci.CodeTypeNonceInc+code {
+		e.setLog(fmt.Sprintf("%s;%s", newLog, e.Log))
+		e.Changed = true
+	}
+}
+
+func NewWrapError(err error) *WrapError {
+	if err == nil {
+		return nil
+	}
+	var wrapErr WrapError
+	jsonErr := json.Unmarshal([]byte(err.Error()), &wrapErr)
+	if jsonErr != nil {
+		fmt.Fprintf(os.Stderr, "Trans wrap error, unmarshal err=%v\n", jsonErr)
+		return nil
+	}
+	wrapErr.RawError = err
+	return &wrapErr
+}
+
+func IsValidator(cliCtx context.CLIContext, cdc *codec.Codec, valAddress sdk.ValAddress) bool {
+	resKVs, _, err := cliCtx.QuerySubspace(staking.ValidatorsKey, staking.StoreKey)
+	if err != nil {
+		return false
+	}
+
+	for _, kv := range resKVs {
+		if staking.MustUnmarshalValidator(cdc, kv.Value).GetOperator().Equals(valAddress) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func IsDelegator(cliCtx context.CLIContext, cdc *codec.Codec, delAddr sdk.AccAddress) bool {
+	delegator := staking.NewDelegator(delAddr)
+	resp, _, err := cliCtx.QueryStore(staking.GetDelegatorKey(delAddr), staking.StoreKey)
+	if err != nil {
+		return false
+	}
+	if len(resp) == 0 {
+		return false
+	}
+	cdc.MustUnmarshalBinaryLengthPrefixed(resp, &delegator)
+
+	if delegator.Tokens.IsZero() {
+		return false
+	}
+
+	return true
 }

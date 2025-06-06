@@ -3,8 +3,8 @@ package keeper
 import (
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
-	comm "github.com/okex/exchain/x/common"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	comm "github.com/okex/exchain/x/common"
 
 	"github.com/okex/exchain/x/distribution/types"
 )
@@ -19,11 +19,26 @@ func NewQuerier(k Keeper) sdk.Querier {
 		case types.QueryValidatorCommission:
 			return queryValidatorCommission(ctx, path[1:], req, k)
 
+		case types.QueryCM45ValidatorCommission:
+			return cm45QueryValidatorCommission(ctx, path[1:], req, k)
+
 		case types.QueryWithdrawAddr:
 			return queryDelegatorWithdrawAddress(ctx, path[1:], req, k)
 
 		case types.QueryCommunityPool:
 			return queryCommunityPool(ctx, path[1:], req, k)
+
+		case types.QueryDelegatorValidators:
+			return queryDelegatorValidators(ctx, path[1:], req, k)
+
+		case types.QueryDelegationRewards:
+			return queryDelegationRewards(ctx, path[1:], req, k)
+
+		case types.QueryDelegatorTotalRewards:
+			return queryDelegatorTotalRewards(ctx, path[1:], req, k)
+
+		case types.QueryValidatorOutstandingRewards:
+			return queryValidatorOutstandingRewards(ctx, path[1:], req, k)
 
 		default:
 			return nil, types.ErrUnknownDistributionQueryType()
@@ -45,7 +60,24 @@ func queryParams(ctx sdk.Context, path []string, req abci.RequestQuery, k Keeper
 			return nil, comm.ErrMarshalJSONFailed(err.Error())
 		}
 		return bz, nil
-
+	case types.ParamDistributionType:
+		bz, err := codec.MarshalJSONIndent(k.cdc, k.GetDistributionType(ctx))
+		if err != nil {
+			return nil, comm.ErrMarshalJSONFailed(err.Error())
+		}
+		return bz, nil
+	case types.ParamWithdrawRewardEnabled:
+		bz, err := codec.MarshalJSONIndent(k.cdc, k.GetWithdrawRewardEnabled(ctx))
+		if err != nil {
+			return nil, comm.ErrMarshalJSONFailed(err.Error())
+		}
+		return bz, nil
+	case types.ParamRewardTruncatePrecision:
+		bz, err := codec.MarshalJSONIndent(k.cdc, k.GetRewardTruncatePrecision(ctx))
+		if err != nil {
+			return nil, comm.ErrMarshalJSONFailed(err.Error())
+		}
+		return bz, nil
 	default:
 		return nil, types.ErrUnknownDistributionParamType()
 	}

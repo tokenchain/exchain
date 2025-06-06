@@ -3,8 +3,9 @@ package cachemulti
 import (
 	"fmt"
 	"io"
+	"sync"
 
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/store/cachekv"
 	"github.com/okex/exchain/libs/cosmos-sdk/store/dbadapter"
@@ -55,6 +56,32 @@ func NewFromKVStore(
 	return cms
 }
 
+// newFromKVStore creates a new Store object from a mapping of store keys to
+// CacheWrap objects and a KVStore as the database. Each CacheWrapper store
+// is cache-wrapped.
+func newFromKVStore(
+	store types.KVStore, stores map[types.StoreKey]types.CacheWrap,
+	keys map[string]types.StoreKey, traceWriter io.Writer, traceContext types.TraceContext,
+) Store {
+	cms := Store{
+		db:           cachekv.NewStore(store),
+		stores:       make(map[types.StoreKey]types.CacheWrap, len(stores)),
+		keys:         keys,
+		traceWriter:  traceWriter,
+		traceContext: traceContext,
+	}
+
+	for key, store := range stores {
+		if cms.TracingEnabled() {
+			cms.stores[key] = store.CacheWrapWithTrace(cms.traceWriter, cms.traceContext)
+		} else {
+			cms.stores[key] = store.CacheWrap()
+		}
+	}
+
+	return cms
+}
+
 // NewStore creates a new Store object from a mapping of store keys to
 // CacheWrapper objects. Each CacheWrapper store is cache-wrapped.
 func NewStore(
@@ -66,12 +93,64 @@ func NewStore(
 }
 
 func newCacheMultiStoreFromCMS(cms Store) Store {
-	stores := make(map[types.StoreKey]types.CacheWrapper)
-	for k, v := range cms.stores {
-		stores[k] = v
+	return newFromKVStore(cms.db, cms.stores, nil, cms.traceWriter, cms.traceContext)
+}
+
+func (cms Store) Reset(ms types.MultiStore) bool {
+	switch rms := ms.(type) {
+	case Store:
+		cms.reset(rms)
+		return true
+	default:
+		return false
+	}
+}
+
+var keysPool = &sync.Pool{
+	New: func() interface{} {
+		return make(map[types.StoreKey]struct{})
+	},
+}
+
+func (cms Store) reset(ms Store) {
+	cms.db.(*cachekv.Store).Reset(ms.db)
+	cms.traceWriter = ms.traceWriter
+	cms.traceContext = ms.traceContext
+	cms.keys = ms.keys
+
+	keysMap := keysPool.Get().(map[types.StoreKey]struct{})
+	defer keysPool.Put(keysMap)
+
+	for k := range keysMap {
+		delete(keysMap, k)
+	}
+	for k := range ms.stores {
+		keysMap[k] = struct{}{}
 	}
 
-	return NewFromKVStore(cms.db, stores, nil, cms.traceWriter, cms.traceContext)
+	for k := range keysMap {
+		msstore := ms.stores[k]
+		if store, ok := cms.stores[k]; ok {
+			if cstore, ok := store.(*cachekv.Store); ok {
+				msKvstore, ok := msstore.(types.KVStore)
+				if ok {
+					cstore.Reset(msKvstore)
+				} else {
+					cms.stores[k] = msstore.CacheWrap()
+				}
+			} else {
+				cms.stores[k] = msstore.CacheWrap()
+			}
+		} else {
+			cms.stores[k] = msstore.CacheWrap()
+		}
+	}
+
+	for k := range cms.stores {
+		if _, ok := keysMap[k]; !ok {
+			delete(cms.stores, k)
+		}
+	}
 }
 
 // SetTracer sets the tracer for the MultiStore that the underlying
@@ -115,16 +194,52 @@ func (cms Store) Write() {
 	}
 }
 
-func (cms Store) IteratorCache(cb func(key, value []byte, isDirty bool) bool) bool {
-	if !cms.db.IteratorCache(cb) {
-		return false
+// Write calls Write on each underlying store.
+func (cms Store) WriteWithSnapshotWSet() types.SnapshotWSet {
+	panic("not support ")
+}
+
+func (cms Store) RevertDBWithSnapshotRWSet(set types.SnapshotWSet) {
+	panic("not support ")
+}
+
+func (cms Store) WriteGetMultiSnapshotWSet() types.MultiSnapshotWSet {
+	multiSet := types.NewMultiSnapshotWSet()
+	multiSet.Root = cms.db.WriteWithSnapshotWSet()
+	for key, store := range cms.stores {
+		multiSet.Stores[key] = store.WriteWithSnapshotWSet()
 	}
-	for _, store := range cms.stores {
-		if !store.IteratorCache(cb) {
+	return multiSet
+}
+
+func (cms Store) RevertDBWithMultiSnapshotRWSet(set types.MultiSnapshotWSet) {
+	types.RevertSnapshotWSet(cms.db, set.Root)
+	for key, store := range cms.stores {
+		if vSet, ok := set.Stores[key]; !ok {
+			panic(fmt.Errorf("RevertDBWithMultiSnapshotRWSet store %s but MultiSnapshotWSet have not", key.String()))
+		} else {
+			store.RevertDBWithSnapshotRWSet(vSet)
+		}
+
+	}
+}
+
+func (cms Store) IteratorCache(isdirty bool, cb func(key string, value []byte, isDirty bool, isDelete bool, storeKey types.StoreKey) bool, sKey types.StoreKey) bool {
+	for key, store := range cms.stores {
+		if !store.IteratorCache(isdirty, cb, key) {
 			return false
 		}
 	}
 	return true
+}
+
+func (cms Store) GetRWSet(mp types.MsRWSet) {
+	for key, store := range cms.stores {
+		if _, ok := mp[key]; !ok {
+			mp[key] = types.NewCacheKvRWSet()
+		}
+		store.(*cachekv.Store).CopyRWSet(mp[key])
+	}
 }
 
 // Implements CacheWrapper.
@@ -153,14 +268,32 @@ func (cms Store) CacheMultiStoreWithVersion(_ int64) (types.CacheMultiStore, err
 
 // GetStore returns an underlying Store by key.
 func (cms Store) GetStore(key types.StoreKey) types.Store {
-	return cms.stores[key].(types.Store)
+	s := cms.stores[key]
+	if key == nil || s == nil {
+		panic(fmt.Sprintf("kv store with key %v has not been registered in stores", key))
+	}
+	return s.(types.Store)
 }
 
 // GetKVStore returns an underlying KVStore by key.
 func (cms Store) GetKVStore(key types.StoreKey) types.KVStore {
 	store := cms.stores[key]
-	if key == nil {
+	if key == nil || store == nil {
 		panic(fmt.Sprintf("kv store with key %v has not been registered in stores", key))
 	}
+
 	return store.(types.KVStore)
+}
+
+func (cms Store) Clear() {
+	cms.db.Clear()
+	for _, store := range cms.stores {
+		store.Clear()
+	}
+}
+
+func (cms Store) DisableCacheReadList() {
+	for _, store := range cms.stores {
+		store.DisableCacheReadList()
+	}
 }

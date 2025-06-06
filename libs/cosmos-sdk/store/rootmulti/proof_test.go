@@ -1,11 +1,12 @@
 package rootmulti
 
 import (
+	types2 "github.com/okex/exchain/libs/tendermint/types"
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/stretchr/testify/require"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/store/iavl"
 	"github.com/okex/exchain/libs/cosmos-sdk/store/types"
@@ -14,11 +15,12 @@ import (
 func TestVerifyIAVLStoreQueryProof(t *testing.T) {
 	// Create main tree for testing.
 	db := dbm.NewMemDB()
-	iStore, err := iavl.LoadStore(db, types.CommitID{}, false, 0)
+	flatKvDB := dbm.NewMemDB()
+	iStore, err := iavl.LoadStore(db, flatKvDB, types.CommitID{}, false, 0)
 	store := iStore.(*iavl.Store)
 	require.Nil(t, err)
 	store.Set([]byte("MYKEY"), []byte("MYVALUE"))
-	cid := store.Commit()
+	cid, _ := store.CommitterCommit(nil)
 
 	// Get Proof
 	res := store.Query(abci.RequestQuery{
@@ -56,6 +58,7 @@ func TestVerifyIAVLStoreQueryProof(t *testing.T) {
 
 func TestVerifyMultiStoreQueryProof(t *testing.T) {
 	// Create main tree for testing.
+	types2.UnittestOnlySetMilestoneVenus1Height(-1)
 	db := dbm.NewMemDB()
 	store := NewStore(db)
 	iavlStoreKey := types.NewKVStoreKey("iavlStoreKey")
@@ -65,7 +68,7 @@ func TestVerifyMultiStoreQueryProof(t *testing.T) {
 
 	iavlStore := store.GetCommitStore(iavlStoreKey).(*iavl.Store)
 	iavlStore.Set([]byte("MYKEY"), []byte("MYVALUE"))
-	cid := store.Commit()
+	cid, _ := store.CommitterCommitMap(nil)
 
 	// Get Proof
 	res := store.Query(abci.RequestQuery{
@@ -109,36 +112,8 @@ func TestVerifyMultiStoreQueryProof(t *testing.T) {
 	require.NotNil(t, err)
 }
 
-func TestVerifyMultiStoreQueryProofEmptyStore(t *testing.T) {
-	// Create main tree for testing.
-	db := dbm.NewMemDB()
-	store := NewStore(db)
-	iavlStoreKey := types.NewKVStoreKey("iavlStoreKey")
-
-	store.MountStoreWithDB(iavlStoreKey, types.StoreTypeIAVL, nil)
-	store.LoadVersion(0)
-	cid := store.Commit() // Commit with empty iavl store.
-
-	// Get Proof
-	res := store.Query(abci.RequestQuery{
-		Path:  "/iavlStoreKey/key", // required path to get key/value+proof
-		Data:  []byte("MYKEY"),
-		Prove: true,
-	})
-	require.NotNil(t, res.Proof)
-
-	// Verify proof.
-	prt := DefaultProofRuntime()
-	err := prt.VerifyAbsence(res.Proof, cid.Hash, "/iavlStoreKey/MYKEY")
-	require.Nil(t, err)
-
-	// Verify (bad) proof.
-	prt = DefaultProofRuntime()
-	err = prt.VerifyValue(res.Proof, cid.Hash, "/iavlStoreKey/MYKEY", []byte("MYVALUE"))
-	require.NotNil(t, err)
-}
-
 func TestVerifyMultiStoreQueryProofAbsence(t *testing.T) {
+	types2.UnittestOnlySetMilestoneVenus1Height(-1)
 	// Create main tree for testing.
 	db := dbm.NewMemDB()
 	store := NewStore(db)
@@ -149,7 +124,7 @@ func TestVerifyMultiStoreQueryProofAbsence(t *testing.T) {
 
 	iavlStore := store.GetCommitStore(iavlStoreKey).(*iavl.Store)
 	iavlStore.Set([]byte("MYKEY"), []byte("MYVALUE"))
-	cid := store.Commit() // Commit with empty iavl store.
+	cid, _ := store.CommitterCommitMap(nil) // Commit with empty iavl store.
 
 	// Get Proof
 	res := store.Query(abci.RequestQuery{

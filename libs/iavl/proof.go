@@ -6,9 +6,9 @@ import (
 
 	"github.com/pkg/errors"
 
-	amino "github.com/tendermint/go-amino"
 	cmn "github.com/okex/exchain/libs/iavl/common"
 	"github.com/okex/exchain/libs/tendermint/crypto/tmhash"
+	amino "github.com/tendermint/go-amino"
 )
 
 var (
@@ -23,6 +23,8 @@ var (
 )
 
 //----------------------------------------
+// ProofInnerNode
+// Contract: Left and Right can never both be set. Will result in a empty `[]` roothash
 
 type ProofInnerNode struct {
 	Height  int8   `json:"height"`
@@ -62,6 +64,10 @@ func (pin ProofInnerNode) Hash(childHash []byte) []byte {
 	}
 	if err == nil {
 		err = amino.EncodeVarint(buf, pin.Version)
+	}
+
+	if len(pin.Left) > 0 && len(pin.Right) > 0 {
+		panic(fmt.Sprintf("Failed to hash ProofInnerNode: both left and right child hashes are set"))
 	}
 
 	if len(pin.Left) == 0 {

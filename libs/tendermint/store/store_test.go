@@ -3,17 +3,19 @@ package store
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"math/rand"
 	"os"
 	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
 
+	db "github.com/okex/exchain/libs/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	db "github.com/tendermint/tm-db"
-	dbm "github.com/tendermint/tm-db"
 
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
@@ -472,6 +474,92 @@ func TestPruneBlocks(t *testing.T) {
 	assert.Nil(t, bs.LoadBlock(1501))
 }
 
+func TestDeleteBlocksFromTop(t *testing.T) {
+	config := cfg.ResetTestRoot("blockchain_reactor_test")
+	defer os.RemoveAll(config.RootDir)
+	state, err := sm.LoadStateFromDBOrGenesisFile(dbm.NewMemDB(), config.GenesisFile())
+	require.NoError(t, err)
+	db := dbm.NewMemDB()
+	bs := NewBlockStore(db)
+	assert.EqualValues(t, 0, bs.Base())
+	assert.EqualValues(t, 0, bs.Height())
+	assert.EqualValues(t, 0, bs.Size())
+
+	// deleting an empty store should error, even when deleting to 0
+	_, err = bs.DeleteBlocksFromTop(1)
+	require.Error(t, err)
+
+	_, err = bs.DeleteBlocksFromTop(0)
+	require.Error(t, err)
+
+	// make more than 1000 blocks, to test batch deletions
+	for h := int64(1); h <= 1500; h++ {
+		block := makeBlock(h, state, new(types.Commit))
+		partSet := block.MakePartSet(2)
+		seenCommit := makeTestCommit(h, tmtime.Now())
+		bs.SaveBlock(block, partSet, seenCommit)
+	}
+
+	assert.EqualValues(t, 1, bs.Base())
+	assert.EqualValues(t, 1500, bs.Height())
+	assert.EqualValues(t, 1500, bs.Size())
+
+	deletedBlock := bs.LoadBlock(1201)
+
+	// Check that basic pruning works
+	deleted, err := bs.DeleteBlocksFromTop(1200)
+	require.NoError(t, err)
+	assert.EqualValues(t, 300, deleted)
+	assert.EqualValues(t, 1, bs.Base())
+	assert.EqualValues(t, 1200, bs.Height())
+	assert.EqualValues(t, 1200, bs.Size())
+	assert.EqualValues(t, BlockStoreStateJSON{
+		Base:   1,
+		Height: 1200,
+	}, LoadBlockStoreStateJSON(db))
+
+	require.NotNil(t, bs.LoadBlock(1200))
+	require.Nil(t, bs.LoadBlock(1201))
+	require.Nil(t, bs.LoadBlockByHash(deletedBlock.Hash()))
+	require.Nil(t, bs.LoadBlockCommit(1201))
+	require.Nil(t, bs.LoadBlockMeta(1201))
+	require.Nil(t, bs.LoadBlockPart(1201, 1))
+
+	for i := int64(1201); i <= 1500; i++ {
+		require.Nil(t, bs.LoadBlock(i))
+	}
+	for i := int64(1); i <= 1200; i++ {
+		require.NotNil(t, bs.LoadBlock(i))
+	}
+
+	// Deleting up the current height should error
+	_, err = bs.DeleteBlocksFromTop(1201)
+	require.Error(t, err)
+
+	// Deleting down to the current height should work
+	deleted, err = bs.DeleteBlocksFromTop(1200)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, deleted)
+
+	// Deleting again should work
+	deleted, err = bs.DeleteBlocksFromTop(1100)
+	require.NoError(t, err)
+	assert.EqualValues(t, 100, deleted)
+	assert.EqualValues(t, 1100, bs.Height())
+
+	// Deleting beyond the current height should error
+	_, err = bs.DeleteBlocksFromTop(1101)
+	require.Error(t, err)
+
+	// Deleting to the current base should work
+	deleted, err = bs.DeleteBlocksFromTop(1)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1099, deleted)
+	assert.Nil(t, bs.LoadBlock(2))
+	assert.NotNil(t, bs.LoadBlock(1))
+	assert.Nil(t, bs.LoadBlock(2))
+}
+
 func TestLoadBlockMeta(t *testing.T) {
 	bs, db := freshBlockStore()
 	height := int64(10)
@@ -528,6 +616,38 @@ func TestBlockFetchAtHeight(t *testing.T) {
 	require.Nil(t, blockAtHeightPlus2, "expecting an unsuccessful load of Height()+2")
 }
 
+func TestBlockFetchAtHeightWithExInfo(t *testing.T) {
+	types.BlockCompressThreshold = 0
+	state, bs, cleanup := makeStateAndBlockStore(log.NewTMLogger(new(bytes.Buffer)))
+	defer cleanup()
+	require.Equal(t, bs.Height(), int64(0), "initially the height should be zero")
+	block := makeBlock(bs.Height()+1, state, new(types.Commit))
+
+	exInfo1 := &types.BlockExInfo{BlockCompressType: 2, BlockCompressFlag: 1, BlockPartSize: 2}
+	partSet := block.MakePartSetByExInfo(exInfo1)
+	seenCommit := makeTestCommit(10, tmtime.Now())
+	bs.SaveBlock(block, partSet, seenCommit)
+	require.Equal(t, bs.Height(), block.Header.Height, "expecting the new height to be changed")
+
+	blockAtHeight, exInfo2 := bs.LoadBlockWithExInfo(bs.Height())
+	bz1 := cdc.MustMarshalBinaryBare(block)
+	bz2 := cdc.MustMarshalBinaryBare(blockAtHeight)
+	require.Equal(t, bz1, bz2)
+	require.Equal(t, block.Hash(), blockAtHeight.Hash(),
+		"expecting a successful load of the last saved block")
+	require.EqualValues(t, exInfo1, exInfo2)
+
+	blockAtHeightPlus1, exInfoPlus1 := bs.LoadBlockWithExInfo(bs.Height() + 1)
+	require.Nil(t, blockAtHeightPlus1, "expecting an unsuccessful load of Height()+1")
+	require.Nil(t, exInfoPlus1)
+	blockAtHeightPlus2, exInfoPlus2 := bs.LoadBlockWithExInfo(bs.Height() + 2)
+	require.Nil(t, blockAtHeightPlus2, "expecting an unsuccessful load of Height()+2")
+	require.Nil(t, exInfoPlus2)
+
+	partSet2 := block.MakePartSetByExInfo(exInfo2)
+	require.EqualValues(t, partSet, partSet2)
+}
+
 func doFn(fn func() (interface{}, error)) (res interface{}, err error, panicErr error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -555,4 +675,82 @@ func newBlock(hdr types.Header, lastCommit *types.Commit) *types.Block {
 		Header:     hdr,
 		LastCommit: lastCommit,
 	}
+}
+
+func calcBlockMetaKeyOld(height int64) []byte {
+	return []byte(fmt.Sprintf("H:%v", height))
+}
+
+func calcBlockPartKeyOld(height int64, partIndex int) []byte {
+	return []byte(fmt.Sprintf("P:%v:%v", height, partIndex))
+}
+
+func calcBlockCommitKeyOld(height int64) []byte {
+	return []byte(fmt.Sprintf("C:%v", height))
+}
+
+func calcSeenCommitKeyOld(height int64) []byte {
+	return []byte(fmt.Sprintf("SC:%v", height))
+}
+
+func calcBlockHashKeyOld(hash []byte) []byte {
+	return []byte(fmt.Sprintf("BH:%x", hash))
+}
+
+func TestCalcKey(t *testing.T) {
+	for _, tc := range []int64{
+		0, 1, -2, math.MaxInt64, math.MinInt64, 12345, -12345,
+	} {
+		require.Equal(t, calcBlockMetaKey(tc), calcBlockMetaKeyOld(tc))
+		require.Equal(t, calcBlockCommitKey(tc), calcBlockCommitKeyOld(tc))
+		require.Equal(t, calcSeenCommitKey(tc), calcSeenCommitKeyOld(tc))
+	}
+
+	for _, tc := range []struct {
+		height    int64
+		partIndex int
+	}{
+		{},
+		{-1, -1},
+		{
+			height:    12345,
+			partIndex: 23456,
+		},
+		{
+			height:    math.MaxInt64,
+			partIndex: math.MaxInt,
+		},
+		{
+			height:    math.MinInt64,
+			partIndex: math.MinInt,
+		},
+	} {
+		require.Equal(t, calcBlockPartKey(tc.height, tc.partIndex), calcBlockPartKeyOld(tc.height, tc.partIndex))
+	}
+
+	for _, tc := range [][]byte{
+		nil,
+		[]byte{},
+		make([]byte, 100),
+		make([]byte, 1024),
+	} {
+		_, err := rand.Read(tc)
+		require.NoError(t, err)
+		require.Equal(t, calcBlockHashKey(tc), calcBlockHashKeyOld(tc))
+	}
+}
+
+func BenchmarkCalcKey(b *testing.B) {
+	b.Run("calcBlockMetaKey", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			calcBlockMetaKey(int64(i))
+		}
+	})
+	b.Run("calcBlockMetaKeyOld", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			calcBlockMetaKeyOld(int64(i))
+		}
+	})
 }

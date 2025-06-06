@@ -1,16 +1,21 @@
 package types
 
 import (
+	"math"
 	"testing"
+
+	"github.com/okex/exchain/libs/tendermint/crypto/multisig"
+
+	"github.com/okex/exchain/libs/tendermint/types/time"
 
 	"github.com/okex/exchain/x/common"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tmtypes "github.com/okex/exchain/libs/tendermint/types"
 )
 
 func TestValidatorTestEquivalent(t *testing.T) {
@@ -137,6 +142,72 @@ func TestValidatorMarshalUnmarshalJSON(t *testing.T) {
 	err = codec.Cdc.UnmarshalJSON(js, got)
 	assert.NoError(t, err)
 	assert.Equal(t, validator, *got)
+}
+
+func TestValidatorAmino(t *testing.T) {
+	common.InitConfig()
+	validator := NewValidator(valAddr1, pk1, Description{"test1", "test2", "test3", "test4"}, DefaultMinSelfDelegation)
+	validator.Jailed = true
+	validator.Status = sdk.Bonded
+	validator.Tokens = sdk.OneInt()
+	validator.UnbondingHeight = 1000
+	validator.Commission = NewCommission(sdk.NewDec(1000), sdk.NewDec(2000), sdk.NewDec(3000))
+	validator.Commission.UpdateTime = time.Now()
+	cdc := ModuleCdc
+
+	testCases := []Validator{
+		{},
+		{
+			OperatorAddress:         valAddr1,
+			ConsPubKey:              pk1,
+			Jailed:                  true,
+			Status:                  sdk.Bonded,
+			Tokens:                  sdk.OneInt(),
+			DelegatorShares:         sdk.OneDec(),
+			Description:             Description{"1", "2", "3", "4"},
+			UnbondingHeight:         math.MaxInt64,
+			UnbondingCompletionTime: time.Now(),
+			Commission: Commission{
+				CommissionRates{sdk.ZeroDec(), sdk.OneDec(), sdk.NewDec(123)},
+				time.Now(),
+			},
+			MinSelfDelegation: DefaultMinSelfDelegation,
+		},
+		{
+			OperatorAddress:   []byte{},
+			ConsPubKey:        multisig.PubKeyMultisigThreshold{},
+			Jailed:            false,
+			Status:            sdk.Unbonded,
+			Tokens:            sdk.NewInt(math.MaxInt64),
+			DelegatorShares:   sdk.NewDec(math.MaxInt64),
+			UnbondingHeight:   math.MinInt64,
+			Commission:        NewCommission(sdk.NewDec(math.MaxInt64), sdk.NewDec(math.MaxInt64), sdk.NewDec(math.MaxInt64)),
+			MinSelfDelegation: sdk.NewDec(math.MaxInt64),
+		},
+		{
+			Status:            sdk.Unbonding,
+			Tokens:            sdk.NewInt(math.MinInt64),
+			DelegatorShares:   sdk.NewDec(math.MinInt64),
+			Commission:        NewCommission(sdk.NewDec(math.MinInt64), sdk.NewDec(math.MinInt64), sdk.NewDec(math.MinInt64)),
+			MinSelfDelegation: sdk.NewDec(math.MinInt64),
+		},
+		validator,
+	}
+
+	for _, validator := range testCases {
+		bz, err := cdc.MarshalBinaryBare(validator)
+		require.NoError(t, err)
+
+		var v1 Validator
+		err = cdc.UnmarshalBinaryBare(bz, &v1)
+		require.NoError(t, err)
+
+		var v2 Validator
+		err = v2.UnmarshalFromAmino(cdc, bz)
+		require.NoError(t, err)
+
+		require.EqualValues(t, v1, v2)
+	}
 }
 
 func TestValidatorSetInitialCommission(t *testing.T) {

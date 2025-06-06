@@ -3,20 +3,47 @@ package iavl
 import (
 	"bytes"
 	"container/list"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"sync"
 
+	"github.com/tendermint/go-amino"
+
+	dbm "github.com/okex/exchain/libs/tm-db"
 	"github.com/pkg/errors"
-	dbm "github.com/tendermint/tm-db"
 )
+
+// when upgrade to fast IAVL every commitGap nodes will trigger a db commit.
+var commitGap uint64 = 5000000
+
+// when upgrade to fast IAVL every verboseGap nodes will trigger a print.
+const verboseGap = 50000
 
 func SetIgnoreVersionCheck(check bool) {
 	ignoreVersionCheck = check
 }
 
+func GetIgnoreVersionCheck() bool {
+	return ignoreVersionCheck
+}
+
+func SetProduceDelta(pd bool) {
+	produceDelta = pd
+}
+
+func GetFinalCommitGapOffset() int64 {
+	return finalCommitGapOffset
+}
+
+func SetFinalCommitGapOffset(offset int64) {
+	finalCommitGapOffset = offset
+}
+
 var (
-	ignoreVersionCheck = false
+	ignoreVersionCheck         = false
+	produceDelta               = false
+	finalCommitGapOffset int64 = 0
 )
 
 // MutableTree is a persistent tree which keeps track of versions. It is not safe for concurrent
@@ -28,23 +55,32 @@ var (
 //
 // The inner ImmutableTree should not be used directly by callers.
 type MutableTree struct {
-	*ImmutableTree                  // The current, working tree.
-	lastSaved      *ImmutableTree   // The most recently saved tree.
-	orphans        []*Node          // Nodes removed by changes to working tree.Will refresh after each block
-	commitOrphans  map[string]int64 // Nodes removed by changes to working tree.Will refresh after each commit.
-	versions       *SyncMap   // The previous, saved versions of the tree.
-	removedVersions   sync.Map      // The removed versions of the tree.
-	ndb            *nodeDB
+	*ImmutableTree                 // The current, working tree.
+	lastSaved       *ImmutableTree // The most recently saved tree.
+	orphans         []*Node        // Nodes removed by changes to working tree.Will refresh after each block
+	commitOrphans   []commitOrphan // Nodes removed by changes to working tree.Will refresh after each commit.
+	versions        *SyncMap       // The previous, saved versions of the tree.
+	removedVersions sync.Map       // The removed versions of the tree.
+	ndb             *nodeDB
 
-	committedHeightQueue  *list.List
-	committedHeightMap    map[int64]bool
-	historyStateNum int
+	savedNodes map[string]*Node
+	deltas     *TreeDelta // For using in other peer
 
-	commitCh chan commitEvent
+	committedHeightQueue *list.List
+	committedHeightMap   map[int64]bool
+	historyStateNum      int
+
+	commitCh          chan commitEvent
+	pruneCh           chan pruneEvent
 	lastPersistHeight int64
+	//for ibc module upgrade version
+	upgradeVersion int64
+
+	readableOrphansSlice []*Node
+
+	unsavedFastNodes *fastNodeChanges
+	mtx              sync.RWMutex // For enableFastStorageAndCommit
 }
-
-
 
 // NewMutableTree returns a new tree with the specified cache size and datastore.
 func NewMutableTree(db dbm.DB, cacheSize int) (*MutableTree, error) {
@@ -61,20 +97,30 @@ func NewMutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options) (*MutableTr
 	} else {
 		initVersion = 0
 	}
-	tree := &MutableTree{
-		ImmutableTree: head,
-		lastSaved:     head.clone(),
-		orphans:       []*Node{},
-		commitOrphans: map[string]int64{},
-		versions:      NewSyncMap(),
-		ndb:           ndb,
+	var tree *MutableTree
+	if savedTree, ok := treeMap.getTree(ndb.name); ok {
+		tree = savedTree
+	} else {
+		tree = &MutableTree{
+			ImmutableTree: head,
+			lastSaved:     head.clone(),
+			savedNodes:    map[string]*Node{},
+			deltas:        &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}},
+			orphans:       []*Node{},
+			versions:      NewSyncMap(),
+			ndb:           ndb,
 
-		committedHeightMap:    map[int64]bool{},
-		committedHeightQueue:  list.New(),
-		historyStateNum: MaxCommittedHeightNum,
+			committedHeightMap:   map[int64]bool{},
+			committedHeightQueue: list.New(),
+			historyStateNum:      MaxCommittedHeightNum,
 
-		commitCh: make(chan commitEvent),
-		lastPersistHeight: initVersion,
+			commitCh:          make(chan commitEvent),
+			pruneCh:           make(chan pruneEvent, PruningChannelSize),
+			lastPersistHeight: initVersion,
+			upgradeVersion:    -1,
+
+			unsavedFastNodes: newFastNodeChanges(),
+		}
 	}
 
 	if tree.historyStateNum < minHistoryStateNum {
@@ -96,12 +142,16 @@ func (tree *MutableTree) IsEmpty() bool {
 
 // VersionExists returns whether or not a version exists.
 func (tree *MutableTree) VersionExists(version int64) bool {
-	tree.ndb.mtx.Lock()
-	defer tree.ndb.mtx.Unlock()
-	if tree.ndb.heightOrphansMap[version] != nil {
+	_, ok := tree.ndb.findRootHash(version)
+	if ok {
 		return true
 	}
 	return tree.versions.Get(version)
+}
+
+func (tree *MutableTree) VersionExistsInDb(version int64) bool {
+	treeVer := tree.ndb.getPreviousVersion(version + 1)
+	return treeVer == version
 }
 
 // AvailableVersions returns all available versions in ascending order
@@ -145,9 +195,45 @@ func (tree *MutableTree) prepareOrphansSlice() []*Node {
 // Set sets a key in the working tree. Nil values are invalid. The given key/value byte slices must
 // not be modified after this call, since they point to slices stored within IAVL.
 func (tree *MutableTree) Set(key, value []byte) bool {
-	orphaned, updated := tree.set(key, value)
+	// orphaned, updated := tree.set(key, value) // old code
+	orphaned := tree.makeOrphansSliceReady()
+	updated := tree.setWithOrphansSlice(key, value, &orphaned)
 	tree.addOrphans(orphaned)
+
 	return updated
+}
+
+func (tree *MutableTree) fastGetFromChanges(key []byte) ([]byte, bool) {
+	if !GetEnableFastStorage() {
+		return nil, false
+	}
+	if fastNode, ok := tree.unsavedFastNodes.get(key); ok {
+		if fastNode == nil {
+			return nil, true
+		} else {
+			return fastNode.value, true
+		}
+	}
+
+	return nil, false
+}
+
+// Get returns the value of the specified key if it exists, or nil otherwise.
+// The returned value must not be modified, since it may point to data stored within IAVL.
+func (tree *MutableTree) Get(key []byte) []byte {
+	if tree.root == nil {
+		return nil
+	}
+	if getForceReadIavl() {
+		_, value := tree.ImmutableTree.GetWithIndex(key)
+		return value
+	}
+
+	if value, ok := tree.fastGetFromChanges(key); ok {
+		return value
+	}
+
+	return tree.ImmutableTree.Get(key)
 }
 
 // Import returns an importer for tree nodes previously exported by ImmutableTree.Export(),
@@ -162,12 +248,43 @@ func (tree *MutableTree) Import(version int64) (*Importer, error) {
 	return newImporter(tree, version)
 }
 
+// Iterate iterates over all keys of the tree. The keys and values must not be modified,
+// since they may point to data stored within IAVL. Returns true if stopped by callnack, false otherwise
+func (tree *MutableTree) Iterate(fn func(key []byte, value []byte) bool) (stopped bool) {
+	if tree.root == nil {
+		return false
+	}
+
+	if !tree.IsFastCacheEnabled() {
+		return tree.ImmutableTree.Iterate(fn)
+	}
+
+	itr := NewUnsavedFastIteratorWithCache(nil, nil, true, tree.ndb, tree.unsavedFastNodes)
+	defer itr.Close()
+	for ; itr.Valid(); itr.Next() {
+		if fn(itr.Key(), itr.Value()) {
+			return true
+		}
+	}
+	return false
+}
+
+// Iterator returns an iterator over the mutable tree.
+// CONTRACT: no updates are made to the tree while an iterator is active.
+func (tree *MutableTree) Iterator(start, end []byte, ascending bool) dbm.Iterator {
+	if tree.IsFastCacheEnabled() {
+		return NewUnsavedFastIteratorWithCache(start, end, ascending, tree.ndb, tree.unsavedFastNodes)
+	}
+	return tree.ImmutableTree.Iterator(start, end, ascending)
+}
+
 func (tree *MutableTree) set(key []byte, value []byte) (orphans []*Node, updated bool) {
 	if value == nil {
 		panic(fmt.Sprintf("Attempt to store nil value at key '%s'", key))
 	}
 
 	if tree.ImmutableTree.root == nil {
+		tree.addUnsavedAddition(key, value, tree.version+1)
 		tree.ImmutableTree.root = NewNode(key, value, tree.version+1)
 		return nil, updated
 	}
@@ -183,6 +300,7 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte, orph
 	version := tree.version + 1
 
 	if node.isLeaf() {
+		tree.addUnsavedAddition(key, value, version)
 		switch bytes.Compare(key, node.key) {
 		case -1:
 			return &Node{
@@ -230,8 +348,11 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte, orph
 // Remove removes a key from the working tree. The given key byte slice should not be modified
 // after this call, since it may point to data stored inside IAVL.
 func (tree *MutableTree) Remove(key []byte) ([]byte, bool) {
-	val, orphaned, removed := tree.remove(key)
+	// val, orphaned, removed := tree.remove(key) // old code
+	orphaned := tree.makeOrphansSliceReady()
+	val, removed := tree.removeWithOrphansSlice(key, &orphaned)
 	tree.addOrphans(orphaned)
+
 	return val, removed
 }
 
@@ -246,6 +367,7 @@ func (tree *MutableTree) remove(key []byte) (value []byte, orphaned []*Node, rem
 	if len(orphaned) == 0 {
 		return nil, nil, false
 	}
+	tree.addUnsavedRemoval(key)
 
 	if newRoot == nil && newRootHash != nil {
 		tree.root = tree.ndb.GetNode(newRootHash)
@@ -332,6 +454,13 @@ func (tree *MutableTree) LazyLoadVersion(targetVersion int64) (int64, error) {
 
 	// no versions have been saved if the latest version is non-positive
 	if latestVersion <= 0 {
+		if targetVersion <= 0 {
+			tree.mtx.Lock()
+			defer tree.mtx.Unlock()
+			_, err := tree.enableFastStorageAndCommitIfNotEnabled()
+			return 0, err
+		}
+
 		return 0, nil
 	}
 
@@ -356,12 +485,26 @@ func (tree *MutableTree) LazyLoadVersion(targetVersion int64) (int64, error) {
 		root:    tree.ndb.GetNode(rootHash),
 	}
 
+	tree.savedNodes = map[string]*Node{}
+	tree.deltas = &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}}
 	tree.orphans = []*Node{}
-	tree.commitOrphans = map[string]int64{}
+	tree.commitOrphans = nil
 	tree.ImmutableTree = iTree
 	tree.lastSaved = iTree.clone()
 
+	tree.mtx.Lock()
+	defer tree.mtx.Unlock()
+	// Attempt to upgrade
+	if _, err := tree.enableFastStorageAndCommitIfNotEnabled(); err != nil {
+		return 0, err
+	}
+
 	return targetVersion, nil
+}
+
+func (tree *MutableTree) GetCommitVersion() int64 {
+	latestVersion := tree.ndb.getLatestVersion()
+	return latestVersion
 }
 
 // Returns the version number of the latest version found
@@ -372,6 +515,12 @@ func (tree *MutableTree) LoadVersion(targetVersion int64) (int64, error) {
 	}
 
 	if len(roots) == 0 {
+		if targetVersion <= 0 {
+			tree.mtx.Lock()
+			defer tree.mtx.Unlock()
+			_, err := tree.enableFastStorageAndCommitIfNotEnabled()
+			return 0, err
+		}
 		return 0, nil
 	}
 
@@ -379,25 +528,31 @@ func (tree *MutableTree) LoadVersion(targetVersion int64) (int64, error) {
 	latestVersion := int64(0)
 
 	var latestRoot []byte
-	for version, r := range roots {
-		tree.versions.Set(version, true)
-		if version > latestVersion && (targetVersion == 0 || version <= targetVersion) {
-			latestVersion = version
-			latestRoot = r
-		}
-		if firstVersion == 0 || version < firstVersion {
-			firstVersion = version
-		}
-	}
 
-	if !(targetVersion == 0 || latestVersion == targetVersion) {
-		return latestVersion, fmt.Errorf("wanted to load target %v but only found up to %v",
-			targetVersion, latestVersion)
-	}
+	if tree.ndb.opts.UpgradeVersion == 0 {
+		for version, r := range roots {
+			tree.versions.Set(version, true)
+			if version > latestVersion && (targetVersion == 0 || version <= targetVersion) {
+				latestVersion = version
+				latestRoot = r
+			}
+			if firstVersion == 0 || version < firstVersion {
+				firstVersion = version
+			}
 
-	if firstVersion > 0 && firstVersion < int64(tree.ndb.opts.InitialVersion) {
-		return latestVersion, fmt.Errorf("initial version set to %v, but found earlier version %v",
-			tree.ndb.opts.InitialVersion, firstVersion)
+		}
+
+		if !(targetVersion == 0 || latestVersion == targetVersion) {
+			return latestVersion, fmt.Errorf("wanted to load target %v but only found up to %v",
+				targetVersion, latestVersion)
+		}
+
+		if firstVersion > 0 && firstVersion < int64(tree.ndb.opts.InitialVersion) {
+			return latestVersion, fmt.Errorf("initial version set to %v, but found earlier version %v",
+				tree.ndb.opts.InitialVersion, firstVersion)
+		}
+	} else {
+		latestVersion = int64(tree.ndb.opts.UpgradeVersion)
 	}
 
 	t := &ImmutableTree{
@@ -409,12 +564,20 @@ func (tree *MutableTree) LoadVersion(targetVersion int64) (int64, error) {
 		t.root = tree.ndb.GetNode(latestRoot)
 	}
 
+	tree.savedNodes = map[string]*Node{}
+	tree.deltas = &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}}
 	tree.orphans = []*Node{}
-	tree.commitOrphans = map[string]int64{}
+	tree.commitOrphans = nil
 	tree.ImmutableTree = t
 	tree.lastSaved = t.clone()
 	tree.lastPersistHeight = latestVersion
 
+	tree.mtx.Lock()
+	defer tree.mtx.Unlock()
+	// Attempt to upgrade
+	if _, err := tree.enableFastStorageAndCommitIfNotEnabled(); err != nil {
+		return 0, err
+	}
 	return latestVersion, nil
 }
 
@@ -431,7 +594,7 @@ func (tree *MutableTree) LoadVersionForOverwriting(targetVersion int64) (int64, 
 		return latestVersion, err
 	}
 
-	if err = tree.ndb.Commit(batch); err != nil {
+	if err = tree.enableFastStorageAndCommitLocked(batch); err != nil {
 		return latestVersion, err
 	}
 
@@ -444,6 +607,114 @@ func (tree *MutableTree) LoadVersionForOverwriting(targetVersion int64) (int64, 
 		return true
 	})
 	return latestVersion, nil
+}
+
+// Returns true if the tree may be auto-upgraded, false otherwise
+// An example of when an upgrade may be performed is when we are enaling fast storage for the first time or
+// need to overwrite fast nodes due to mismatch with live state.
+func (tree *MutableTree) IsUpgradeable() bool {
+	return !tree.ndb.hasUpgradedToFastStorage() || tree.ndb.shouldForceFastStorageUpgrade()
+}
+
+// enableFastStorageAndCommitIfNotEnabled if nodeDB doesn't mark fast storage as enabled, enable it, and commit the update.
+// Checks whether the fast cache on disk matches latest live state. If not, deletes all existing fast nodes and repopulates them
+// from latest tree.
+// nolint: unparam
+func (tree *MutableTree) enableFastStorageAndCommitIfNotEnabled() (bool, error) {
+	if getIgnoreAutoUpgrade() {
+		return false, nil
+	}
+
+	if !GetEnableFastStorage() {
+		return false, nil
+	}
+
+	if !tree.IsUpgradeable() {
+		return false, nil
+	}
+
+	// If there is a mismatch between which fast nodes are on disk and the live state due to temporary
+	// downgrade and subsequent re-upgrade, we cannot know for sure which fast nodes have been removed while downgraded,
+	// Therefore, there might exist stale fast nodes on disk. As a result, to avoid persisting the stale state, it might
+	// be worth to delete the fast nodes from disk.
+	var deleteCounter uint64
+	deleteBatch := tree.NewBatch()
+	fastItr := newFastIterator(nil, nil, true, tree.ndb)
+	defer fastItr.Close()
+	for ; fastItr.Valid(); fastItr.Next() {
+		if deleteCounter%verboseGap == 0 {
+			tree.log(IavlInfo, "Deleting stale fast nodes...", "finished", deleteCounter, "db", tree.ndb.name)
+		}
+		deleteCounter++
+		if err := tree.ndb.DeleteFastNode(fastItr.Key(), deleteBatch); err != nil {
+			return false, err
+		}
+		if deleteCounter%commitGap == 0 {
+			if err := tree.ndb.Commit(deleteBatch); err != nil {
+				return false, err
+			}
+			deleteBatch = tree.NewBatch()
+		}
+	}
+	if deleteCounter%commitGap != 0 {
+		if err := tree.ndb.Commit(deleteBatch); err != nil {
+			return false, err
+		}
+	} else {
+		deleteBatch.Close()
+	}
+	tree.log(IavlInfo, "Deleting stale fast nodes...", "done", deleteCounter, "db", tree.ndb.name)
+
+	batch := tree.NewBatch()
+	if err := tree.enableFastStorageAndCommit(batch); err != nil {
+		tree.ndb.storageVersion = defaultStorageVersionValue
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (tree *MutableTree) enableFastStorageAndCommitLocked(batch dbm.Batch) error {
+	if !GetEnableFastStorage() {
+		return nil
+	}
+	tree.mtx.Lock()
+	defer tree.mtx.Unlock()
+	return tree.enableFastStorageAndCommit(batch)
+}
+
+func (tree *MutableTree) enableFastStorageAndCommit(batch dbm.Batch) error {
+	var err error
+
+	itr := NewIterator(nil, nil, true, tree.ImmutableTree)
+	defer itr.Close()
+	var upgradedNodes uint64
+	for ; itr.Valid(); itr.Next() {
+		if upgradedNodes%verboseGap == 0 {
+			tree.log(IavlInfo, "Upgrading to fast IAVL...", "finished", upgradedNodes, "db", tree.ndb.name)
+		}
+		upgradedNodes++
+		if err = tree.ndb.SaveFastNodeNoCache(NewFastNode(itr.Key(), itr.Value(), tree.version), batch); err != nil {
+			return err
+		}
+		if upgradedNodes%commitGap == 0 {
+			if err := tree.ndb.Commit(batch); err != nil {
+				return err
+			}
+			batch = tree.NewBatch()
+		}
+	}
+	tree.log(IavlInfo, "Upgrading to fast IAVL...", "done", upgradedNodes, "db", tree.ndb.name)
+
+	if err = itr.Error(); err != nil {
+		return err
+	}
+
+	if err = tree.ndb.setFastStorageVersionToBatch(batch, tree.ndb.getLatestVersion()); err != nil {
+		return err
+	}
+
+	return tree.ndb.Commit(batch)
 }
 
 // GetImmutable loads an ImmutableTree at a given version for querying. The returned tree is
@@ -476,8 +747,11 @@ func (tree *MutableTree) Rollback() {
 	} else {
 		tree.ImmutableTree = &ImmutableTree{ndb: tree.ndb, version: 0}
 	}
+	tree.savedNodes = map[string]*Node{}
+	tree.deltas = &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}}
 	tree.orphans = []*Node{}
-	tree.commitOrphans = map[string]int64{}
+	tree.commitOrphans = nil
+	tree.unsavedFastNodes = newFastNodeChanges()
 }
 
 // GetVersioned gets the value at the specified key and version. The returned value must not be
@@ -485,69 +759,128 @@ func (tree *MutableTree) Rollback() {
 func (tree *MutableTree) GetVersioned(key []byte, version int64) (
 	index int64, value []byte,
 ) {
-	if tree.versions.Get(version) {
+	if tree.VersionExists(version) {
+		isFastCacheEnabled := tree.IsFastCacheEnabled()
+		if isFastCacheEnabled && !getForceReadIavl() {
+			fastNode, _ := tree.ndb.GetFastNode(key)
+			if fastNode == nil && version == tree.ndb.getLatestMemoryVersion() {
+				return -1, nil
+			}
+
+			if fastNode != nil && fastNode.versionLastUpdatedAt <= version {
+				return fastNode.versionLastUpdatedAt, fastNode.value
+			}
+		}
+
 		t, err := tree.GetImmutable(version)
 		if err != nil {
 			return -1, nil
 		}
-		return t.Get(key)
+		return t.GetWithIndex(key)
 	}
 	return -1, nil
 }
 
 // SaveVersion saves a new tree version to disk, based on the current state of
 // the tree. Returns the hash and new version number.
-func (tree *MutableTree) SaveVersion() ([]byte, int64, error) {
+func (tree *MutableTree) SaveVersion(useDeltas bool) ([]byte, int64, TreeDelta, error) {
 	version := tree.version + 1
+
+	//begin for upgrade new module
+	upgradeVersion := tree.GetUpgradeVersion()
+	if upgradeVersion != -1 {
+		version = upgradeVersion
+		tree.version = version - 1
+		tree.SetUpgradeVersion(-1)
+	} //end for upgrade new module
+
 	if version == 1 && tree.ndb.opts.InitialVersion > 0 {
 		version = int64(tree.ndb.opts.InitialVersion) + 1
 	}
+
+	tree.deltas = &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}}
 
 	if !ignoreVersionCheck && tree.versions.Get(version) {
 		// If the version already exists, return an error as we're attempting to overwrite.
 		// However, the same hash means idempotent (i.e. no-op).
 		existingHash, err := tree.ndb.getRoot(version)
 		if err != nil {
-			return nil, version, err
+			return nil, version, *tree.deltas, err
 		}
 
-		var newHash = tree.WorkingHash()
+		var newHash []byte
+		if useDeltas {
+			newHash = existingHash
+		} else {
+			newHash = tree.WorkingHash()
+		}
 
 		if bytes.Equal(existingHash, newHash) {
 			tree.version = version
 			tree.ImmutableTree = tree.ImmutableTree.clone()
 			tree.lastSaved = tree.ImmutableTree.clone()
+			tree.savedNodes = map[string]*Node{}
+			tree.deltas = &TreeDelta{[]*NodeJsonImp{}, []*NodeJson{}, []*CommitOrphansImp{}}
 			tree.orphans = []*Node{}
-			tree.commitOrphans = map[string]int64{}
-			return existingHash, version, nil
+			tree.commitOrphans = nil
+			return existingHash, version, *tree.deltas, nil
 		}
 
-		return nil, version, fmt.Errorf("version %d was already saved to different hash %X (existing hash %X)", version, newHash, existingHash)
+		return nil, version, *tree.deltas, fmt.Errorf("version %d was already saved to different hash %X (existing hash %X)", version, newHash, existingHash)
+	}
+
+	// apply state delta
+	if useDeltas && tree.hasNewNode() {
+		tree.root = tree.savedNodes["root"]
 	}
 
 	if EnableAsyncCommit {
-		return tree.SaveVersionAsync(version)
+		h, v, err := tree.SaveVersionAsync(version, useDeltas)
+		return h, v, *tree.deltas, err
 	}
-	return tree.SaveVersionSync(version)
+	h, v, err := tree.SaveVersionSync(version, useDeltas)
+	return h, v, *tree.deltas, err
 }
 
-func (tree *MutableTree) SaveVersionSync(version int64) ([]byte, int64, error) {
+func (tree *MutableTree) SaveVersionSync(version int64, useDeltas bool) ([]byte, int64, error) {
 	batch := tree.NewBatch()
 	if tree.root == nil {
 		// There can still be orphans, for example if the root is the node being
 		// removed.
-		tree.log(IavlDebug, "SAVE EMPTY TREE %v", version)
+		tree.log(IavlDebug, "SAVE EMPTY TREE", "version", version)
 		tree.ndb.SaveOrphans(batch, version, tree.orphans)
 		if err := tree.ndb.SaveEmptyRoot(batch, version); err != nil {
 			return nil, 0, err
 		}
 	} else {
-		tree.log(IavlDebug, "SAVE TREE %v", version)
-		tree.ndb.SaveBranch(batch, tree.root)
+		tree.log(IavlDebug, "SAVE TREE", "version", version)
+		if useDeltas && tree.hasNewNode() {
+			tree.SaveBranch(batch, tree.root)
+			if hex.EncodeToString(tree.root.hash) != hex.EncodeToString(tree.savedNodes["root"].hash) {
+				return nil, version, fmt.Errorf("wrong deltas. get hash %X (want hash %X)", tree.savedNodes["root"].hash, tree.root.hash)
+			}
+		} else {
+			tree.ndb.SaveBranch(batch, tree.root, tree.savedNodes)
+		}
+		// generate state delta
+		if produceDelta {
+			if tree.hasNewNode() {
+				delete(tree.savedNodes, amino.BytesToStr(tree.root.hash))
+				tree.savedNodes["root"] = tree.root
+			}
+			tree.GetDelta()
+		}
+
 		tree.ndb.SaveOrphans(batch, version, tree.orphans)
 		if err := tree.ndb.SaveRoot(batch, tree.root, version); err != nil {
 			return nil, 0, err
 		}
+	}
+
+	tree.ndb.updateLatestMemoryVersion(version)
+
+	if err := tree.ndb.saveFastNodeVersion(batch, tree.unsavedFastNodes, tree.ndb.getLatestVersion()); err != nil {
+		return nil, version, err
 	}
 
 	if err := tree.ndb.Commit(batch); err != nil {
@@ -560,13 +893,25 @@ func (tree *MutableTree) SaveVersionSync(version int64) ([]byte, int64, error) {
 	// set new working tree
 	tree.ImmutableTree = tree.ImmutableTree.clone()
 	tree.lastSaved = tree.ImmutableTree.clone()
+	tree.savedNodes = map[string]*Node{}
 	tree.orphans = []*Node{}
+	tree.unsavedFastNodes = newFastNodeChanges()
 
 	tree.ndb.log(IavlDebug, tree.ndb.sprintCacheLog(version))
 	return tree.Hash(), version, nil
 }
 
 func (tree *MutableTree) deleteVersion(batch dbm.Batch, version int64, versions map[int64]bool) error {
+	if err := tree.deleteVersionPreCheck(version, versions); err != nil {
+		return err
+	}
+
+	tree.ndb.deleteVersion(batch, version, true)
+
+	return nil
+}
+
+func (tree *MutableTree) deleteVersionPreCheck(version int64, versions map[int64]bool) error {
 	if version == 0 {
 		return errors.New("version must be greater than 0")
 	}
@@ -582,10 +927,10 @@ func (tree *MutableTree) deleteVersion(batch dbm.Batch, version int64, versions 
 		return errors.Wrap(ErrVersionDoesNotExist, fmt.Sprintf("%d", version))
 	}
 
-	if err := tree.ndb.DeleteVersion(batch, version, true); err != nil {
+	err := tree.ndb.checkoutVersionReaders(version)
+	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -599,7 +944,7 @@ func (tree *MutableTree) SetInitialVersion(version uint64) {
 // DeleteVersions deletes a series of versions from the MutableTree.
 // Deprecated: please use DeleteVersionsRange instead.
 func (tree *MutableTree) DeleteVersions(versions ...int64) error {
-	tree.log(IavlDebug, "DELETING VERSIONS: %v", versions)
+	tree.log(IavlDebug, "DELETING", "VERSIONS", versions)
 
 	if len(versions) == 0 {
 		return nil
@@ -631,9 +976,9 @@ func (tree *MutableTree) DeleteVersions(versions ...int64) error {
 // DeleteVersionsRange removes versions from an interval from the MutableTree (not inclusive).
 // An error is returned if any single version has active readers.
 // All writes happen in a single batch with a single commit.
-func (tree *MutableTree) DeleteVersionsRange(fromVersion, toVersion int64) error {
+func (tree *MutableTree) DeleteVersionsRange(fromVersion, toVersion int64, enforce ...bool) error {
 	batch := tree.NewBatch()
-	if err := tree.ndb.DeleteVersionsRange(batch, fromVersion, toVersion); err != nil {
+	if err := tree.ndb.DeleteVersionsRange(batch, fromVersion, toVersion, enforce...); err != nil {
 		return err
 	}
 
@@ -647,10 +992,82 @@ func (tree *MutableTree) DeleteVersionsRange(fromVersion, toVersion int64) error
 	return nil
 }
 
+func (ndb *nodeDB) saveFastNodeVersion(batch dbm.Batch, fnc *fastNodeChanges, version int64) error {
+	if !GetEnableFastStorage() || fnc == nil {
+		return nil
+	}
+	if err := ndb.setFastStorageVersionToBatch(batch, version); err != nil {
+		return err
+	}
+	if err := ndb.saveFastNodeAdditions(batch, fnc.getAdditions()); err != nil {
+		return err
+	}
+	if err := ndb.saveFastNodeRemovals(batch, fnc.getRemovals()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// nolint: unused
+func (tree *MutableTree) getUnsavedFastNodeAdditions() map[string]*FastNode {
+	return tree.unsavedFastNodes.getAdditions()
+}
+
+// getUnsavedFastNodeRemovals returns unsaved FastNodes to remove
+// nolint: unused
+func (tree *MutableTree) getUnsavedFastNodeRemovals() map[string]interface{} {
+	return tree.unsavedFastNodes.getRemovals()
+}
+
+func (tree *MutableTree) addUnsavedAddition(key, value []byte, version int64) {
+	if !GetEnableFastStorage() {
+		return
+	}
+
+	tree.unsavedFastNodes.add(key, NewFastNode(key, value, version))
+}
+
+func (ndb *nodeDB) saveFastNodeAdditions(batch dbm.Batch, additions map[string]*FastNode) error {
+	keysToSort := make([]string, 0, len(additions))
+	for key := range additions {
+		keysToSort = append(keysToSort, key)
+	}
+	sort.Strings(keysToSort)
+
+	for _, key := range keysToSort {
+		if err := ndb.SaveFastNode(additions[key], batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tree *MutableTree) addUnsavedRemoval(key []byte) {
+	if !GetEnableFastStorage() {
+		return
+	}
+	tree.unsavedFastNodes.remove(key, true)
+}
+
+func (ndb *nodeDB) saveFastNodeRemovals(batch dbm.Batch, removals map[string]interface{}) error {
+	keysToSort := make([]string, 0, len(removals))
+	for key := range removals {
+		keysToSort = append(keysToSort, key)
+	}
+	sort.Strings(keysToSort)
+
+	for _, key := range keysToSort {
+		if err := ndb.DeleteFastNode([]byte(key), batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeleteVersion deletes a tree version from disk. The version can then no
 // longer be accessed.
 func (tree *MutableTree) DeleteVersion(version int64) error {
-	tree.log(IavlDebug, "DELETE VERSION: %d", version)
+	tree.log(IavlDebug, "DELETE", "VERSION", version)
 	batch := tree.NewBatch()
 	if err := tree.deleteVersion(batch, version, tree.versions.Clone()); err != nil {
 		return err
@@ -764,4 +1181,108 @@ func (tree *MutableTree) addOrphans(orphans []*Node) {
 			tree.orphans = append(tree.orphans, node)
 		}
 	}
+}
+
+// SaveBranch saves the given node and all of its descendants.
+// NOTE: This function clears leftNode/rigthNode recursively and
+// calls _hash() on the given node.
+// TODO refactor, maybe use hashWithCount() but provide a callback.
+func (tree *MutableTree) SaveBranch(batch dbm.Batch, node *Node) []byte {
+	node.persisted = false
+
+	// sync state delta from other node
+	// TODO: handle magic number
+	if node.leftHash != nil {
+		key := string(node.leftHash)
+		if tmp := tree.savedNodes[key]; tmp != nil {
+			node.leftHash = tree.SaveBranch(batch, tree.savedNodes[key])
+		}
+	}
+	if node.rightHash != nil {
+		key := string(node.rightHash)
+		if tmp := tree.savedNodes[key]; tmp != nil {
+			node.rightHash = tree.SaveBranch(batch, tree.savedNodes[key])
+		}
+	}
+	node._hash()
+
+	//resetBatch only working on generate a genesis block
+	if node.version == genesisVersion {
+		tmpBatch := tree.ndb.NewBatch()
+		tree.ndb.SaveNode(tmpBatch, node)
+		tree.ndb.resetBatch(tmpBatch)
+	} else {
+		tree.ndb.SaveNode(batch, node)
+	}
+
+	node.leftNode = nil
+	node.rightNode = nil
+
+	// TODO: handle magic number
+	tree.savedNodes[string(node.hash)] = node
+
+	return node.hash
+}
+
+func (tree *MutableTree) SetDelta(delta *TreeDelta) {
+	if delta != nil {
+		for _, v := range delta.NodesDelta {
+			tree.savedNodes[v.Key] = NodeJsonToNode(v.NodeValue)
+		}
+
+		// set tree.orphans
+		orphans := make([]*Node, len(delta.OrphansDelta))
+		for i, orphan := range delta.OrphansDelta {
+			orphans[i] = NodeJsonToNode(orphan)
+		}
+		tree.orphans = orphans
+
+		// set tree.commitOrphans
+		for _, v := range delta.CommitOrphansDelta {
+			tree.commitOrphans = append(tree.commitOrphans, commitOrphan{Version: v.CommitValue, NodeHash: amino.StrToBytes(v.Key)})
+		}
+
+		if GetEnableFastStorage() {
+			// fast node related
+			for _, v := range tree.savedNodes {
+				if v.isLeaf() {
+					tree.unsavedFastNodes.addAdditions(v.key, NewFastNode(v.key, v.value, v.version))
+				}
+			}
+
+			for _, v := range tree.orphans {
+				ok := tree.unsavedFastNodes.checkAdditions(v.key)
+				if v.isLeaf() && !ok {
+					tree.unsavedFastNodes.addRemovals(v.key)
+				}
+			}
+		}
+	}
+}
+
+func (tree *MutableTree) GetDelta() {
+	nodes := make([]*NodeJsonImp, len(tree.savedNodes))
+	index := 0
+	for k, v := range tree.savedNodes {
+		nodes[index] = &NodeJsonImp{Key: k, NodeValue: NodeToNodeJson(v)}
+		index++
+	}
+	tree.deltas.NodesDelta = nodes
+
+	orphans := make([]*NodeJson, len(tree.orphans))
+	for i, orphan := range tree.orphans {
+		orphans[i] = NodeToNodeJson(orphan)
+	}
+	tree.deltas.OrphansDelta = orphans
+}
+func (tree *MutableTree) SetUpgradeVersion(version int64) {
+	tree.upgradeVersion = version
+}
+
+func (tree *MutableTree) GetUpgradeVersion() int64 {
+	return tree.upgradeVersion
+}
+
+func (tree *MutableTree) hasNewNode() bool {
+	return len(tree.savedNodes) > 0
 }

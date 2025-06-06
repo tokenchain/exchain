@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	ethcmn "github.com/ethereum/go-ethereum/common"
+	"github.com/okex/exchain/libs/tendermint/types"
 	govtypes "github.com/okex/exchain/x/gov/types"
 	"github.com/stretchr/testify/suite"
 )
@@ -29,12 +30,27 @@ const (
  ContractAddrs:
 						ex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqm2k6w2
 						ex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpxuz0nc`
+	expectedManageContractMethodBlockedListProposalString = `ManageContractMethodBlockedListProposal:
+ Title:					default title
+ Description:        	default description
+ Type:                	ManageContractMethodBlockedList
+ IsAdded:				true
+ ContractList:
+						Address: ex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqm2k6w2
+Method List:
+Sign: 0x11111111Extra: TEST1
+Sign: 0x22222222Extra: TEST2
+						Address: ex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpxuz0nc
+Method List:
+Sign: 0x33333333Extra: TEST3
+Sign: 0x44444444Extra: TEST4`
 )
 
 type ProposalTestSuite struct {
 	suite.Suite
-	strBuilder strings.Builder
-	addrs      AddressList
+	strBuilder          strings.Builder
+	addrs               AddressList
+	blockedContractList BlockedContractList
 }
 
 func TestProposalTestSuite(t *testing.T) {
@@ -42,6 +58,22 @@ func TestProposalTestSuite(t *testing.T) {
 		addrs: AddressList{
 			ethcmn.BytesToAddress([]byte{0x0}).Bytes(),
 			ethcmn.BytesToAddress([]byte{0x1}).Bytes(),
+		},
+		blockedContractList: BlockedContractList{
+			BlockedContract{
+				Address: ethcmn.BytesToAddress([]byte{0x0}).Bytes(),
+				BlockMethods: ContractMethods{
+					ContractMethod{Sign: "0x11111111", Extra: "TEST1"},
+					ContractMethod{Sign: "0x22222222", Extra: "TEST2"},
+				},
+			},
+			BlockedContract{
+				Address: ethcmn.BytesToAddress([]byte{0x1}).Bytes(),
+				BlockMethods: ContractMethods{
+					ContractMethod{Sign: "0x33333333", Extra: "TEST3"},
+					ContractMethod{Sign: "0x44444444", Extra: "TEST4"},
+				},
+			},
 		},
 	}
 	suite.Run(t, &proposalTestSuite)
@@ -248,6 +280,271 @@ func (suite *ProposalTestSuite) TestProposal_ManageContractBlockedListProposal()
 				suite.Require().Error(err)
 			} else {
 				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *ProposalTestSuite) TestProposal_ManageContractMethodBlockedListProposal() {
+	proposal := NewManageContractMethodBlockedListProposal(
+		expectedTitle,
+		expectedDescription,
+		suite.blockedContractList,
+		true,
+	)
+
+	suite.Require().Equal(expectedTitle, proposal.GetTitle())
+	suite.Require().Equal(expectedDescription, proposal.GetDescription())
+	suite.Require().Equal(RouterKey, proposal.ProposalRoute())
+	suite.Require().Equal(proposalTypeManageContractMethodBlockedList, proposal.ProposalType())
+	suite.Require().Equal(expectedManageContractMethodBlockedListProposalString, proposal.String())
+
+	testCases := []struct {
+		msg           string
+		prepare       func()
+		expectedError bool
+	}{
+		{
+			"pass",
+			func() {},
+			false,
+		},
+		{
+			"empty title",
+			func() {
+				proposal.Title = ""
+			},
+			true,
+		},
+		{
+			"overlong title",
+			func() {
+				for i := 0; i < govtypes.MaxTitleLength+1; i++ {
+					suite.strBuilder.WriteByte('a')
+				}
+				proposal.Title = suite.strBuilder.String()
+			},
+			true,
+		},
+		{
+			"empty description",
+			func() {
+				proposal.Description = ""
+				proposal.Title = expectedTitle
+			},
+			true,
+		},
+		{
+			"overlong description",
+			func() {
+				suite.strBuilder.Reset()
+				for i := 0; i < govtypes.MaxDescriptionLength+1; i++ {
+					suite.strBuilder.WriteByte('a')
+				}
+				proposal.Description = suite.strBuilder.String()
+			},
+			true,
+		},
+		{
+			"duplicated contract addresses",
+			func() {
+				// add a duplicated address into ContractAddrs
+				proposal.ContractList = append(proposal.ContractList, proposal.ContractList[0])
+				proposal.Description = expectedDescription
+			},
+			true,
+		},
+		{
+			"empty contract addresses",
+			func() {
+				proposal.ContractList = nil
+			},
+			true,
+		},
+		{
+			"oversize contract addresses",
+			func() {
+				for i := int64(0); i <= maxAddressListLength; i++ {
+					testAddr := ethcmn.BigToAddress(big.NewInt(i)).Bytes()
+					testbc := BlockedContract{Address: testAddr, BlockMethods: nil}
+					proposal.ContractList = append(proposal.ContractList, testbc)
+				}
+			},
+			true,
+		},
+		{
+			"empty contract addresses",
+			func() {
+				for i := int64(0); i <= maxAddressListLength; i++ {
+					testbc := BlockedContract{Address: nil, BlockMethods: nil}
+					proposal.ContractList = append(proposal.ContractList, testbc)
+				}
+			},
+			true,
+		},
+		{
+			"duplicated contract method",
+			func() {
+				proposal.ContractList[0].BlockMethods = append(proposal.ContractList[0].BlockMethods, proposal.ContractList[0].BlockMethods...)
+			},
+			true,
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(tc.msg, func() {
+			tc.prepare()
+
+			err := proposal.ValidateBasic()
+
+			if tc.expectedError {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *ProposalTestSuite) TestProposal_ManageSysContractAddressProposal() {
+
+	const expectedManageSysContractAddressProposalString = `ManageSysContractAddressProposal:
+ Title:					default title
+ Description:        	default description
+ Type:                	ManageSysContractAddress
+ ContractAddr:          ex1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqm2k6w2
+ IsAdded:				true`
+
+	proposal := NewManageSysContractAddressProposal(
+		expectedTitle,
+		expectedDescription,
+		ethcmn.BytesToAddress([]byte{0x0}).Bytes(),
+		true,
+	)
+	types.UnittestOnlySetMilestoneVenus3Height(-1)
+	suite.Require().Equal(expectedTitle, proposal.GetTitle())
+	suite.Require().Equal(expectedDescription, proposal.GetDescription())
+	suite.Require().Equal(RouterKey, proposal.ProposalRoute())
+	suite.Require().Equal(proposalTypeManageSysContractAddress, proposal.ProposalType())
+	suite.Require().Equal(expectedManageSysContractAddressProposalString, proposal.String())
+
+	testCases := []struct {
+		msg           string
+		prepare       func()
+		expectedError bool
+	}{
+		{
+			"pass",
+			func() {
+			},
+			false,
+		},
+		{
+			"pass",
+			func() {
+				proposal.IsAdded = false
+				proposal.ContractAddr = nil
+			},
+			false,
+		},
+		{
+			"empty title",
+			func() {
+				proposal.Title = ""
+			},
+			true,
+		},
+		{
+			"overlong title",
+			func() {
+				for i := 0; i < govtypes.MaxTitleLength+1; i++ {
+					suite.strBuilder.WriteByte('a')
+				}
+				proposal.Title = suite.strBuilder.String()
+			},
+			true,
+		},
+		{
+			"empty description",
+			func() {
+				proposal.Description = ""
+				proposal.Title = expectedTitle
+			},
+			true,
+		},
+		{
+			"overlong description",
+			func() {
+				suite.strBuilder.Reset()
+				for i := 0; i < govtypes.MaxDescriptionLength+1; i++ {
+					suite.strBuilder.WriteByte('a')
+				}
+				proposal.Description = suite.strBuilder.String()
+			},
+			true,
+		},
+		{
+			"is_added true, contract address required",
+			func() {
+				proposal.IsAdded = true
+				proposal.ContractAddr = nil
+			},
+			true,
+		},
+	}
+
+	for _, tc := range testCases {
+		suite.Run(tc.msg, func() {
+			tc.prepare()
+
+			err := proposal.ValidateBasic()
+
+			if tc.expectedError {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *ProposalTestSuite) TestFixShortAddr() {
+	testCases := []struct {
+		msg           string
+		shouldFix     bool
+		contractList  BlockedContractList
+		expectedFixed bool
+	}{
+		{
+			"pass after fix",
+			true,
+			[]BlockedContract{{Address: []byte{0x3}}},
+			true,
+		},
+		{
+			"not pass if not fix",
+			false,
+			[]BlockedContract{{Address: []byte{0x3}}},
+			false,
+		},
+	}
+	for _, tc := range testCases {
+		suite.Run(tc.msg, func() {
+
+			proposal := NewManageContractMethodBlockedListProposal(
+				"default title",
+				"default description",
+				tc.contractList,
+				true,
+			)
+			if tc.shouldFix {
+				proposal.FixShortAddr()
+			}
+
+			if tc.expectedFixed {
+				suite.Require().Equal(len(proposal.ContractList[0].Address), 20)
+			} else {
+				suite.Require().NotEqual(len(proposal.ContractList[0].Address), 20)
 			}
 		})
 	}

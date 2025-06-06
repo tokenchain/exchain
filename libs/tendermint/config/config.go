@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/okex/exchain/libs/tendermint/types"
+
 	"github.com/pkg/errors"
 )
 
@@ -73,6 +75,7 @@ type Config struct {
 	Consensus       *ConsensusConfig       `mapstructure:"consensus"`
 	TxIndex         *TxIndexConfig         `mapstructure:"tx_index"`
 	Instrumentation *InstrumentationConfig `mapstructure:"instrumentation"`
+	GRPC            GRPCConfig             `mapstructure:"grpc"`
 }
 
 // DefaultConfig returns a default configuration for a Tendermint node
@@ -86,6 +89,7 @@ func DefaultConfig() *Config {
 		Consensus:       DefaultConsensusConfig(),
 		TxIndex:         DefaultTxIndexConfig(),
 		Instrumentation: DefaultInstrumentationConfig(),
+		GRPC:            DefaultGRPCConfig(),
 	}
 }
 
@@ -169,6 +173,10 @@ type BaseConfig struct { //nolint: maligned
 	// and verifying their commits
 	FastSyncMode bool `mapstructure:"fast_sync"`
 
+	// AutoFastSync allows this node switches from consensus mode to fast-sync mode automatically
+	// when it is many blocks behind the tip of the chain.
+	AutoFastSync bool `mapstructure:"auto_fast_sync"`
+
 	// Database backend: goleveldb | cleveldb | boltdb | rocksdb
 	// * goleveldb (github.com/syndtr/goleveldb - most popular implementation)
 	//   - pure go
@@ -242,8 +250,9 @@ func DefaultBaseConfig() BaseConfig {
 		LogLevel:           DefaultPackageLogLevels(),
 		LogFormat:          LogFormatPlain,
 		FastSyncMode:       true,
+		AutoFastSync:       true,
 		FilterPeers:        false,
-		DBBackend:          "goleveldb",
+		DBBackend:          types.DBBackend,
 		DBPath:             "data",
 		LogFile:            defaultLogFile,
 		LogStdout:          true,
@@ -257,6 +266,7 @@ func TestBaseConfig() BaseConfig {
 	cfg.chainID = "tendermint_test"
 	cfg.ProxyApp = "kvstore"
 	cfg.FastSyncMode = false
+	cfg.AutoFastSync = false
 	cfg.DBBackend = "memdb"
 	return cfg
 }
@@ -309,7 +319,7 @@ func DefaultLogLevel() string {
 // DefaultPackageLogLevels returns a default log level setting so all packages
 // log at "error", while the `state` and `main` packages log at "info"
 func DefaultPackageLogLevels() string {
-	return fmt.Sprintf("main:info,state:info,*:%s", DefaultLogLevel())
+	return fmt.Sprintf("main:info,iavl:info,*:%s", DefaultLogLevel())
 }
 
 //-----------------------------------------------------------------------------
@@ -658,25 +668,28 @@ func DefaultFuzzConnConfig() *FuzzConnConfig {
 
 // MempoolConfig defines the configuration options for the Tendermint mempool
 type MempoolConfig struct {
-	RootDir                    string `mapstructure:"home"`
-	Sealed                     bool   `mapstructure:"sealed"`
-	Recheck                    bool   `mapstructure:"recheck"`
-	Broadcast                  bool   `mapstructure:"broadcast"`
-	WalPath                    string `mapstructure:"wal_dir"`
-	Size                       int    `mapstructure:"size"`
-	MaxTxsBytes                int64  `mapstructure:"max_txs_bytes"`
-	CacheSize                  int    `mapstructure:"cache_size"`
-	MaxTxBytes                 int    `mapstructure:"max_tx_bytes"`
-	MaxTxNumPerBlock           int64  `mapstructure:"max_tx_num_per_block"`
-	MaxGasUsedPerBlock         int64  `mapstructure:"max_gas_used_per_block"`
-	SortTxByGp                 bool   `mapstructure:"sort_tx_by_gp"`
-	ForceRecheckGap            int64  `mapstructure:"force_recheck_gap"`
-	TxPriceBump                uint64 `mapstructure:"tx_price_bump"`
-	EnablePendingPool          bool   `mapstructure:"enable_pending_pool"`
-	PendingPoolSize            int    `mapstructure:"pending_pool_size"`
-	PendingPoolPeriod          int    `mapstructure:"pending_pool_period"`
-	PendingPoolReserveBlocks   int    `mapstructure:"pending_pool_reserve_blocks"`
-	PendingPoolMaxTxPerAddress int    `mapstructure:"pending_pool_max_tx_per_address"`
+	RootDir                    string   `mapstructure:"home"`
+	Sealed                     bool     `mapstructure:"sealed"`
+	Recheck                    bool     `mapstructure:"recheck"`
+	Broadcast                  bool     `mapstructure:"broadcast"`
+	Size                       int      `mapstructure:"size"`
+	MaxTxsBytes                int64    `mapstructure:"max_txs_bytes"`
+	CacheSize                  int      `mapstructure:"cache_size"`
+	MaxTxBytes                 int      `mapstructure:"max_tx_bytes"`
+	MaxTxNumPerBlock           int64    `mapstructure:"max_tx_num_per_block"`
+	EnableDeleteMinGPTx        bool     `mapstructure:"enable_delete_min_gp_tx"`
+	MaxGasUsedPerBlock         int64    `mapstructure:"max_gas_used_per_block"`
+	SortTxByGp                 bool     `mapstructure:"sort_tx_by_gp"`
+	ForceRecheckGap            int64    `mapstructure:"force_recheck_gap"`
+	TxPriceBump                uint64   `mapstructure:"tx_price_bump"`
+	EnablePendingPool          bool     `mapstructure:"enable_pending_pool"`
+	PendingPoolSize            int      `mapstructure:"pending_pool_size"`
+	PendingPoolPeriod          int      `mapstructure:"pending_pool_period"`
+	PendingPoolReserveBlocks   int      `mapstructure:"pending_pool_reserve_blocks"`
+	PendingPoolMaxTxPerAddress int      `mapstructure:"pending_pool_max_tx_per_address"`
+	NodeKeyWhitelist           []string `mapstructure:"node_key_whitelist"`
+	PendingRemoveEvent         bool     `mapstructure:"pending_remove_event"`
+	MaxTxLimitPerPeer          uint64   `mapstructure:"max_tx_limit_per_peer"`
 }
 
 // DefaultMempoolConfig returns a default configuration for the Tendermint mempool
@@ -684,22 +697,26 @@ func DefaultMempoolConfig() *MempoolConfig {
 	return &MempoolConfig{
 		Recheck:   false,
 		Broadcast: true,
-		WalPath:   "",
 		// Each signature verification takes .5ms, Size reduced until we implement
 		// ABCI Recheck
-		Size:                       10000,              // exchain memory pool size(max tx num)
+		Size:                       200_000,            // exchain memory pool size(max tx num)
 		MaxTxsBytes:                1024 * 1024 * 1024, // 1GB
-		CacheSize:                  10000,
+		CacheSize:                  300_000,
 		MaxTxBytes:                 1024 * 1024, // 1MB
 		MaxTxNumPerBlock:           300,
+		EnableDeleteMinGPTx:        false,
 		MaxGasUsedPerBlock:         -1,
 		SortTxByGp:                 true,
 		ForceRecheckGap:            2000,
 		TxPriceBump:                10,
+		EnablePendingPool:          false,
 		PendingPoolSize:            50000,
 		PendingPoolPeriod:          3,
 		PendingPoolReserveBlocks:   100,
 		PendingPoolMaxTxPerAddress: 100,
+		NodeKeyWhitelist:           []string{},
+		PendingRemoveEvent:         false,
+		MaxTxLimitPerPeer:          100,
 	}
 }
 
@@ -710,14 +727,14 @@ func TestMempoolConfig() *MempoolConfig {
 	return cfg
 }
 
-// WalDir returns the full path to the mempool's write-ahead log
-func (cfg *MempoolConfig) WalDir() string {
-	return rootify(cfg.WalPath, cfg.RootDir)
-}
-
-// WalEnabled returns true if the WAL is enabled.
-func (cfg *MempoolConfig) WalEnabled() bool {
-	return cfg.WalPath != ""
+// GetNodeKeyWhitelist first use the DynamicConfig to get secondly backup to
+// the config file
+func (cfg *MempoolConfig) GetNodeKeyWhitelist() []string {
+	keys := DynamicConfig.GetNodeKeyWhitelist()
+	if len(keys) != 0 {
+		return keys
+	}
+	return cfg.NodeKeyWhitelist
 }
 
 // ValidateBasic performs basic validation (checking param bounds, etc.) and
@@ -795,6 +812,8 @@ type ConsensusConfig struct {
 	TimeoutPrecommit      time.Duration `mapstructure:"timeout_precommit"`
 	TimeoutPrecommitDelta time.Duration `mapstructure:"timeout_precommit_delta"`
 	TimeoutCommit         time.Duration `mapstructure:"timeout_commit"`
+	TimeoutConsensus      time.Duration `mapstructure:"timeout_consensus"`
+	Waiting               bool          `mapstructure:"waiting"`
 
 	// Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
 	SkipTimeoutCommit bool `mapstructure:"skip_timeout_commit"`
@@ -802,6 +821,7 @@ type ConsensusConfig struct {
 	// EmptyBlocks mode and possible interval between empty blocks
 	CreateEmptyBlocks         bool          `mapstructure:"create_empty_blocks"`
 	CreateEmptyBlocksInterval time.Duration `mapstructure:"create_empty_blocks_interval"`
+	TimeoutToFastSync         time.Duration `mapstructure:"switch_to_fast_sync_interval"`
 
 	// Reactor sleep duration parameters
 	PeerGossipSleepDuration     time.Duration `mapstructure:"peer_gossip_sleep_duration"`
@@ -818,12 +838,15 @@ func DefaultConsensusConfig() *ConsensusConfig {
 		TimeoutPrevoteDelta:         500 * time.Millisecond,
 		TimeoutPrecommit:            1000 * time.Millisecond,
 		TimeoutPrecommitDelta:       500 * time.Millisecond,
-		TimeoutCommit:               3000 * time.Millisecond,
+		TimeoutCommit:               types.TimeoutCommit * time.Millisecond,
+		TimeoutConsensus:            1000 * time.Millisecond,
 		SkipTimeoutCommit:           false,
 		CreateEmptyBlocks:           true,
 		CreateEmptyBlocksInterval:   0 * time.Second,
+		TimeoutToFastSync:           30 * time.Second,
 		PeerGossipSleepDuration:     100 * time.Millisecond,
 		PeerQueryMaj23SleepDuration: 2000 * time.Millisecond,
+		Waiting:                     true,
 	}
 }
 
@@ -837,7 +860,9 @@ func TestConsensusConfig() *ConsensusConfig {
 	cfg.TimeoutPrecommit = 10 * time.Millisecond
 	cfg.TimeoutPrecommitDelta = 1 * time.Millisecond
 	cfg.TimeoutCommit = 10 * time.Millisecond
+	cfg.TimeoutConsensus = 60 * time.Millisecond
 	cfg.SkipTimeoutCommit = true
+	cfg.TimeoutToFastSync = 30 * time.Second
 	cfg.PeerGossipSleepDuration = 5 * time.Millisecond
 	cfg.PeerQueryMaj23SleepDuration = 250 * time.Millisecond
 	return cfg
@@ -851,28 +876,28 @@ func (cfg *ConsensusConfig) WaitForTxs() bool {
 // Propose returns the amount of time to wait for a proposal
 func (cfg *ConsensusConfig) Propose(round int) time.Duration {
 	return time.Duration(
-		cfg.TimeoutPropose.Nanoseconds()+cfg.TimeoutProposeDelta.Nanoseconds()*int64(round),
+		DynamicConfig.GetCsTimeoutPropose().Nanoseconds()+DynamicConfig.GetCsTimeoutProposeDelta().Nanoseconds()*int64(round),
 	) * time.Nanosecond
 }
 
 // Prevote returns the amount of time to wait for straggler votes after receiving any +2/3 prevotes
 func (cfg *ConsensusConfig) Prevote(round int) time.Duration {
 	return time.Duration(
-		cfg.TimeoutPrevote.Nanoseconds()+cfg.TimeoutPrevoteDelta.Nanoseconds()*int64(round),
+		DynamicConfig.GetCsTimeoutPrevote().Nanoseconds()+DynamicConfig.GetCsTimeoutPrevoteDelta().Nanoseconds()*int64(round),
 	) * time.Nanosecond
 }
 
 // Precommit returns the amount of time to wait for straggler votes after receiving any +2/3 precommits
 func (cfg *ConsensusConfig) Precommit(round int) time.Duration {
 	return time.Duration(
-		cfg.TimeoutPrecommit.Nanoseconds()+cfg.TimeoutPrecommitDelta.Nanoseconds()*int64(round),
+		DynamicConfig.GetCsTimeoutPrecommit().Nanoseconds()+DynamicConfig.GetCsTimeoutPrecommitDelta().Nanoseconds()*int64(round),
 	) * time.Nanosecond
 }
 
 // Commit returns the amount of time to wait for straggler votes after receiving +2/3 precommits
 // for a single block (ie. a commit).
 func (cfg *ConsensusConfig) Commit(t time.Time) time.Time {
-	return t.Add(cfg.TimeoutCommit)
+	return t.Add(DynamicConfig.GetCsTimeoutCommit())
 }
 
 // WalFile returns the full path to the write-ahead log file
@@ -912,8 +937,14 @@ func (cfg *ConsensusConfig) ValidateBasic() error {
 	if cfg.TimeoutCommit < 0 {
 		return errors.New("timeout_commit can't be negative")
 	}
+	if cfg.TimeoutConsensus < 0 {
+		return errors.New("timeout_consensus can't be negative")
+	}
 	if cfg.CreateEmptyBlocksInterval < 0 {
 		return errors.New("create_empty_blocks_interval can't be negative")
+	}
+	if cfg.TimeoutToFastSync < 0 {
+		return errors.New("timeout_to_fast_sync can't be negative")
 	}
 	if cfg.PeerGossipSleepDuration < 0 {
 		return errors.New("peer_gossip_sleep_duration can't be negative")
@@ -924,12 +955,14 @@ func (cfg *ConsensusConfig) ValidateBasic() error {
 	return nil
 }
 
-//-----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // TxIndexConfig
 // Remember that Event has the following structure:
 // type: [
-//  key: value,
-//  ...
+//
+//	key: value,
+//	...
+//
 // ]
 //
 // CompositeKeys are constructed by `type.key`

@@ -23,6 +23,18 @@ var (
 	KeyFarmProportion = []byte("YieldFarmingProportion")
 )
 
+// WrappedParams is used to wrap the Params, thus making the rest API response compatible with cosmos-sdk
+type WrappedParams struct {
+	Params Params `json:"params" yaml:"params"`
+}
+
+// NewWrappedParams creates a new instance of WrappedParams
+func NewWrappedParams(params Params) WrappedParams {
+	return WrappedParams{
+		Params: params,
+	}
+}
+
 // mint parameters
 type Params struct {
 	MintDenom           string  `json:"mint_denom" yaml:"mint_denom"`                       // type of coin to mint
@@ -32,7 +44,7 @@ type Params struct {
 	GoalBonded          sdk.Dec `json:"goal_bonded" yaml:"goal_bonded"`                     // Deprecated: goal of percent bonded atoms
 	BlocksPerYear       uint64  `json:"blocks_per_year" yaml:"blocks_per_year"`             // blocks per year according to one block per 3s
 
-	DeflationRate  sdk.Dec `json:"deflation_rate" yaml:"deflation_rate"` // deflation rate every DeflationEpoch
+	DeflationRate  sdk.Dec `json:"deflation_rate" yaml:"deflation_rate"`   // deflation rate every DeflationEpoch
 	DeflationEpoch uint64  `json:"deflation_epoch" yaml:"deflation_epoch"` // block number to deflate
 	FarmProportion sdk.Dec `json:"farm_proportion" yaml:"farm_proportion"` // proportion of minted for farm
 }

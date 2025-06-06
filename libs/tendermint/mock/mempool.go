@@ -4,11 +4,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 
+	"github.com/okex/exchain/libs/system/trace"
+
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/libs/clist"
 	mempl "github.com/okex/exchain/libs/tendermint/mempool"
-	"github.com/okex/exchain/libs/tendermint/trace"
 	"github.com/okex/exchain/libs/tendermint/types"
 )
 
@@ -31,11 +32,13 @@ func (Mempool) Size() int { return 0 }
 func (Mempool) CheckTx(_ types.Tx, _ func(*abci.Response), _ mempl.TxInfo) error {
 	return nil
 }
-func (Mempool) ReapMaxBytesMaxGas(_, _ int64) types.Txs       { return types.Txs{} }
+func (Mempool) ReapMaxBytesMaxGas(_, _ int64) []types.Tx      { return nil }
+func (Mempool) ReapEssentialTx(tx types.Tx) abci.TxEssentials { return nil }
 func (Mempool) ReapMaxTxs(n int) types.Txs                    { return types.Txs{} }
 func (Mempool) ReapUserTxsCnt(address string) int             { return 0 }
 func (Mempool) GetUserPendingTxsCnt(address string) int       { return 0 }
 func (Mempool) ReapUserTxs(address string, max int) types.Txs { return types.Txs{} }
+func (Mempool) GetPendingNonce(address string) (uint64, bool) { return 0, true }
 func (Mempool) Update(
 	_ int64,
 	txs types.Txs,
@@ -72,4 +75,18 @@ func (Mempool) SetAccountRetriever(_ mempl.AccountRetriever) {
 
 func (Mempool) SetTxInfoParser(_ mempl.TxInfoParser) {
 
+}
+
+func (Mempool) GetTxSimulateGas(txHash string) int64 { return 0 }
+
+func (Mempool) SetEnableDeleteMinGPTx(enable bool) {
+
+}
+
+func (Mempool) GetEnableDeleteMinGPTx() bool {
+	return false
+}
+
+func (Mempool) GetPendingPoolTxsBytes() map[string]map[string]types.WrappedMempoolTx {
+	return make(map[string]map[string]types.WrappedMempoolTx)
 }

@@ -2,15 +2,13 @@ package mempool
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	mrand "math/rand"
 	"os"
-	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,14 +21,16 @@ import (
 
 	"github.com/okex/exchain/libs/tendermint/abci/example/counter"
 	"github.com/okex/exchain/libs/tendermint/abci/example/kvstore"
-	abciserver "github.com/okex/exchain/libs/tendermint/abci/server"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
 	tmrand "github.com/okex/exchain/libs/tendermint/libs/rand"
-	"github.com/okex/exchain/libs/tendermint/libs/service"
 	"github.com/okex/exchain/libs/tendermint/proxy"
 	"github.com/okex/exchain/libs/tendermint/types"
+)
+
+const (
+	BlockMaxTxNum = 300
 )
 
 // A cleanupFunc cleans up any config / test files created for a particular
@@ -105,10 +105,11 @@ func TestReapMaxBytesMaxGas(t *testing.T) {
 	tx0 := mempool.TxsFront().Value.(*mempoolTx)
 	// assert that kv store has gas wanted = 1.
 	require.Equal(t, app.CheckTx(abci.RequestCheckTx{Tx: tx0.tx}).GasWanted, int64(1), "KVStore had a gas value neq to 1")
-	require.Equal(t, tx0.gasWanted, int64(1), "transactions gas was set incorrectly")
+	require.Equal(t, tx0.gasLimit, int64(1), "transactions gas was set incorrectly")
 	// ensure each tx is 20 bytes long
 	require.Equal(t, len(tx0.tx), 20, "Tx is longer than 20 bytes")
 	mempool.Flush()
+	assert.Zero(t, mempool.Size())
 
 	// each table driven test creates numTxsToCreate txs with checkTx, and at the end clears all remaining txs.
 	// each tx has 20 bytes + amino overhead = 21 bytes, 1 gas
@@ -119,7 +120,7 @@ func TestReapMaxBytesMaxGas(t *testing.T) {
 		expectedNumTxs int
 	}{
 		{20, -1, -1, 20},
-		{20, -1, 0, 0},
+		{20, -1, 0, 1},
 		{20, -1, 10, 10},
 		{20, -1, 30, 20},
 		{20, 0, -1, 0},
@@ -141,6 +142,7 @@ func TestReapMaxBytesMaxGas(t *testing.T) {
 		assert.Equal(t, tt.expectedNumTxs, len(got), "Got %d txs, expected %d, tc #%d",
 			len(got), tt.expectedNumTxs, tcIndex)
 		mempool.Flush()
+		assert.Zero(t, mempool.Size())
 	}
 }
 
@@ -330,7 +332,7 @@ func TestSerialReap(t *testing.T) {
 					res.Code, res.Data, res.Log)
 			}
 		}
-		res, err := appConnCon.CommitSync()
+		res, err := appConnCon.CommitSync(abci.RequestCommit{})
 		if err != nil {
 			t.Errorf("client error committing: %v", err)
 		}
@@ -355,69 +357,23 @@ func TestSerialReap(t *testing.T) {
 	deliverTxsRange(0, 1000)
 
 	// Reap the txs.
-	reapCheck(1000)
+	reapCheck(BlockMaxTxNum)
 
 	// Reap again.  We should get the same amount
-	reapCheck(1000)
+	reapCheck(BlockMaxTxNum)
 
 	// Commit from the conensus AppConn
-	commitRange(0, 500)
-	updateRange(0, 500)
+	commitRange(0, BlockMaxTxNum)
+	updateRange(0, BlockMaxTxNum)
 
 	// We should have 500 left.
-	reapCheck(500)
+	reapCheck(BlockMaxTxNum)
 
 	// Deliver 100 invalid txs and 100 valid txs
 	deliverTxsRange(900, 1100)
 
-	// We should have 600 now.
-	reapCheck(600)
-}
-
-func TestMempoolCloseWAL(t *testing.T) {
-	// 1. Create the temporary directory for mempool and WAL testing.
-	rootDir, err := ioutil.TempDir("", "mempool-test")
-	require.Nil(t, err, "expecting successful tmpdir creation")
-
-	// 2. Ensure that it doesn't contain any elements -- Sanity check
-	m1, err := filepath.Glob(filepath.Join(rootDir, "*"))
-	require.Nil(t, err, "successful globbing expected")
-	require.Equal(t, 0, len(m1), "no matches yet")
-
-	// 3. Create the mempool
-	wcfg := cfg.DefaultConfig()
-	wcfg.Mempool.RootDir = rootDir
-	app := kvstore.NewApplication()
-	cc := proxy.NewLocalClientCreator(app)
-	mempool, cleanup := newMempoolWithAppAndConfig(cc, wcfg)
-	defer cleanup()
-	mempool.height = 10
-	mempool.InitWAL()
-
-	// 4. Ensure that the directory contains the WAL file
-	m2, err := filepath.Glob(filepath.Join(rootDir, "*"))
-	require.Nil(t, err, "successful globbing expected")
-	require.Equal(t, 1, len(m2), "expecting the wal match in")
-
-	// 5. Write some contents to the WAL
-	mempool.CheckTx(types.Tx([]byte("foo")), nil, TxInfo{})
-	walFilepath := mempool.wal.Path
-	sum1 := checksumFile(walFilepath, t)
-
-	// 6. Sanity check to ensure that the written TX matches the expectation.
-	require.Equal(t, sum1, checksumIt([]byte("foo\n")), "foo with a newline should be written")
-
-	// 7. Invoke CloseWAL() and ensure it discards the
-	// WAL thus any other write won't go through.
-	mempool.CloseWAL()
-	mempool.CheckTx(types.Tx([]byte("bar")), nil, TxInfo{})
-	sum2 := checksumFile(walFilepath, t)
-	require.Equal(t, sum1, sum2, "expected no change to the WAL after invoking CloseWAL() since it was discarded")
-
-	// 8. Sanity check to ensure that the WAL file still exists
-	m3, err := filepath.Glob(filepath.Join(rootDir, "*"))
-	require.Nil(t, err, "successful globbing expected")
-	require.Equal(t, 1, len(m3), "expecting the wal match in")
+	// We should have 300 now.
+	reapCheck(BlockMaxTxNum)
 }
 
 // Size of the amino encoded TxMessage is the length of the
@@ -464,7 +420,7 @@ func TestMempoolMaxMsgSize(t *testing.T) {
 
 		tx := tmrand.Bytes(testCase.len)
 		err := mempl.CheckTx(tx, nil, TxInfo{})
-		msg := &TxMessage{tx}
+		msg := &TxMessage{tx, ""}
 		encoded := cdc.MustMarshalBinaryBare(msg)
 		require.Equal(t, len(encoded), txMessageSize(tx), caseString)
 		if !testCase.err {
@@ -535,80 +491,19 @@ func TestMempoolTxsBytes(t *testing.T) {
 	res, err := appConnCon.DeliverTxSync(abci.RequestDeliverTx{Tx: txBytes})
 	require.NoError(t, err)
 	require.EqualValues(t, 0, res.Code)
-	res2, err := appConnCon.CommitSync()
+	res2, err := appConnCon.CommitSync(abci.RequestCommit{})
 	require.NoError(t, err)
 	require.NotEmpty(t, res2.Data)
-
 	// Pretend like we committed nothing so txBytes gets rechecked and removed.
-	mempool.Update(1, []types.Tx{}, abciResponses(0, abci.CodeTypeOK), nil, nil)
-	assert.EqualValues(t, 0, mempool.TxsBytes())
-}
-
-// This will non-deterministically catch some concurrency failures like
-// https://github.com/tendermint/tendermint/issues/3509
-// TODO: all of the tests should probably also run using the remote proxy app
-// since otherwise we're not actually testing the concurrency of the mempool here!
-func TestMempoolRemoteAppConcurrency(t *testing.T) {
-	sockPath := fmt.Sprintf("unix:///tmp/echo_%v.sock", tmrand.Str(6))
-	app := kvstore.NewApplication()
-	cc, server := newRemoteApp(t, sockPath, app)
-	defer server.Stop()
-	config := cfg.ResetTestRoot("mempool_test")
-	mempool, cleanup := newMempoolWithAppAndConfig(cc, config)
-	defer cleanup()
-
-	// generate small number of txs
-	nTxs := 10
-	txLen := 200
-	txs := make([]types.Tx, nTxs)
-	for i := 0; i < nTxs; i++ {
-		txs[i] = tmrand.Bytes(txLen)
+	// our config recheck flag default is false so cannot rechecked to remove unavailable txs
+	// add config to check whether to assert mempool txsbytes
+	height := int64(1)
+	mempool.Update(height, []types.Tx{}, abciResponses(0, abci.CodeTypeOK), nil, nil)
+	if cfg.DynamicConfig.GetMempoolRecheck() || height%cfg.DynamicConfig.GetMempoolForceRecheckGap() == 0 {
+		assert.EqualValues(t, 0, mempool.TxsBytes())
+	} else {
+		assert.EqualValues(t, len(txBytes), mempool.TxsBytes())
 	}
-
-	// simulate a group of peers sending them over and over
-	N := config.Mempool.Size
-	maxPeers := 5
-	for i := 0; i < N; i++ {
-		peerID := mrand.Intn(maxPeers)
-		txNum := mrand.Intn(nTxs)
-		tx := txs[txNum]
-
-		// this will err with ErrTxInCache many times ...
-		mempool.CheckTx(tx, nil, TxInfo{SenderID: uint16(peerID)})
-	}
-	err := mempool.FlushAppConn()
-	require.NoError(t, err)
-}
-
-// caller must close server
-func newRemoteApp(
-	t *testing.T,
-	addr string,
-	app abci.Application,
-) (
-	clientCreator proxy.ClientCreator,
-	server service.Service,
-) {
-	clientCreator = proxy.NewRemoteClientCreator(addr, "socket", true)
-
-	// Start server
-	server = abciserver.NewSocketServer(addr, app)
-	server.SetLogger(log.TestingLogger().With("module", "abci-server"))
-	if err := server.Start(); err != nil {
-		t.Fatalf("Error starting socket server: %v", err.Error())
-	}
-	return clientCreator, server
-}
-func checksumIt(data []byte) string {
-	h := sha256.New()
-	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func checksumFile(p string, t *testing.T) string {
-	data, err := ioutil.ReadFile(p)
-	require.Nil(t, err, "expecting successful read of %q", p)
-	return checksumIt(data)
 }
 
 func abciResponses(n int, code uint32) []*abci.ResponseDeliverTx {
@@ -629,34 +524,33 @@ func TestAddAndSortTx(t *testing.T) {
 
 	//tx := &mempoolTx{height: 1, gasWanted: 1, tx:[]byte{0x01}}
 	testCases := []struct {
-		Tx   *mempoolTx
-		Info ExTxInfo
+		Tx *mempoolTx
 	}{
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("1")}, ExTxInfo{"18", 0, big.NewInt(3780), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("2")}, ExTxInfo{"6", 0, big.NewInt(5853), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("3")}, ExTxInfo{"7", 0, big.NewInt(8315), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("4")}, ExTxInfo{"10", 0, big.NewInt(9526), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("5")}, ExTxInfo{"15", 0, big.NewInt(9140), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("6")}, ExTxInfo{"9", 0, big.NewInt(9227), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("7")}, ExTxInfo{"3", 0, big.NewInt(761), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("8")}, ExTxInfo{"18", 0, big.NewInt(9740), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("9")}, ExTxInfo{"1", 0, big.NewInt(6574), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10")}, ExTxInfo{"8", 0, big.NewInt(9656), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("11")}, ExTxInfo{"12", 0, big.NewInt(6554), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("12")}, ExTxInfo{"16", 0, big.NewInt(5609), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("13")}, ExTxInfo{"6", 0, big.NewInt(2791), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("14")}, ExTxInfo{"18", 0, big.NewInt(2698), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("15")}, ExTxInfo{"1", 0, big.NewInt(6925), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("16")}, ExTxInfo{"3", 0, big.NewInt(3171), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("17")}, ExTxInfo{"1", 0, big.NewInt(2965), 2}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("18")}, ExTxInfo{"19", 0, big.NewInt(2484), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("19")}, ExTxInfo{"13", 0, big.NewInt(9722), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("20")}, ExTxInfo{"7", 0, big.NewInt(4236), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("21")}, ExTxInfo{"18", 0, big.NewInt(1780), 0}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("1"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(3780)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("2"), from: "6", realTx: abci.MockTx{GasPrice: big.NewInt(5853)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("3"), from: "7", realTx: abci.MockTx{GasPrice: big.NewInt(8315)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("4"), from: "10", realTx: abci.MockTx{GasPrice: big.NewInt(9526)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("5"), from: "15", realTx: abci.MockTx{GasPrice: big.NewInt(9140)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("6"), from: "9", realTx: abci.MockTx{GasPrice: big.NewInt(9227)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("7"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(761)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("8"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(9740)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("9"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(6574)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10"), from: "8", realTx: abci.MockTx{GasPrice: big.NewInt(9656)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("11"), from: "12", realTx: abci.MockTx{GasPrice: big.NewInt(6554)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("12"), from: "16", realTx: abci.MockTx{GasPrice: big.NewInt(5609)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("13"), from: "6", realTx: abci.MockTx{GasPrice: big.NewInt(2791), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("14"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(2698), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("15"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(6925), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("16"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(3171)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("17"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(2965), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("18"), from: "19", realTx: abci.MockTx{GasPrice: big.NewInt(2484)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("19"), from: "13", realTx: abci.MockTx{GasPrice: big.NewInt(9722)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("20"), from: "7", realTx: abci.MockTx{GasPrice: big.NewInt(4236), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("21"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(1780)}}},
 	}
 
 	for _, exInfo := range testCases {
-		mempool.addAndSortTx(exInfo.Tx, exInfo.Info)
+		mempool.addTx(exInfo.Tx)
 	}
 	require.Equal(t, 18, mempool.txs.Len(), fmt.Sprintf("Expected to txs length %v but got %v", 18, mempool.txs.Len()))
 
@@ -681,9 +575,9 @@ func TestAddAndSortTx(t *testing.T) {
 	//Address:  18  , GasPrice:  2698  , Nonce:  1
 	//Address:  19  , GasPrice:  2484  , Nonce:  0
 
-	require.Equal(t, 3, mempool.addressRecord.GetAddressTxsCnt("1"))
-	require.Equal(t, 1, mempool.addressRecord.GetAddressTxsCnt("15"))
-	require.Equal(t, 2, mempool.addressRecord.GetAddressTxsCnt("18"))
+	require.Equal(t, 3, mempool.GetUserPendingTxsCnt("1"))
+	require.Equal(t, 1, mempool.GetUserPendingTxsCnt("15"))
+	require.Equal(t, 2, mempool.GetUserPendingTxsCnt("18"))
 
 	require.Equal(t, "18", mempool.txs.Front().Address)
 	require.Equal(t, big.NewInt(9740), mempool.txs.Front().GasPrice)
@@ -705,8 +599,8 @@ func TestAddAndSortTx(t *testing.T) {
 
 	mempool.Flush()
 	require.Equal(t, 0, mempool.txs.Len())
-	require.Equal(t, 0, mempool.bcTxsList.Len())
-	require.Equal(t, 0, len(mempool.addressRecord.GetAddressList()))
+	require.Equal(t, 0, mempool.txs.BroadcastLen())
+	require.Equal(t, 0, len(mempool.GetAddressList()))
 
 }
 
@@ -719,21 +613,30 @@ func TestReplaceTx(t *testing.T) {
 
 	//tx := &mempoolTx{height: 1, gasWanted: 1, tx:[]byte{0x01}}
 	testCases := []struct {
-		Tx   *mempoolTx
-		Info ExTxInfo
+		Tx *mempoolTx
 	}{
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10000")}, ExTxInfo{"1", 0, big.NewInt(9740), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10001")}, ExTxInfo{"1", 0, big.NewInt(5853), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10002")}, ExTxInfo{"1", 0, big.NewInt(8315), 2}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10003")}, ExTxInfo{"1", 0, big.NewInt(9526), 3}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10004")}, ExTxInfo{"1", 0, big.NewInt(9140), 4}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10002")}, ExTxInfo{"1", 0, big.NewInt(9227), 2}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10000"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(9740)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10001"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(5853), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10002"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(8315), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10003"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(9526), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10004"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(9140), Nonce: 4}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10002"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(9227), Nonce: 2}}},
 	}
 
 	for _, exInfo := range testCases {
-		mempool.addAndSortTx(exInfo.Tx, exInfo.Info)
+		mempool.addTx(exInfo.Tx)
 	}
 	require.Equal(t, 5, mempool.txs.Len(), fmt.Sprintf("Expected to txs length %v but got %v", 5, mempool.txs.Len()))
+
+	var nonces []uint64
+	var gasPrices []uint64
+	for e := mempool.txs.Front(); e != nil; e = e.Next() {
+		nonces = append(nonces, e.Nonce)
+		gasPrices = append(gasPrices, e.GasPrice.Uint64())
+	}
+
+	require.Equal(t, []uint64{0, 1, 2, 3, 4}, nonces)
+	require.Equal(t, []uint64{9740, 5853, 9227, 9526, 9140}, gasPrices)
 }
 
 func TestAddAndSortTxByRandom(t *testing.T) {
@@ -745,11 +648,11 @@ func TestAddAndSortTxByRandom(t *testing.T) {
 
 	AddrNonce := make(map[string]int)
 	for i := 0; i < 1000; i++ {
-		mempool.addAndSortTx(generateNode(AddrNonce, i))
+		mempool.addTx(generateNode(AddrNonce, i))
 	}
 
 	require.Equal(t, true, checkTx(mempool.txs.Front()))
-	addressList := mempool.addressRecord.GetAddressList()
+	addressList := mempool.GetAddressList()
 	for _, addr := range addressList {
 		require.Equal(t, true, checkAccNonce(addr, mempool.txs.Front()))
 	}
@@ -764,33 +667,32 @@ func TestReapUserTxs(t *testing.T) {
 
 	//tx := &mempoolTx{height: 1, gasWanted: 1, tx:[]byte{0x01}}
 	testCases := []struct {
-		Tx   *mempoolTx
-		Info ExTxInfo
+		Tx *mempoolTx
 	}{
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("1")}, ExTxInfo{"18", 0, big.NewInt(9740), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("2")}, ExTxInfo{"6", 0, big.NewInt(5853), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("3")}, ExTxInfo{"7", 0, big.NewInt(8315), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("4")}, ExTxInfo{"10", 0, big.NewInt(9526), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("5")}, ExTxInfo{"15", 0, big.NewInt(9140), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("6")}, ExTxInfo{"9", 0, big.NewInt(9227), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("7")}, ExTxInfo{"3", 0, big.NewInt(761), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("8")}, ExTxInfo{"18", 0, big.NewInt(3780), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("9")}, ExTxInfo{"1", 0, big.NewInt(6574), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10")}, ExTxInfo{"8", 0, big.NewInt(9656), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("11")}, ExTxInfo{"12", 0, big.NewInt(6554), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("12")}, ExTxInfo{"16", 0, big.NewInt(5609), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("13")}, ExTxInfo{"6", 0, big.NewInt(2791), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("14")}, ExTxInfo{"18", 0, big.NewInt(2698), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("15")}, ExTxInfo{"1", 0, big.NewInt(6925), 1}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("16")}, ExTxInfo{"3", 0, big.NewInt(3171), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("17")}, ExTxInfo{"1", 0, big.NewInt(2965), 2}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("18")}, ExTxInfo{"19", 0, big.NewInt(2484), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("19")}, ExTxInfo{"13", 0, big.NewInt(9722), 0}},
-		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("20")}, ExTxInfo{"7", 0, big.NewInt(4236), 1}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("1"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(9740)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("2"), from: "6", realTx: abci.MockTx{GasPrice: big.NewInt(5853)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("3"), from: "7", realTx: abci.MockTx{GasPrice: big.NewInt(8315)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("4"), from: "10", realTx: abci.MockTx{GasPrice: big.NewInt(9526)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("5"), from: "15", realTx: abci.MockTx{GasPrice: big.NewInt(9140)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("6"), from: "9", realTx: abci.MockTx{GasPrice: big.NewInt(9227)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("7"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(761)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("8"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(3780)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("9"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(6574)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10"), from: "8", realTx: abci.MockTx{GasPrice: big.NewInt(9656)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("11"), from: "12", realTx: abci.MockTx{GasPrice: big.NewInt(6554)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("12"), from: "16", realTx: abci.MockTx{GasPrice: big.NewInt(5609)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("13"), from: "6", realTx: abci.MockTx{GasPrice: big.NewInt(2791), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("14"), from: "18", realTx: abci.MockTx{GasPrice: big.NewInt(2698), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("15"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(6925), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("16"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(3171)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("17"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(2965), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("18"), from: "19", realTx: abci.MockTx{GasPrice: big.NewInt(2484)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("19"), from: "13", realTx: abci.MockTx{GasPrice: big.NewInt(9722)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("20"), from: "7", realTx: abci.MockTx{GasPrice: big.NewInt(4236), Nonce: 1}}},
 	}
 
 	for _, exInfo := range testCases {
-		mempool.addAndSortTx(exInfo.Tx, exInfo.Info)
+		mempool.addTx(exInfo.Tx)
 	}
 	require.Equal(t, 18, mempool.txs.Len(), fmt.Sprintf("Expected to txs length %v but got %v", 18,
 		mempool.txs.Len()))
@@ -814,7 +716,7 @@ func TestReapUserTxs(t *testing.T) {
 		"of %s is %v but got %v", "111", 0, len(mempool.ReapUserTxs("111", 100))))
 }
 
-func generateNode(addrNonce map[string]int, idx int) (*mempoolTx, ExTxInfo) {
+func generateNode(addrNonce map[string]int, idx int) *mempoolTx {
 	mrand.Seed(time.Now().UnixNano())
 	addr := strconv.Itoa(mrand.Int()%1000 + 1)
 	gasPrice := mrand.Int()%100000 + 1
@@ -833,15 +735,14 @@ func generateNode(addrNonce map[string]int, idx int) (*mempoolTx, ExTxInfo) {
 		height:    1,
 		gasWanted: int64(idx),
 		tx:        []byte(strconv.Itoa(idx)),
+		from:      addr,
+		realTx: abci.MockTx{
+			GasPrice: big.NewInt(int64(gasPrice)),
+			Nonce:    uint64(nonce),
+		},
 	}
 
-	exInfo := ExTxInfo{
-		Sender:   addr,
-		GasPrice: big.NewInt(int64(gasPrice)),
-		Nonce:    uint64(nonce),
-	}
-
-	return tx, exInfo
+	return tx
 }
 
 func checkAccNonce(addr string, head *clist.CElement) bool {
@@ -899,5 +800,310 @@ func TestMultiPriceBump(t *testing.T) {
 	}
 	for _, tt := range tests {
 		require.True(t, tt.targetPrice.Cmp(MultiPriceBump(tt.rawPrice, int64(tt.priceBump))) == 0)
+	}
+}
+
+func TestAddAndSortTxConcurrency(t *testing.T) {
+	app := kvstore.NewApplication()
+	cc := proxy.NewLocalClientCreator(app)
+	config := cfg.ResetTestRoot("mempool_test")
+	config.Mempool.SortTxByGp = true
+	mempool, cleanup := newMempoolWithAppAndConfig(cc, config)
+	defer cleanup()
+
+	//tx := &mempoolTx{height: 1, gasWanted: 1, tx:[]byte{0x01}}
+	type Case struct {
+		Tx *mempoolTx
+	}
+
+	testCases := []Case{
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("1"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(3780)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("2"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(3780), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("3"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(5315), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("4"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(4526), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("5"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(2140), Nonce: 4}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("6"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(4227), Nonce: 5}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("7"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(2161)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("8"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(5740), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("9"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(6574), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("10"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(9630), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("11"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(6554), Nonce: 4}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("12"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(5609), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("13"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(2791)}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("14"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(2698), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("15"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(6925), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("16"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(4171), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("17"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(2965), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("18"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(2484), Nonce: 2}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("19"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(9722), Nonce: 1}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("20"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(4236), Nonce: 3}}},
+		{&mempoolTx{height: 1, gasWanted: 1, tx: []byte("21"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(8780), Nonce: 4}}},
+	}
+
+	var wait sync.WaitGroup
+	for _, exInfo := range testCases {
+		wait.Add(1)
+		go func(p Case) {
+			mempool.addTx(p.Tx)
+			wait.Done()
+		}(exInfo)
+	}
+
+	wait.Wait()
+}
+
+func TestTxID(t *testing.T) {
+	var bytes = make([]byte, 256)
+	for i := 0; i < 10; i++ {
+		_, err := rand.Read(bytes)
+		require.NoError(t, err)
+		require.Equal(t, amino.HexEncodeToStringUpper(bytes), fmt.Sprintf("%X", bytes))
+	}
+}
+
+func BenchmarkTxID(b *testing.B) {
+	var bytes = make([]byte, 256)
+	_, _ = rand.Read(bytes)
+	var res string
+	b.Run("fmt", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			res = fmt.Sprintf("%X", bytes)
+		}
+	})
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			res = amino.HexEncodeToStringUpper(bytes)
+		}
+	})
+	_ = res
+}
+
+func TestReplaceTxWithMultiAddrs(t *testing.T) {
+	app := kvstore.NewApplication()
+	cc := proxy.NewLocalClientCreator(app)
+	config := cfg.ResetTestRoot("mempool_test")
+	mempool, cleanup := newMempoolWithAppAndConfig(cc, config)
+	defer cleanup()
+
+	tx1 := &mempoolTx{height: 1, gasWanted: 1, tx: []byte("10002"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(9740), Nonce: 1}}
+	mempool.addTx(tx1)
+	tx2 := &mempoolTx{height: 1, gasWanted: 1, tx: []byte("90000"), from: "2", realTx: abci.MockTx{GasPrice: big.NewInt(10717), Nonce: 1}}
+	mempool.addTx(tx2)
+	tx3 := &mempoolTx{height: 1, gasWanted: 1, tx: []byte("90000"), from: "3", realTx: abci.MockTx{GasPrice: big.NewInt(10715), Nonce: 1}}
+	mempool.addTx(tx3)
+	tx4 := &mempoolTx{height: 1, gasWanted: 1, tx: []byte("10001"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(10716), Nonce: 2}}
+	mempool.addTx(tx4)
+	tx5 := &mempoolTx{height: 1, gasWanted: 1, tx: []byte("10001"), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(10712), Nonce: 1}}
+	mempool.addTx(tx5)
+
+	var nonces []uint64
+	for e := mempool.txs.Front(); e != nil; e = e.Next() {
+		if e.Address == "1" {
+			nonces = append(nonces, e.Nonce)
+		}
+	}
+	require.Equal(t, []uint64{1, 2}, nonces)
+}
+
+func BenchmarkMempoolLogUpdate(b *testing.B) {
+	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout)).With("module", "benchmark")
+	var options []log.Option
+	options = append(options, log.AllowErrorWith("module", "benchmark"))
+	logger = log.NewFilter(logger, options...)
+
+	mem := &CListMempool{height: 123456, logger: logger}
+	addr := "address"
+	nonce := uint64(123456)
+
+	b.Run("pool", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			mem.logUpdate(addr, nonce)
+		}
+	})
+
+	b.Run("logger", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			mem.logger.Debug("mempool update", "address", addr, "nonce", nonce)
+		}
+	})
+}
+
+func BenchmarkMempoolLogAddTx(b *testing.B) {
+	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout)).With("module", "benchmark")
+	var options []log.Option
+	options = append(options, log.AllowErrorWith("module", "benchmark"))
+	logger = log.NewFilter(logger, options...)
+
+	mem := &CListMempool{height: 123456, logger: logger, txs: NewBaseTxQueue()}
+	tx := []byte("tx")
+
+	memTx := &mempoolTx{
+		height: mem.Height(),
+		tx:     tx,
+	}
+
+	r := &abci.Response_CheckTx{}
+
+	b.Run("pool", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			mem.logAddTx(memTx, r)
+		}
+	})
+
+	b.Run("logger", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			mem.logger.Info("Added good transaction",
+				"tx", txIDStringer{tx, mem.height},
+				"res", r,
+				"height", memTx.height,
+				"total", mem.Size(),
+			)
+		}
+	})
+}
+
+func TestTxOrTxHashToKey(t *testing.T) {
+	var tx = make([]byte, 256)
+	rand.Read(tx)
+
+	old := types.GetVenusHeight()
+
+	types.UnittestOnlySetMilestoneVenusHeight(1)
+
+	venus := types.GetVenusHeight()
+	txhash := types.Tx(tx).Hash(venus)
+
+	require.Equal(t, txKey(tx), txOrTxHashToKey(tx, nil, venus))
+	require.Equal(t, txKey(tx), txOrTxHashToKey(tx, txhash, venus))
+	require.Equal(t, txKey(tx), txOrTxHashToKey(tx, txhash, venus-1))
+	require.Equal(t, txKey(tx), txOrTxHashToKey(tx, types.Tx(tx).Hash(venus-1), venus-1))
+	require.NotEqual(t, txKey(tx), txOrTxHashToKey(tx, types.Tx(tx).Hash(venus-1), venus))
+
+	types.UnittestOnlySetMilestoneVenusHeight(old)
+}
+
+func TestCListMempool_GetEnableDeleteMinGPTx(t *testing.T) {
+
+	testCases := []struct {
+		name     string
+		prepare  func(mempool *CListMempool, tt *testing.T)
+		execFunc func(mempool *CListMempool, tt *testing.T)
+	}{
+		{
+			name: "normal mempool is full add tx failed, disableDeleteMinGPTx",
+			prepare: func(mempool *CListMempool, tt *testing.T) {
+				mempool.Flush()
+				err := mempool.CheckTx([]byte{0x01}, nil, TxInfo{})
+				require.NoError(tt, err)
+			},
+			execFunc: func(mempool *CListMempool, tt *testing.T) {
+				err := mempool.CheckTx([]byte{0x02}, nil, TxInfo{})
+				require.Error(tt, err)
+				_, ok := err.(ErrMempoolIsFull)
+				require.True(t, ok)
+			},
+		},
+		{
+			name: "normal mempool is full add tx failed, enableDeleteMinGPTx",
+			prepare: func(mempool *CListMempool, tt *testing.T) {
+				mempool.Flush()
+				err := mempool.CheckTx([]byte{0x02}, nil, TxInfo{})
+				require.NoError(tt, err)
+				moc := cfg.MockDynamicConfig{}
+				moc.SetEnableDeleteMinGPTx(true)
+				cfg.SetDynamicConfig(moc)
+			},
+			execFunc: func(mempool *CListMempool, tt *testing.T) {
+				err := mempool.CheckTx([]byte{0x03}, nil, TxInfo{})
+				require.NoError(tt, err)
+				require.Equal(tt, 1, mempool.Size())
+				tx := mempool.txs.Back().Value.(*mempoolTx).tx
+				require.Equal(tt, byte(0x02), tx[0])
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(tt *testing.T) {
+			app := kvstore.NewApplication()
+			cc := proxy.NewLocalClientCreator(app)
+			mempool, cleanup := newMempoolWithApp(cc)
+			mempool.config.MaxTxsBytes = 1 //  in unit test we only use tx bytes to  control mempool weather full
+			defer cleanup()
+
+			tc.prepare(mempool, tt)
+			tc.execFunc(mempool, tt)
+		})
+	}
+
+}
+
+func TestConsumePendingtxConcurrency(t *testing.T) {
+
+	app := kvstore.NewApplication()
+	cc := proxy.NewLocalClientCreator(app)
+	mem, cleanup := newMempoolWithApp(cc)
+	defer cleanup()
+	mem.pendingPool = newPendingPool(500000, 3, 10, 500000)
+
+	for i := 0; i < 10000; i++ {
+		mem.pendingPool.addTx(&mempoolTx{height: 1, gasWanted: 1, tx: []byte(strconv.Itoa(i)), from: "1", realTx: abci.MockTx{GasPrice: big.NewInt(3780), Nonce: uint64(i)}})
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	startWg := &sync.WaitGroup{}
+	startWg.Add(1)
+	go func() {
+		startWg.Wait()
+		mem.consumePendingTx("1", 0)
+		wg.Done()
+	}()
+	startWg.Done()
+	mem.consumePendingTx("1", 5000)
+	wg.Wait()
+	require.Equal(t, 0, mem.pendingPool.Size())
+}
+
+func TestCheckAndGetWrapCMTx(t *testing.T) {
+	wCMTx := &types.WrapCMTx{Tx: []byte("123456"), Nonce: 2}
+	wdata, err := cdc.MarshalJSON(wCMTx)
+	assert.NoError(t, err)
+
+	testcase := []struct {
+		tx     types.Tx
+		txInfo TxInfo
+		res    *types.WrapCMTx
+	}{
+		{
+			tx:     []byte("123"),
+			txInfo: TxInfo{wrapCMTx: &types.WrapCMTx{Tx: []byte("123"), Nonce: 1}},
+			res:    &types.WrapCMTx{Tx: []byte("123"), Nonce: 1},
+		},
+		{
+			tx:     []byte("123"),
+			txInfo: TxInfo{},
+			res:    nil,
+		},
+		{
+			tx:     wdata,
+			txInfo: TxInfo{},
+			res:    wCMTx,
+		},
+	}
+
+	clistMem := &CListMempool{}
+	for _, tc := range testcase {
+		re := clistMem.CheckAndGetWrapCMTx(tc.tx, tc.txInfo)
+		if re != nil {
+			assert.Equal(t, *re, *tc.res)
+		} else {
+			assert.Equal(t, re, tc.res)
+		}
 	}
 }

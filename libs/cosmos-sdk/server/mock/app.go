@@ -20,7 +20,7 @@ import (
 // similar to a real app. Make sure rootDir is empty before running the test,
 // in order to guarantee consistent results
 func NewApp(rootDir string, logger log.Logger) (abci.Application, error) {
-	db, err := sdk.NewLevelDB("mock", filepath.Join(rootDir, "data"))
+	db, err := sdk.NewDB("mock", filepath.Join(rootDir, "data"))
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func NewApp(rootDir string, logger log.Logger) (abci.Application, error) {
 // them to the db
 func KVStoreHandler(storeKey sdk.StoreKey) sdk.Handler {
 	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-		dTx, ok := msg.(kvstoreTx)
+		dTx, ok := msg.(*kvstoreTx)
 		if !ok {
 			return nil, errors.New("KVStoreHandler should only receive kvstoreTx")
 		}
@@ -104,7 +104,7 @@ func InitChainer(key sdk.StoreKey) func(sdk.Context, abci.RequestInitChain) abci
 // AppGenState can be passed into InitCmd, returns a static string of a few
 // key-values that can be parsed by InitChainer
 func AppGenState(_ *codec.Codec, _ types.GenesisDoc, _ []json.RawMessage) (appState json.
-	RawMessage, err error) {
+RawMessage, err error) {
 	appState = json.RawMessage(`{
   "values": [
     {

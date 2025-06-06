@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -13,6 +14,7 @@ import (
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	tmos "github.com/okex/exchain/libs/tendermint/libs/os"
 	nm "github.com/okex/exchain/libs/tendermint/node"
+	"github.com/okex/exchain/libs/tendermint/types"
 )
 
 var (
@@ -33,6 +35,7 @@ func AddNodeFlags(cmd *cobra.Command) {
 
 	// node flags
 	cmd.Flags().Bool("fast_sync", config.FastSyncMode, "Fast blockchain syncing")
+	cmd.Flags().Bool("auto_fast_sync", config.AutoFastSync, "Switch to FastSync mode automatically")
 	cmd.Flags().BytesHexVar(
 		&genesisHash,
 		"genesis_hash",
@@ -50,7 +53,7 @@ func AddNodeFlags(cmd *cobra.Command) {
 	cmd.Flags().String("abci", config.ABCI, "Specify abci transport (socket | grpc)")
 
 	// rpc flags
-	cmd.Flags().String("rpc.laddr", config.RPC.ListenAddress, "RPC listen address. Port required")
+	cmd.Flags().String("rpc.laddr", config.RPC.ListenAddress, "Tendermint RPC listen address. If you need EVM RPC(that is, the 8545 port service of Ethereum) use --rest.laddr flag instead.")
 	cmd.Flags().String(
 		"rpc.grpc_laddr",
 		config.RPC.GRPCListenAddress,
@@ -70,6 +73,7 @@ func AddNodeFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("p2p.pex", config.P2P.PexReactor, "Enable/disable Peer-Exchange")
 	cmd.Flags().Bool("p2p.seed_mode", config.P2P.SeedMode, "Enable/disable seed mode")
 	cmd.Flags().String("p2p.private_peer_ids", config.P2P.PrivatePeerIDs, "Comma-delimited private peer IDs")
+	cmd.Flags().String("p2p.sentry_addrs", "", "Comma-delimited addresses")
 
 	// consensus flags
 	cmd.Flags().Bool(
@@ -80,6 +84,10 @@ func AddNodeFlags(cmd *cobra.Command) {
 		"consensus.create_empty_blocks_interval",
 		config.Consensus.CreateEmptyBlocksInterval.String(),
 		"The possible interval between empty blocks")
+	cmd.Flags().String(
+		"consensus.switch_to_fast_sync_interval",
+		config.Consensus.TimeoutToFastSync.String(),
+		"The interval for switching from consensus mode to fast-sync mode")
 	// mempool flags
 	cmd.Flags().Bool(
 		"mempool.sealed",
@@ -108,11 +116,45 @@ func AddNodeFlags(cmd *cobra.Command) {
 		config.Mempool.MaxTxNumPerBlock,
 		"Maximum number of transactions in a block",
 	)
+	cmd.Flags().Bool(
+		"mempool.enable_delete_min_gp_tx",
+		config.Mempool.EnableDeleteMinGPTx,
+		"Enable delete the minimum gas price tx from mempool when mempool is full",
+	)
+	cmd.Flags().String(
+		"mempool.pending-pool-blacklist",
+		"",
+		"Set the address blacklist of the pending pool, separated by commas",
+	)
 	cmd.Flags().Int64(
 		"mempool.max_gas_used_per_block",
 		config.Mempool.MaxGasUsedPerBlock,
 		"Maximum gas used of transactions in a block",
 	)
+	cmd.Flags().Bool(
+		"mempool.enable-pgu",
+		false,
+		"enable precise gas used",
+	)
+	cmd.Flags().Int64(
+		"mempool.pgu-percentage-threshold",
+		10,
+		"use pgu when hgu has a margin of at least threshold percent",
+	)
+	cmd.Flags().Int(
+		"mempool.pgu-concurrency",
+		1,
+		"pgu concurrency",
+	)
+	cmd.Flags().Float64(
+		"mempool.pgu-adjustment",
+		1,
+		"adjustment for pgu, such as 0.9 or 1.1",
+	)
+	cmd.Flags().Bool(
+		"mempool.pgu-persist",
+		false,
+		"persist the gas estimated by pgu")
 	cmd.Flags().Bool(
 		"mempool.sort_tx_by_gp",
 		config.Mempool.SortTxByGp,
@@ -148,16 +190,59 @@ func AddNodeFlags(cmd *cobra.Command) {
 		config.Mempool.PendingPoolMaxTxPerAddress,
 		"Maximum number of transactions per address in the pending pool",
 	)
+	cmd.Flags().Bool(
+		"mempool.pending_remove_event",
+		config.Mempool.PendingRemoveEvent,
+		"Push event when remove a pending tx",
+	)
+	cmd.Flags().Uint64(
+		"mempool.max_tx_limit_per_peer",
+		config.Mempool.MaxTxLimitPerPeer,
+		"Max tx limit per peer. If set 0 ,this flag disable",
+	)
+
+	cmd.Flags().String(
+		"mempool.node_key_whitelist",
+		strings.Join(config.Mempool.NodeKeyWhitelist, ","),
+		"The whitelist of nodes whose wtx is confident",
+	)
+
+	cmd.Flags().Bool(
+		"enable-wtx",
+		false,
+		"enable wrapped tx",
+	)
+
+	cmd.Flags().Bool(
+		"mempool.check_tx_cost",
+		false,
+		"Calculate tx type count and time in function checkTx per block",
+	)
+	cmd.Flags().String(
+		"tx_index.indexer",
+		config.TxIndex.Indexer,
+		"indexer to use for transactions, options: null, kv",
+	)
+	cmd.Flags().String(
+		"local_perf",
+		"",
+		"send tx/wtx to mempool, only for local performance test",
+	)
 
 	// db flags
 	cmd.Flags().String(
 		"db_backend",
-		config.DBBackend,
+		types.DBBackend,
 		"Database backend: goleveldb | cleveldb | boltdb | rocksdb")
 	cmd.Flags().String(
 		"db_dir",
 		config.DBPath,
 		"Database directory")
+
+	cmd.Flags().String(
+		"grpc.address",
+		config.GRPC.Address,
+		"grpc server address")
 
 	addMoreFlags(cmd)
 }

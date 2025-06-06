@@ -314,3 +314,62 @@ func TestVoteProtobuf(t *testing.T) {
 		}
 	}
 }
+
+var voteAminoTestCases = []Vote{
+	{},
+	{
+		Type:   PrevoteType,
+		Height: 1,
+		Round:  1,
+		BlockID: BlockID{
+			Hash: tmhash.Sum([]byte("blockhash1")),
+			PartsHeader: PartSetHeader{
+				Total: 1,
+				Hash:  tmhash.Sum([]byte("blockparts1")),
+			},
+		},
+		Timestamp:        time.Now(),
+		ValidatorAddress: []byte("address1"),
+		ValidatorIndex:   1,
+		Signature:        []byte("signature1"),
+		HasVC:            true,
+	},
+	{
+		Type:  PrecommitType,
+		HasVC: false,
+	},
+	{
+		Type:             ProposalType,
+		Height:           math.MaxInt64,
+		Round:            math.MaxInt,
+		ValidatorAddress: []byte(""),
+		ValidatorIndex:   math.MaxInt,
+		Signature:        []byte(""),
+		HasVC:            true,
+	},
+	{
+		Height:         math.MinInt64,
+		Round:          math.MinInt,
+		ValidatorIndex: math.MinInt,
+		HasVC:          true,
+	},
+}
+
+func TestVoteAmino(t *testing.T) {
+	for _, vote := range voteAminoTestCases {
+		expectData, err := cdc.MarshalBinaryBare(vote)
+		require.NoError(t, err)
+
+		require.Equal(t, len(expectData), vote.AminoSize(cdc))
+
+		var expectValue Vote
+		err = cdc.UnmarshalBinaryBare(expectData, &expectValue)
+		require.NoError(t, err)
+
+		var actualValue Vote
+		err = actualValue.UnmarshalFromAmino(cdc, expectData)
+		require.NoError(t, err)
+
+		require.EqualValues(t, expectValue, actualValue)
+	}
+}

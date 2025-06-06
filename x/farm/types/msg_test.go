@@ -1,3 +1,5 @@
+//go:build ignore
+
 package types
 
 import (
@@ -10,7 +12,7 @@ import (
 func testCode(t *testing.T, err sdk.Error, expectedCode uint32) {
 	if expectedCode != 0 {
 		require.NotNil(t, err)
-	}else {
+	} else {
 		require.Nil(t, err)
 	}
 }

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/okex/exchain/libs/cosmos-sdk/store/mpt"
+
 	"github.com/spf13/viper"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/store"
 	"github.com/okex/exchain/libs/cosmos-sdk/store/types"
 	tmiavl "github.com/okex/exchain/libs/iavl"
-
+	iavlcfg "github.com/okex/exchain/libs/iavl/config"
 )
 
 // GetPruningOptionsFromFlags parses command flags and returns the correct
@@ -23,6 +25,8 @@ func GetPruningOptionsFromFlags() (types.PruningOptions, error) {
 		if strategy == types.PruningOptionNothing {
 			tmiavl.EnablePruningHistoryState = false
 			tmiavl.CommitIntervalHeight = 1
+			iavlcfg.DynamicConfig.SetCommitGapHeight(1)
+			mpt.TrieDirtyDisabled = true
 		}
 		return types.NewPruningOptionsFromString(strategy), nil
 

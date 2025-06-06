@@ -10,14 +10,21 @@ import (
 	"strings"
 	"time"
 
+	blockindex "github.com/okex/exchain/libs/tendermint/state/indexer"
+	bloxkindexnull "github.com/okex/exchain/libs/tendermint/state/indexer/block/null"
+
+	"github.com/okex/exchain/libs/tendermint/global"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/cors"
 
 	amino "github.com/tendermint/go-amino"
-	dbm "github.com/tendermint/tm-db"
 
+	dbm "github.com/okex/exchain/libs/tm-db"
+
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	bcv0 "github.com/okex/exchain/libs/tendermint/blockchain/v0"
 	bcv1 "github.com/okex/exchain/libs/tendermint/blockchain/v1"
@@ -40,6 +47,7 @@ import (
 	grpccore "github.com/okex/exchain/libs/tendermint/rpc/grpc"
 	rpcserver "github.com/okex/exchain/libs/tendermint/rpc/jsonrpc/server"
 	sm "github.com/okex/exchain/libs/tendermint/state"
+	blockindexer "github.com/okex/exchain/libs/tendermint/state/indexer/block/kv"
 	"github.com/okex/exchain/libs/tendermint/state/txindex"
 	"github.com/okex/exchain/libs/tendermint/state/txindex/kv"
 	"github.com/okex/exchain/libs/tendermint/state/txindex/null"
@@ -183,6 +191,9 @@ type Node struct {
 	txIndexer        txindex.TxIndexer
 	indexerService   *txindex.IndexerService
 	prometheusSrv    *http.Server
+
+	//blockExec
+	blockExec *sm.BlockExecutor
 }
 
 func initDBs(config *cfg.Config, dbProvider DBProvider) (blockStore *store.BlockStore, stateDB dbm.DB, err error) {
@@ -194,6 +205,46 @@ func initDBs(config *cfg.Config, dbProvider DBProvider) (blockStore *store.Block
 	blockStore = store.NewBlockStore(blockStoreDB)
 
 	stateDB, err = dbProvider(&DBContext{"state", config})
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func initBlockStore(dataDir string) (blockStore *store.BlockStore, err error) {
+	var blockStoreDB dbm.DB
+	blockStoreDB, err = sdk.NewDB("blockstore", dataDir)
+	if err != nil {
+		return
+	}
+	blockStore = store.NewBlockStore(blockStoreDB)
+
+	return
+}
+
+func initTxDB(dataDir string) (txDB dbm.DB, err error) {
+	txDB, err = sdk.NewDB("tx_index", dataDir)
+	if err != nil {
+		return
+	}
+
+	return
+}
+func initBlockIndexDB(dataDir string) (txDB dbm.DB, err error) {
+	txDB, err = sdk.NewDB("block_index", dataDir)
+	if err != nil {
+		return
+	}
+
+	return
+}
+func initBlcokEventTxDB(blockIndexDb dbm.DB) dbm.DB {
+	return dbm.NewPrefixDB(blockIndexDb, []byte("block_events"))
+}
+
+func initStateDB(config *cfg.Config) (stateDB dbm.DB, err error) {
+	stateDB, err = sdk.NewDB("state", config.DBDir())
 	if err != nil {
 		return
 	}
@@ -223,6 +274,7 @@ func createAndStartIndexerService(config *cfg.Config, dbProvider DBProvider,
 	eventBus *types.EventBus, logger log.Logger) (*txindex.IndexerService, txindex.TxIndexer, error) {
 
 	var txIndexer txindex.TxIndexer
+	var blockIndexer blockindex.BlockIndexer
 	switch config.TxIndex.Indexer {
 	case "kv":
 		store, err := dbProvider(&DBContext{"tx_index", config})
@@ -237,11 +289,17 @@ func createAndStartIndexerService(config *cfg.Config, dbProvider DBProvider,
 		default:
 			txIndexer = kv.NewTxIndex(store)
 		}
+		blockIndexStore, err := dbProvider(&DBContext{"block_index", config})
+		if err != nil {
+			return nil, nil, err
+		}
+		blockIndexer = blockindexer.New(dbm.NewPrefixDB(blockIndexStore, []byte("block_events")))
 	default:
 		txIndexer = &null.TxIndex{}
+		blockIndexer = &bloxkindexnull.BlockerIndexer{}
 	}
 
-	indexerService := txindex.NewIndexerService(txIndexer, eventBus)
+	indexerService := txindex.NewIndexerService(txIndexer, blockIndexer, eventBus)
 	indexerService.SetLogger(logger.With("module", "txindex"))
 	if err := indexerService.Start(); err != nil {
 		return nil, nil, err
@@ -367,6 +425,7 @@ func createConsensusReactor(config *cfg.Config,
 	privValidator types.PrivValidator,
 	csMetrics *cs.Metrics,
 	fastSync bool,
+	autoFastSync bool,
 	eventBus *types.EventBus,
 	consensusLogger log.Logger) (*consensus.Reactor, *consensus.State) {
 
@@ -383,11 +442,13 @@ func createConsensusReactor(config *cfg.Config,
 	if privValidator != nil {
 		consensusState.SetPrivValidator(privValidator)
 	}
-	consensusReactor := cs.NewReactor(consensusState, fastSync, cs.ReactorMetrics(csMetrics))
+	consensusReactor := cs.NewReactor(consensusState, fastSync, autoFastSync, cs.ReactorMetrics(csMetrics))
 	consensusReactor.SetLogger(consensusLogger)
 	// services which will be publishing and/or subscribing for messages (events)
 	// consensusReactor will set it on consensusState and blockExecutor
-	consensusReactor.SetEventBus(eventBus)
+	if eventBus != nil {
+		consensusReactor.SetEventBus(eventBus)
+	}
 	return consensusReactor, consensusState
 }
 
@@ -524,13 +585,13 @@ func createPEXReactorAndAddToSwitch(addrBook pex.AddrBook, config *cfg.Config,
 	// TODO persistent peers ? so we can have their DNS addrs saved
 	pexReactor := pex.NewReactor(addrBook,
 		&pex.ReactorConfig{
-			Seeds:    splitAndTrimEmpty(config.P2P.Seeds, ",", " "),
+			Seeds:    splitAndTrimEmpty(setDefaultSeeds(config.P2P.Seeds), ",", " "),
 			SeedMode: config.P2P.SeedMode,
 			// See consensus/reactor.go: blocksToContributeToBecomeGoodPeer 10000
 			// blocks assuming 10s blocks ~ 28 hours.
 			// TODO (melekes): make it dynamic based on the actual block latencies
 			// from the live network.
-			// https://github.com/tendermint/tendermint/issues/3523
+			// https://github.com/okex/exchain/libs/tendermint/issues/3523
 			SeedDisconnectWaitPeriod:     28 * time.Hour,
 			PersistentPeersMaxDialPeriod: config.P2P.PersistentPeersMaxDialPeriod,
 		})
@@ -559,6 +620,8 @@ func NewNode(config *cfg.Config,
 	if err != nil {
 		return nil, err
 	}
+
+	global.SetGlobalHeight(state.LastBlockHeight)
 
 	// Create the proxyApp and establish connections to the ABCI app (consensus, mempool, query).
 	proxyApp, err := createAndStartProxyAppConns(clientCreator, logger)
@@ -613,12 +676,13 @@ func NewNode(config *cfg.Config,
 	// Decide whether to fast-sync or not
 	// We don't fast-sync when the only validator is us.
 	fastSync := config.FastSyncMode && !onlyValidatorIsUs(state, pubKey)
+	autoFastSync := config.AutoFastSync
 
 	csMetrics, p2pMetrics, memplMetrics, smMetrics := metricsProvider(genDoc.ChainID)
 
 	// Make MempoolReactor
 	mempoolReactor, mempool := createMempoolAndMempoolReactor(config, proxyApp, state, memplMetrics, logger)
-
+	mempoolReactor.SetNodeKey(nodeKey)
 	// Make Evidence Reactor
 	evidenceReactor, evidencePool, err := createEvidenceReactor(config, dbProvider, stateDB, logger)
 	if err != nil {
@@ -634,6 +698,10 @@ func NewNode(config *cfg.Config,
 		evidencePool,
 		sm.BlockExecutorWithMetrics(smMetrics),
 	)
+	blockExec.SetIsAsyncSaveDB(true)
+	if _, ok := txIndexer.(*null.TxIndex); ok {
+		blockExec.SetIsNullIndexer(true)
+	}
 
 	// Make BlockchainReactor
 	bcReactor, err := createBlockchainReactor(config, state, blockExec, blockStore, fastSync, logger)
@@ -644,7 +712,7 @@ func NewNode(config *cfg.Config,
 	// Make ConsensusReactor
 	consensusReactor, consensusState := createConsensusReactor(
 		config, state, blockExec, blockStore, mempool, evidencePool,
-		privValidator, csMetrics, fastSync, eventBus, consensusLogger,
+		privValidator, csMetrics, fastSync, autoFastSync, eventBus, consensusLogger,
 	)
 
 	nodeInfo, err := makeNodeInfo(config, nodeKey, txIndexer, genDoc, state)
@@ -724,12 +792,112 @@ func NewNode(config *cfg.Config,
 		txIndexer:        txIndexer,
 		indexerService:   indexerService,
 		eventBus:         eventBus,
+
+		blockExec: blockExec,
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
 	for _, option := range options {
 		option(node)
 	}
+
+	return node, nil
+}
+
+func NewLRPNode(config *cfg.Config,
+	privValidator types.PrivValidator,
+	nodeKey *p2p.NodeKey,
+	clientCreator proxy.ClientCreator,
+	genesisDocProvider GenesisDocProvider,
+	dbProvider DBProvider,
+	originDir string,
+	logger log.Logger,
+	options ...Option) (*Node, error) {
+
+	blockStore, err := initBlockStore(originDir)
+	if err != nil {
+		return nil, err
+	}
+
+	stateDB, err := initStateDB(config)
+	if err != nil {
+		return nil, err
+	}
+
+	state, genDoc, err := LoadStateFromDBOrGenesisDocProvider(stateDB, genesisDocProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	global.SetGlobalHeight(state.LastBlockHeight)
+
+	eventBus, err := createAndStartEventBus(logger)
+	if err != nil {
+		return nil, err
+	}
+
+	var txIndexer txindex.TxIndexer
+	var blockIndexer blockindex.BlockIndexer
+	txDB, err := initTxDB(originDir)
+	if err != nil {
+		return nil, err
+	}
+	blockIndexDb, err := initBlockIndexDB(originDir)
+	if err != nil {
+		return nil, err
+	}
+	txIndexer = kv.NewTxIndex(txDB, kv.IndexAllEvents())
+	blockIndexer = blockindexer.New(initBlcokEventTxDB(blockIndexDb))
+
+	indexerService := txindex.NewIndexerService(txIndexer, blockIndexer, eventBus)
+	indexerService.SetLogger(logger.With("module", "txindex"))
+	if err := indexerService.Start(); err != nil {
+		return nil, err
+	}
+
+	// Create the proxyApp and establish connections to the ABCI app (consensus, mempool, query).
+	proxyApp, err := createAndStartProxyAppConns(clientCreator, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	consensusLogger := logger.With("module", "consensus")
+
+	state = sm.LoadState(stateDB)
+	mempoolReactor, mempool := createMempoolAndMempoolReactor(config, proxyApp, state, nil, logger)
+	mempoolReactor.SetNodeKey(nodeKey)
+
+	// Make ConsensusReactor
+	consensusReactor, consensusState := createConsensusReactor(
+		config, state, nil, blockStore, nil, nil,
+		nil, nil, false, false, nil, consensusLogger,
+	)
+
+	nodeInfo, err := makeNodeInfo(config, nodeKey, nil, genDoc, state)
+	if err != nil {
+		return nil, err
+	}
+
+	node := &Node{
+		config:        config,
+		genesisDoc:    genDoc,
+		privValidator: privValidator,
+
+		nodeInfo: nodeInfo,
+		nodeKey:  nodeKey,
+
+		stateDB:          stateDB,
+		blockStore:       blockStore,
+		consensusState:   consensusState,
+		consensusReactor: consensusReactor,
+		txIndexer:        txIndexer,
+		indexerService:   indexerService,
+		eventBus:         eventBus,
+		proxyApp:         proxyApp,
+		mempoolReactor:   mempoolReactor,
+		mempool:          mempool,
+	}
+	node.BaseService = *service.NewBaseService(logger, "Node", node)
 
 	return node, nil
 }
@@ -772,13 +940,6 @@ func (n *Node) OnStart() error {
 
 	n.isListening = true
 
-	if n.config.Mempool.WalEnabled() {
-		err = n.mempool.InitWAL()
-		if err != nil {
-			return fmt.Errorf("init mempool WAL: %w", err)
-		}
-	}
-
 	// Start the switch (the P2P server).
 	err = n.sw.Start()
 	if err != nil {
@@ -800,17 +961,13 @@ func (n *Node) OnStop() {
 
 	n.Logger.Info("Stopping Node")
 
-	// first stop the non-reactor services
-	n.eventBus.Stop()
-	n.indexerService.Stop()
-
-	// now stop the reactors
+	// first stop the reactors
 	n.sw.Stop()
 
-	// stop mempool WAL
-	if n.config.Mempool.WalEnabled() {
-		n.mempool.CloseWAL()
-	}
+	// now stop the non-reactor services
+	n.blockExec.Stop()
+	n.eventBus.Stop()
+	n.indexerService.Stop()
 
 	if err := n.transport.Close(); err != nil {
 		n.Logger.Error("Error closing transport", "err", err)
@@ -857,6 +1014,7 @@ func (n *Node) ConfigureRPC() error {
 		PubKey:           pubKey,
 		GenDoc:           n.genesisDoc,
 		TxIndexer:        n.txIndexer,
+		BlockIndexer:     n.indexerService.GetBlockIndexer(),
 		ConsensusReactor: n.consensusReactor,
 		EventBus:         n.eventBus,
 		Mempool:          n.mempool,
@@ -888,7 +1046,7 @@ func (n *Node) startRPC() ([]net.Listener, error) {
 	config.MaxOpenConnections = n.config.RPC.MaxOpenConnections
 	// If necessary adjust global WriteTimeout to ensure it's greater than
 	// TimeoutBroadcastTxCommit.
-	// See https://github.com/tendermint/tendermint/issues/3435
+	// See https://github.com/okex/exchain/libs/tendermint/issues/3435
 	if config.WriteTimeout <= n.config.RPC.TimeoutBroadcastTxCommit {
 		config.WriteTimeout = n.config.RPC.TimeoutBroadcastTxCommit + 1*time.Second
 	}
@@ -959,7 +1117,7 @@ func (n *Node) startRPC() ([]net.Listener, error) {
 		config.MaxOpenConnections = n.config.RPC.GRPCMaxOpenConnections
 		// If necessary adjust global WriteTimeout to ensure it's greater than
 		// TimeoutBroadcastTxCommit.
-		// See https://github.com/tendermint/tendermint/issues/3435
+		// See https://github.com/okex/exchain/libs/tendermint/issues/3435
 		if config.WriteTimeout <= n.config.RPC.TimeoutBroadcastTxCommit {
 			config.WriteTimeout = n.config.RPC.TimeoutBroadcastTxCommit + 1*time.Second
 		}
@@ -1078,6 +1236,10 @@ func (n *Node) NodeInfo() p2p.NodeInfo {
 	return n.nodeInfo
 }
 
+func (n *Node) StateDB() dbm.DB {
+	return n.stateDB
+}
+
 func makeNodeInfo(
 	config *cfg.Config,
 	nodeKey *p2p.NodeKey,
@@ -1113,7 +1275,7 @@ func makeNodeInfo(
 		Version:       version.TMCoreSemVer,
 		Channels: []byte{
 			bcChannel,
-			cs.StateChannel, cs.DataChannel, cs.VoteChannel, cs.VoteSetBitsChannel,
+			cs.StateChannel, cs.DataChannel, cs.VoteChannel, cs.VoteSetBitsChannel, cs.ViewChangeChannel,
 			mempl.MempoolChannel,
 			evidence.EvidenceChannel,
 		},
@@ -1246,4 +1408,18 @@ func splitAndTrimEmpty(s, sep, cutset string) []string {
 		}
 	}
 	return nonEmptyStrings
+}
+
+// this method will work if seeds is null and judge net is main or test
+func setDefaultSeeds(seeds string) string {
+	if seeds == "" {
+		if types.IsMainNet() {
+			seeds = p2p.MAIN_NET_SEEDS
+		}
+
+		if types.IsTestNet() {
+			seeds = p2p.TEST_NET_SEEDS
+		}
+	}
+	return seeds
 }

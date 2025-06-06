@@ -1,10 +1,13 @@
 package params
 
 import (
+	"fmt"
+
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
+	stypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkparams "github.com/okex/exchain/libs/cosmos-sdk/x/params"
-
+	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"github.com/okex/exchain/x/params/types"
 )
 
@@ -19,14 +22,24 @@ type Keeper struct {
 	// the reference to the CoinKeeper to modify balances
 	ck BankKeeper
 	// the reference to the GovKeeper to insert waiting queue
-	gk GovKeeper
+	gk      GovKeeper
+	signals []func()
+
+	logger log.Logger
+
+	upgradeCache *types.UpgradeCache
 }
 
 // NewKeeper creates a new instance of params keeper
-func NewKeeper(cdc *codec.Codec, key *sdk.KVStoreKey, tkey *sdk.TransientStoreKey) (
+func NewKeeper(cdc *codec.Codec, key *sdk.KVStoreKey, tkey *sdk.TransientStoreKey, logger log.Logger) (
 	k Keeper) {
 	k = Keeper{
-		Keeper: sdkparams.NewKeeper(cdc, key, tkey),
+		Keeper:  sdkparams.NewKeeper(cdc, key, tkey),
+		signals: make([]func(), 0),
+
+		logger: logger.With("module", fmt.Sprintf("x/%s", ModuleName)),
+
+		upgradeCache: types.NewUpgreadeCache(key, logger, cdc),
 	}
 	k.cdc = cdc
 	k.paramSpace = k.Subspace(DefaultParamspace).WithKeyTable(types.ParamKeyTable())
@@ -57,5 +70,31 @@ func (keeper *Keeper) SetParams(ctx sdk.Context, params types.Params) {
 func (keeper Keeper) GetParams(ctx sdk.Context) types.Params {
 	var params types.Params
 	keeper.paramSpace.GetParamSet(ctx, &params)
+	return params
+}
+
+func (keeper Keeper) GetGasConfig(ctx sdk.Context) *stypes.GasConfig {
+	params := keeper.getGasConfig(ctx)
+	return &params.GasConfig
+}
+
+func (keeper Keeper) getGasConfig(ctx sdk.Context) (params types.GasConfig) {
+	for _, pair := range params.ParamSetPairs() {
+		keeper.paramSpace.GetIfExists(ctx, pair.Key, pair.Value)
+	}
+	stypes.AsDefaultGasConfig(&params.GasConfig)
+	return
+}
+
+func (keeper Keeper) GetBlockConfig(ctx sdk.Context) *sdk.BlockConfig {
+	params := keeper.getBlockConfig(ctx)
+	return &sdk.BlockConfig{params.MaxGasUsedPerBlock}
+}
+
+func (keeper Keeper) getBlockConfig(ctx sdk.Context) *types.BlockConfig {
+	params := types.NewDefaultBlockConfig()
+	for _, pair := range params.ParamSetPairs() {
+		keeper.paramSpace.GetIfExists(ctx, pair.Key, pair.Value)
+	}
 	return params
 }

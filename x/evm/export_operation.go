@@ -12,12 +12,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	ethcmn "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/okex/exchain/x/evm/types"
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/okex/exchain/x/evm/types"
 )
 
 const (
@@ -173,11 +173,11 @@ func exportStorage(ctx sdk.Context, k Keeper, addr ethcmn.Address, db dbm.DB) {
 
 func initEVMDB(path string) {
 	var err error
-	evmByteCodeDB, err = sdk.NewLevelDB("evm_bytecode", path)
+	evmByteCodeDB, err = sdk.NewDB("evm_bytecode", path)
 	if err != nil {
 		panic(err)
 	}
-	evmStateDB, err = sdk.NewLevelDB("evm_state", path)
+	evmStateDB, err = sdk.NewDB("evm_state", path)
 	if err != nil {
 		panic(err)
 	}

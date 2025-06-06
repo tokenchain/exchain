@@ -1,8 +1,8 @@
 package types
 
 import (
-	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	ethcmn "github.com/ethereum/go-ethereum/common"
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 )
 
 const (
@@ -16,6 +16,9 @@ const (
 
 	// RouterKey uses module name for routing
 	RouterKey = ModuleName
+
+	// SysContractAddressKey uses for save system contract address
+	SysContractAddressKey = "sysContractAddress"
 )
 
 // KVStore key prefixes
@@ -28,6 +31,10 @@ var (
 	KeyPrefixHeightHash                  = []byte{0x07}
 	KeyPrefixContractDeploymentWhitelist = []byte{0x08}
 	KeyPrefixContractBlockedList         = []byte{0x09}
+	KeyPrefixSysContractAddress          = []byte{0x10}
+	KeyPrefixContractCodeHash            = []byte{0x11}
+
+	KeyPrefixEvmRootHash = []byte("evmRootHash")
 )
 
 // HeightHashKey returns the key for the given chain epoch and height.
@@ -67,4 +74,13 @@ func GetContractBlockedListMemberKey(contractAddr sdk.AccAddress) []byte {
 // splitBlockedContractAddress splits the blocked contract address from a ContractBlockedListMemberKey
 func splitBlockedContractAddress(key []byte) sdk.AccAddress {
 	return key[1:]
+}
+
+// GetSysContractAddressKey builds the key for system contract address
+func GetSysContractAddressKey() []byte {
+	return append(KeyPrefixSysContractAddress, []byte(SysContractAddressKey)...)
+}
+
+func GetInitContractCodeHashKey(contractAddr sdk.AccAddress) []byte {
+	return append(KeyPrefixContractCodeHash, contractAddr...)
 }

@@ -1,3 +1,4 @@
+//go:build rocksdb
 // +build rocksdb
 
 package main
@@ -5,8 +6,8 @@ package main
 import (
 	"log"
 
-	"github.com/tecbot/gorocksdb"
-	dbm "github.com/tendermint/tm-db"
+	"github.com/cosmos/gorocksdb"
+	dbm "github.com/okex/exchain/libs/tm-db"
 )
 
 func init() {

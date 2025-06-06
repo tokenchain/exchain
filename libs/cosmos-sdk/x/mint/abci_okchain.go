@@ -2,6 +2,7 @@ package mint
 
 import (
 	"fmt"
+
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/mint/internal/types"
 )
@@ -15,7 +16,7 @@ var setInflationHandler func(minter *types.Minter)
 // BeginBlocker mints new tokens for the previous block.
 func beginBlocker(ctx sdk.Context, k Keeper) {
 
-	logger := ctx.Logger().With("module", "mint")
+	logger := k.Logger(ctx)
 	// fetch stored minter & params
 	params := k.GetParams(ctx)
 	minter := k.GetMinterCustom(ctx)
@@ -73,4 +74,3 @@ func BeginBlocker(ctx sdk.Context, k Keeper) {
 	setInflationHandler = disableMining
 	beginBlocker(ctx, k)
 }
-

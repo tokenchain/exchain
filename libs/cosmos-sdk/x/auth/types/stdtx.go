@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/okex/exchain/libs/tendermint/crypto"
-	"github.com/okex/exchain/libs/tendermint/crypto/multisig"
-	"github.com/okex/exchain/libs/tendermint/mempool"
-	yaml "gopkg.in/yaml.v2"
-
+	ethcmn "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
+	"github.com/okex/exchain/libs/tendermint/crypto"
+	cryptoamino "github.com/okex/exchain/libs/tendermint/crypto/encoding/amino"
+	"github.com/okex/exchain/libs/tendermint/crypto/multisig"
+	"github.com/tendermint/go-amino"
+	yaml "gopkg.in/yaml.v2"
 )
 
 var (
@@ -29,10 +31,84 @@ type StdTx struct {
 	Fee        StdFee         `json:"fee" yaml:"fee"`
 	Signatures []StdSignature `json:"signatures" yaml:"signatures"`
 	Memo       string         `json:"memo" yaml:"memo"`
+
+	sdk.BaseTx `json:"-" yaml:"-"`
 }
 
-func NewStdTx(msgs []sdk.Msg, fee StdFee, sigs []StdSignature, memo string) StdTx {
-	return StdTx{
+func (tx *StdTx) VerifySequence(index int, acc exported.Account) error {
+	//this function no use in stdtx, never add anythin in this
+	//only new cosmos44 tx will call this to verify sequence
+
+	return nil
+}
+
+func (tx *StdTx) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("invalid pbType: %v", pbType)
+		}
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("invalid tx data")
+		}
+		subData = data[:dataLen]
+
+		switch pos {
+		case 1:
+			var msg sdk.Msg
+			v, err := cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(subData, &msg)
+			if err != nil {
+				err = cdc.UnmarshalBinaryBare(subData, &msg)
+				if err != nil {
+					return err
+				} else {
+					tx.Msgs = append(tx.Msgs, msg)
+				}
+			} else {
+				tx.Msgs = append(tx.Msgs, v.(sdk.Msg))
+			}
+		case 2:
+			if err := tx.Fee.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+		case 3:
+			var sig StdSignature
+			if err := sig.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+			tx.Signatures = append(tx.Signatures, sig)
+		case 4:
+			tx.Memo = string(subData)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
+}
+
+func NewStdTx(msgs []sdk.Msg, fee StdFee, sigs []StdSignature, memo string) *StdTx {
+	return &StdTx{
 		Msgs:       msgs,
 		Fee:        fee,
 		Signatures: sigs,
@@ -41,11 +117,11 @@ func NewStdTx(msgs []sdk.Msg, fee StdFee, sigs []StdSignature, memo string) StdT
 }
 
 // GetMsgs returns the all the transaction's messages.
-func (tx StdTx) GetMsgs() []sdk.Msg { return tx.Msgs }
+func (tx *StdTx) GetMsgs() []sdk.Msg { return tx.Msgs }
 
 // ValidateBasic does a simple and lightweight validation check that doesn't
 // require access to any other information.
-func (tx StdTx) ValidateBasic() error {
+func (tx *StdTx) ValidateBasic() error {
 	stdSigs := tx.GetSignatures()
 
 	if tx.Fee.Gas > maxGasWanted {
@@ -73,6 +149,17 @@ func (tx StdTx) ValidateBasic() error {
 	return nil
 }
 
+func (tx *StdTx) ValidWithHeight(h int64) error {
+	for _, msg := range tx.Msgs {
+		if v, ok := msg.(sdk.HeightSensitive); ok {
+			if err := v.ValidWithHeight(h); nil != err {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // CountSubKeys counts the total number of keys for a multi-sig public key.
 func CountSubKeys(pub crypto.PubKey) int {
 	v, ok := pub.(multisig.PubKeyMultisigThreshold)
@@ -93,7 +180,7 @@ func CountSubKeys(pub crypto.PubKey) int {
 // They are accumulated from the GetSigners method for each Msg
 // in the order they appear in tx.GetMsgs().
 // Duplicate addresses will be omitted.
-func (tx StdTx) GetSigners() []sdk.AccAddress {
+func (tx *StdTx) GetSigners() []sdk.AccAddress {
 	seen := map[string]bool{}
 	var signers []sdk.AccAddress
 	for _, msg := range tx.GetMsgs() {
@@ -107,8 +194,12 @@ func (tx StdTx) GetSigners() []sdk.AccAddress {
 	return signers
 }
 
+func (tx *StdTx) GetType() sdk.TransactionType {
+	return sdk.StdTxType
+}
+
 // GetMemo returns the memo
-func (tx StdTx) GetMemo() string { return tx.Memo }
+func (tx *StdTx) GetMemo() string { return tx.Memo }
 
 // GetSignatures returns the signature of signers who signed the Msg.
 // CONTRACT: Length returned is same as length of
@@ -117,7 +208,7 @@ func (tx StdTx) GetMemo() string { return tx.Memo }
 // CONTRACT: If the signature is missing (ie the Msg is
 // invalid), then the corresponding signature is
 // .Empty().
-func (tx StdTx) GetSignatures() [][]byte {
+func (tx *StdTx) GetSignatures() [][]byte {
 	sigs := make([][]byte, len(tx.Signatures))
 	for i, stdSig := range tx.Signatures {
 		sigs[i] = stdSig.Signature
@@ -127,7 +218,7 @@ func (tx StdTx) GetSignatures() [][]byte {
 
 // GetPubkeys returns the pubkeys of signers if the pubkey is included in the signature
 // If pubkey is not included in the signature, then nil is in the slice instead
-func (tx StdTx) GetPubKeys() []crypto.PubKey {
+func (tx *StdTx) GetPubKeys() []crypto.PubKey {
 	pks := make([]crypto.PubKey, len(tx.Signatures))
 	for i, stdSig := range tx.Signatures {
 		pks[i] = stdSig.PubKey
@@ -136,7 +227,7 @@ func (tx StdTx) GetPubKeys() []crypto.PubKey {
 }
 
 // GetSignBytes returns the signBytes of the tx for a given signer
-func (tx StdTx) GetSignBytes(ctx sdk.Context, acc exported.Account) []byte {
+func (tx *StdTx) GetSignBytes(ctx sdk.Context, index int, acc exported.Account) []byte {
 	genesis := ctx.BlockHeight() == 0
 	chainID := ctx.ChainID()
 	var accNum uint64
@@ -150,44 +241,84 @@ func (tx StdTx) GetSignBytes(ctx sdk.Context, acc exported.Account) []byte {
 }
 
 // GetGas returns the Gas in StdFee
-func (tx StdTx) GetGas() uint64 { return tx.Fee.Gas }
+func (tx *StdTx) GetGas() uint64 { return tx.Fee.Gas }
 
 // GetFee returns the FeeAmount in StdFee
-func (tx StdTx) GetFee() sdk.Coins { return tx.Fee.Amount }
+func (tx *StdTx) GetFee() sdk.Coins { return tx.Fee.Amount }
 
 // FeePayer returns the address that is responsible for paying fee
 // StdTx returns the first signer as the fee payer
 // If no signers for tx, return empty address
-func (tx StdTx) FeePayer(ctx sdk.Context) sdk.AccAddress {
+func (tx *StdTx) FeePayer(ctx sdk.Context) sdk.AccAddress {
 	if tx.GetSigners() != nil {
 		return tx.GetSigners()[0]
 	}
 	return sdk.AccAddress{}
 }
 
-// GetTxInfo return tx sender and gas price
-func (tx StdTx) GetTxInfo(ctx sdk.Context) mempool.ExTxInfo {
-	exInfo := mempool.ExTxInfo{
-		Sender:   "",
-		GasPrice: big.NewInt(0),
-		Nonce:    0,
-	}
-
-	if tx.GetSigners() != nil {
-		exInfo.Sender = tx.FeePayer(ctx).String()
-	}
-	exInfo.GasPrice = tx.Fee.GasPrices()[0].Amount.BigInt()
-
-	return exInfo
-}
-
 // GetGasPrice return gas price
-func (tx StdTx) GetGasPrice() *big.Int {
+func (tx *StdTx) GetGasPrice() *big.Int {
+	if tx.Fee.Gas == 0 {
+		return big.NewInt(0)
+	}
 	gasPrices := tx.Fee.GasPrices()
 	if len(gasPrices) == 0 {
 		return big.NewInt(0)
 	}
 	return tx.Fee.GasPrices()[0].Amount.BigInt()
+}
+
+type WasmMsgChecker interface {
+	FnSignatureInfo() (string, int, error)
+}
+
+func (tx *StdTx) GetTxFnSignatureInfo() ([]byte, int) {
+	// hgu can't be right simulated with many Msgs.
+	if len(tx.Msgs) != 1 {
+		return nil, 0
+	}
+
+	fnSign := ""
+	deploySize := 0
+	for _, msg := range tx.Msgs {
+		v, ok := msg.(WasmMsgChecker)
+		if !ok {
+			break
+		}
+		fn, size, err := v.FnSignatureInfo()
+		if err != nil || len(fn) <= 0 {
+			break
+		}
+
+		deploySize = size
+		fnSign = fn
+		break
+	}
+	return []byte(fnSign), deploySize
+}
+
+func (tx *StdTx) GetFrom() string {
+	signers := tx.GetSigners()
+	if len(signers) == 0 {
+		return ""
+	}
+	return signers[0].String()
+}
+
+func (tx *StdTx) GetEthAddr() string {
+	signers := tx.GetSigners()
+	if len(signers) == 0 {
+		return ""
+	}
+	return ethcmn.BytesToAddress(signers[0]).String()
+}
+
+func (tx *StdTx) GetSender(_ sdk.Context) string {
+	return tx.GetFrom()
+}
+
+func (tx *StdTx) GetNonce() uint64 {
+	return tx.Nonce
 }
 
 //__________________________________________________________
@@ -209,7 +340,7 @@ func NewStdFee(gas uint64, amount sdk.Coins) StdFee {
 }
 
 // Bytes for signing later
-func (fee StdFee) Bytes() []byte {
+func (fee *StdFee) Bytes() []byte {
 	// normalize. XXX
 	// this is a sign of something ugly
 	// (in the lcd_test, client side its null,
@@ -229,10 +360,61 @@ func (fee StdFee) Bytes() []byte {
 // NOTE: The gas prices returned are not the true gas prices that were
 // originally part of the submitted transaction because the fee is computed
 // as fee = ceil(gasWanted * gasPrices).
-func (fee StdFee) GasPrices() sdk.DecCoins {
-	// todook
+func (fee *StdFee) GasPrices() sdk.DecCoins {
+	// NOTE: here fee.Gas must be greater than 0.
 	return sdk.NewDecCoinsFromCoins(fee.Amount...).QuoDec(sdk.NewDec(int64(fee.Gas)))
 	//return fee.Amount.QuoDec(sdk.NewDec(int64(fee.Gas)))
+}
+
+func (fee *StdFee) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+
+		data = data[1:]
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid tx data")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			var coin sdk.DecCoin
+			err = coin.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+			fee.Amount = append(fee.Amount, coin)
+		case 2:
+			var n int
+			fee.Gas, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			dataLen = uint64(n)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }
 
 //__________________________________________________________
@@ -279,8 +461,11 @@ type StdSignature struct {
 
 // DefaultTxDecoder logic for standard transaction decoding
 func DefaultTxDecoder(cdc *codec.Codec) sdk.TxDecoder {
-	return func(txBytes []byte) (sdk.Tx, error) {
-		var tx = StdTx{}
+	return func(txBytes []byte, heights ...int64) (sdk.Tx, error) {
+		if len(heights) > 0 {
+			return nil, fmt.Errorf("too many height parameters")
+		}
+		var tx StdTx
 
 		if len(txBytes) == 0 {
 			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "tx bytes are empty")
@@ -292,8 +477,9 @@ func DefaultTxDecoder(cdc *codec.Codec) sdk.TxDecoder {
 		if err != nil {
 			return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, err.Error())
 		}
+		tx.BaseTx.Raw = txBytes
 
-		return tx, nil
+		return &tx, nil
 	}
 }
 
@@ -302,6 +488,20 @@ func DefaultTxEncoder(cdc *codec.Codec) sdk.TxEncoder {
 	return func(tx sdk.Tx) ([]byte, error) {
 		return cdc.MarshalBinaryLengthPrefixed(tx)
 	}
+}
+
+func EthereumTxEncoder(_ *codec.Codec) sdk.TxEncoder {
+	return func(tx sdk.Tx) ([]byte, error) {
+		return EthereumTxEncode(tx)
+	}
+}
+
+func EthereumTxEncode(tx sdk.Tx) ([]byte, error) {
+	return rlp.EncodeToBytes(tx)
+}
+
+func EthereumTxDecode(b []byte, tx interface{}) error {
+	return rlp.DecodeBytes(b, tx)
 }
 
 // MarshalYAML returns the YAML representation of the signature.
@@ -331,4 +531,52 @@ func (ss StdSignature) MarshalYAML() (interface{}, error) {
 	}
 
 	return string(bz), err
+}
+
+func (ss *StdSignature) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("invalid field type in StdSignature")
+		}
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("invalid tx data")
+		}
+		subData = data[:dataLen]
+
+		switch pos {
+		case 1:
+			ss.PubKey, err = cryptoamino.UnmarshalPubKeyFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 2:
+			ss.Signature = make([]byte, dataLen)
+			copy(ss.Signature, subData)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }

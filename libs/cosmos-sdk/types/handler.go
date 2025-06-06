@@ -1,5 +1,12 @@
 package types
 
+import (
+	"github.com/ethereum/go-ethereum/common"
+
+	stypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+)
+
 // Handler defines the core of the state transition function of an application.
 type Handler func(ctx Context, msg Msg) (*Result, error)
 
@@ -7,15 +14,35 @@ type Handler func(ctx Context, msg Msg) (*Result, error)
 // If newCtx.IsZero(), ctx is used instead.
 type AnteHandler func(ctx Context, tx Tx, simulate bool) (newCtx Context, err error)
 
+type PreDeliverTxHandler func(ctx Context, tx Tx, onlyVerifySig bool)
+
 type GasRefundHandler func(ctx Context, tx Tx) (fee Coins, err error)
 
-type AccHandler func(ctx Context, address AccAddress) (nonce uint64)
+type AccNonceHandler func(ctx Context, address AccAddress) (nonce uint64)
 
-type UpdateFeeCollectorAccHandler func(ctx Context, balance Coins) error
+type EvmSysContractAddressHandler func(ctx Context, addr AccAddress) bool
 
-type LogFix func(isAnteFailed [][]string) (logs [][]byte)
+type UpdateCMTxNonceHandler func(tx Tx, nonce uint64)
 
-type GetTxFeeHandler func(tx Tx) (Coins, bool)
+type UpdateFeeCollectorAccHandler func(ctx Context, balance Coins, txFeesplit []*FeeSplitInfo) error
+type UpdateCosmosTxCount func(ctx Context, txCount int)
+
+type GetFeeCollectorInfo func(ctx Context, onlyGetFeeCollectorStoreKey bool) (Coins, []byte)
+
+type GetGasConfigHandler func(ctx Context) *stypes.GasConfig
+
+type GetBlockConfigHandler func(ctx Context) *BlockConfig
+
+type LogFix func(tx []Tx, logIndex []int, hasEnterEvmTx []bool, errs []error, resp []abci.ResponseDeliverTx) (logs [][]byte)
+type UpdateFeeSplitHandler func(txHash common.Hash, addr AccAddress, fee Coins, isDelete bool)
+type GetTxFeeAndFromHandler func(ctx Context, tx Tx) (Coins, bool, bool, string, string, error, bool)
+type GetTxFeeHandler func(tx Tx) Coins
+
+type CustomizeOnStop func(ctx Context) error
+
+type MptCommitHandler func(ctx Context)
+
+type EvmWatcherCollector func(...IWatcher)
 
 // AnteDecorator wraps the next AnteHandler to perform custom pre- and post-processing.
 type AnteDecorator interface {
@@ -46,31 +73,40 @@ func ChainAnteDecorators(chain ...AnteDecorator) AnteHandler {
 		chain = append(chain, Terminator{})
 	}
 
+	next := ChainAnteDecorators(chain[1:]...)
+
 	return func(ctx Context, tx Tx, simulate bool) (Context, error) {
-		return chain[0].AnteHandle(ctx, tx, simulate, ChainAnteDecorators(chain[1:]...))
+		return chain[0].AnteHandle(ctx, tx, simulate, next)
 	}
 }
 
 // Terminator AnteDecorator will get added to the chain to simplify decorator code
 // Don't need to check if next == nil further up the chain
-//                        ______
-//                     <((((((\\\
-//                     /      . }\
-//                     ;--..--._|}
-//  (\                 '--/\--'  )
-//   \\                | '-'  :'|
-//    \\               . -==- .-|
-//     \\               \.__.'   \--._
-//     [\\          __.--|       //  _/'--.
-//     \ \\       .'-._ ('-----'/ __/      \
-//      \ \\     /   __>|      | '--.       |
-//       \ \\   |   \   |     /    /       /
-//        \ '\ /     \  |     |  _/       /
-//         \  \       \ |     | /        /
-//   snd    \  \      \        /
+//
+//	                      ______
+//	                   <((((((\\\
+//	                   /      . }\
+//	                   ;--..--._|}
+//	(\                 '--/\--'  )
+//	 \\                | '-'  :'|
+//	  \\               . -==- .-|
+//	   \\               \.__.'   \--._
+//	   [\\          __.--|       //  _/'--.
+//	   \ \\       .'-._ ('-----'/ __/      \
+//	    \ \\     /   __>|      | '--.       |
+//	     \ \\   |   \   |     /    /       /
+//	      \ '\ /     \  |     |  _/       /
+//	       \  \       \ |     | /        /
+//	 snd    \  \      \        /
 type Terminator struct{}
+
+const AnteTerminatorTag = "ante-terminator"
 
 // Simply return provided Context and nil error
 func (t Terminator) AnteHandle(ctx Context, _ Tx, _ bool, _ AnteHandler) (Context, error) {
+	trc := ctx.AnteTracer()
+	if trc != nil {
+		trc.RepeatingPin(AnteTerminatorTag)
+	}
 	return ctx, nil
 }

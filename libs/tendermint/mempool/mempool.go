@@ -4,9 +4,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	cfg "github.com/okex/exchain/libs/tendermint/config"
-
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/p2p"
 	"github.com/okex/exchain/libs/tendermint/types"
 )
@@ -25,7 +24,8 @@ type Mempool interface {
 	// maxGas.
 	// If both maxes are negative, there is no cap on the size of all returned
 	// transactions (~ all available transactions).
-	ReapMaxBytesMaxGas(maxBytes, maxGas int64) types.Txs
+	ReapMaxBytesMaxGas(maxBytes, maxGas int64) []types.Tx
+	ReapEssentialTx(tx types.Tx) abci.TxEssentials
 
 	// ReapMaxTxs reaps up to max transactions from the mempool.
 	// If max is negative, there is no cap on the size of all returned
@@ -38,6 +38,7 @@ type Mempool interface {
 	GetUserPendingTxsCnt(address string) int
 
 	ReapUserTxs(address string, max int) types.Txs
+	GetPendingNonce(address string) (uint64, bool)
 
 	// Lock locks the mempool. The consensus must be able to hold lock to safely update.
 	Lock()
@@ -79,14 +80,6 @@ type Mempool interface {
 	// TxsBytes returns the total size of all txs in the mempool.
 	TxsBytes() int64
 
-	// InitWAL creates a directory for the WAL file and opens a file itself. If
-	// there is an error, it will be of type *PathError.
-	InitWAL() error
-
-	// CloseWAL closes and discards the underlying WAL file.
-	// Any further writes will not be relayed to disk.
-	CloseWAL()
-
 	SetEventBus(eventBus types.TxEventPublisher)
 
 	GetConfig() *cfg.MempoolConfig
@@ -96,6 +89,12 @@ type Mempool interface {
 	SetAccountRetriever(retriever AccountRetriever)
 
 	SetTxInfoParser(parser TxInfoParser)
+
+	GetTxSimulateGas(txHash string) int64
+
+	GetEnableDeleteMinGPTx() bool
+
+	GetPendingPoolTxsBytes() map[string]map[string]types.WrappedMempoolTx
 }
 
 //--------------------------------------------------------------------------------
@@ -118,6 +117,14 @@ type TxInfo struct {
 	SenderID uint16
 	// SenderP2PID is the actual p2p.ID of the sender, used e.g. for logging.
 	SenderP2PID p2p.ID
+
+	from         string
+	wtx          *WrappedTx
+	checkType    abci.CheckTxType
+	isGasPrecise bool
+	gasUsed      int64
+
+	wrapCMTx *types.WrapCMTx
 }
 
 //--------------------------------------------------------------------------------

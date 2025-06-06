@@ -27,23 +27,31 @@ commands:
 jobs:
   build:
     docker:
-      - image: circleci/golang:1.14
-    working_directory: /go/src/github.com/{{ORG_NAME}}/{{REPO_NAME}}
+      - image: cimg/go:1.20
+    working_directory: /home/circleci/go/src/github.com/{{ORG_NAME}}/{{REPO_NAME}}
     steps:
       - checkout
       - restore_cache:
           name: Restore go modules cache
           keys:
             - go-mod-v1-{{ checksum "go.sum" }}
+      - run: 
+          name: run go mod tidy first
+          command: go mod tidy
+      # If there are any diffs from goimports or go mod tidy, fail.
+      - run:
+          name: Verify no changes from go mod tidy
+          command: |
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "need run 'go mod tidy' before commit"
+              exit 1
+            fi
       - run:
           name: Cache go modules
           command: make go-mod-cache
       - run:
           name: Build
           command: make build
-      #      - run:
-      #          name: Unit Test
-      #          command: make test-unit
       - save_cache:
           name: Save go modules cache
           key: go-mod-v1-{{ checksum "go.sum" }}

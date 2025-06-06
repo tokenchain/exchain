@@ -22,9 +22,15 @@ type Application interface {
 	BeginBlock(RequestBeginBlock) ResponseBeginBlock // Signals the beginning of a block
 	DeliverTx(RequestDeliverTx) ResponseDeliverTx    // Deliver a tx for full processing
 	EndBlock(RequestEndBlock) ResponseEndBlock       // Signals the end of a block, returns changes to the validator set
-	Commit() ResponseCommit                          // Commit the state and return the application Merkle root hash
 
-	ParallelTxs(txs [][]byte) []*ResponseDeliverTx
+	Commit(RequestCommit) ResponseCommit // Commit the state and return the application Merkle root hash
+	ParallelTxs(txs [][]byte, onlyCalSender bool) []*ResponseDeliverTx
+	// PreDeliverRealTx will try convert bytes of tx to TxEssentials, it should be thread safe,
+	// if return nil, it means failed or this Application doesn't support PreDeliverRealTx and you must use DeliverTx,
+	// else, you can call DeliverRealTx to process the TxEssentials
+	PreDeliverRealTx([]byte) TxEssentials
+	// DeliverRealTx deliver tx returned by PreDeliverRealTx, if PreDeliverRealTx returns nil, DeliverRealTx SHOULD NOT be called
+	DeliverRealTx(TxEssentials) ResponseDeliverTx
 }
 
 //-------------------------------------------------------
@@ -51,11 +57,19 @@ func (BaseApplication) DeliverTx(req RequestDeliverTx) ResponseDeliverTx {
 	return ResponseDeliverTx{Code: CodeTypeOK}
 }
 
+func (BaseApplication) PreDeliverRealTx([]byte) TxEssentials {
+	return nil
+}
+
+func (BaseApplication) DeliverRealTx(TxEssentials) ResponseDeliverTx {
+	panic("do not support DeliverRealTx")
+}
+
 func (BaseApplication) CheckTx(req RequestCheckTx) ResponseCheckTx {
 	return ResponseCheckTx{Code: CodeTypeOK}
 }
 
-func (BaseApplication) Commit() ResponseCommit {
+func (BaseApplication) Commit(req RequestCommit) ResponseCommit {
 	return ResponseCommit{}
 }
 
@@ -75,7 +89,7 @@ func (BaseApplication) EndBlock(req RequestEndBlock) ResponseEndBlock {
 	return ResponseEndBlock{}
 }
 
-func (a BaseApplication) ParallelTxs(_ [][]byte) []*ResponseDeliverTx {
+func (a BaseApplication) ParallelTxs(_ [][]byte, onlyCalSender bool) []*ResponseDeliverTx {
 	return nil
 }
 
@@ -124,7 +138,7 @@ func (app *GRPCApplication) Query(ctx context.Context, req *RequestQuery) (*Resp
 }
 
 func (app *GRPCApplication) Commit(ctx context.Context, req *RequestCommit) (*ResponseCommit, error) {
-	res := app.app.Commit()
+	res := app.app.Commit(*req)
 	return &res, nil
 }
 

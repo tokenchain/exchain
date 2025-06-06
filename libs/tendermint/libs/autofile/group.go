@@ -160,8 +160,14 @@ func (g *Group) Close() {
 	g.FlushAndSync()
 
 	g.mtx.Lock()
-	_ = g.Head.closeFile()
+	_ = g.Head.Close()
 	g.mtx.Unlock()
+}
+
+func (g *Group) Reset() error {
+	//g.ticker.Reset(g.groupCheckDuration)
+	//go g.processTicks()
+	return nil
 }
 
 // HeadSizeLimit returns the current head size limit.

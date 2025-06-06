@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"encoding/hex"
 
-	"github.com/okex/exchain/libs/tendermint/crypto"
-	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
-	"github.com/okex/exchain/libs/tendermint/crypto/multisig"
-	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
-
+	ethcmn "github.com/ethereum/go-ethereum/common"
+	"github.com/okex/exchain/app/crypto/ethsecp256k1"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/keeper"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
+	"github.com/okex/exchain/libs/tendermint/crypto"
+	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
+	"github.com/okex/exchain/libs/tendermint/crypto/etherhash"
+	"github.com/okex/exchain/libs/tendermint/crypto/multisig"
+	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
+	types2 "github.com/okex/exchain/libs/tendermint/types"
 )
 
 var (
@@ -23,6 +26,7 @@ var (
 	simSecp256k1Sig    [64]byte
 
 	_ SigVerifiableTx = (*types.StdTx)(nil) // assert StdTx implements SigVerifiableTx
+	_ SigVerifiableTx = (*types.IbcTx)(nil)
 )
 
 func init() {
@@ -42,7 +46,9 @@ type SigVerifiableTx interface {
 	GetSignatures() [][]byte
 	GetSigners() []sdk.AccAddress
 	GetPubKeys() []crypto.PubKey // If signer already has pubkey in context, this list will have nil in its place
-	GetSignBytes(ctx sdk.Context, acc exported.Account) []byte
+	GetSignBytes(ctx sdk.Context, index int, acc exported.Account) []byte
+	//for ibc tx sign direct
+	VerifySequence(index int, acc exported.Account) error
 }
 
 // SetPubKeyDecorator sets PubKeys in context for any signer which does not already have pubkey set
@@ -75,10 +81,14 @@ func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate b
 			}
 			pk = simSecp256k1Pubkey
 		}
+
 		// Only make check if simulate=false
-		if !simulate && !bytes.Equal(pk.Address(), signers[i]) {
-			return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
-				"pubKey does not match signer address %s with signer index: %d", signers[i], i)
+		var valid bool
+		if !simulate {
+			if pk, valid = checkSigner(pk, signers[i], ctx.BlockHeight()); !valid {
+				return ctx, sdkerrors.Wrapf(sdkerrors.ErrInvalidPubKey,
+					"pubKey does not match signer address %s with signer index: %d", signers[i], i)
+			}
 		}
 
 		acc, err := GetSignerAcc(ctx, spkd.ak, signers[i])
@@ -86,7 +96,7 @@ func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate b
 			return ctx, err
 		}
 		// account already has pubkey set,no need to reset
-		if acc.GetPubKey() != nil {
+		if !isPubKeyNeedChange(acc.GetPubKey(), pk, ctx.BlockHeight()) {
 			continue
 		}
 		err = acc.SetPubKey(pk)
@@ -97,6 +107,38 @@ func (spkd SetPubKeyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate b
 	}
 
 	return next(ctx, tx, simulate)
+}
+
+func checkSigner(pk crypto.PubKey, signer sdk.AccAddress, height int64) (crypto.PubKey, bool) {
+	if bytes.Equal(pk.Address(), signer) {
+		return pk, true
+	}
+	// In case that tx is created by CosmWasmJS with pubKey type of `secp256k1`
+	// 	and the signer address is derived by the pubKey of `ethsecp256k1` type.
+	// Let it pass after Earth height.
+	if types2.HigherThanEarth(height) {
+		switch v := pk.(type) {
+		case secp256k1.PubKeySecp256k1:
+			ethPub := ethsecp256k1.PubKey(v[:])
+			return ethPub, bytes.Equal(ethPub.Address(), signer)
+		case *secp256k1.PubKeySecp256k1:
+			ethPub := ethsecp256k1.PubKey(v[:])
+			return ethPub, bytes.Equal(ethPub.Address(), signer)
+		}
+	}
+	return pk, false
+}
+
+func isPubKeyNeedChange(pk1, pk2 crypto.PubKey, height int64) bool {
+	if pk1 == nil {
+		return true
+	}
+	if !types2.HigherThanEarth(height) {
+		return false
+	}
+
+	// check if two public keys are equal
+	return pk1.Equals(pk2)
 }
 
 // Consume parameter-defined amount of gas for each signature according to the passed-in SignatureVerificationGasConsumer function
@@ -191,15 +233,36 @@ func (svd SigVerificationDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simul
 	if len(sigs) != len(signerAddrs) {
 		return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of signer;  expected: %d, got %d", len(signerAddrs), len(sigs))
 	}
-
+	var txNonce uint64
+	if len(sigs) == 1 && tx.GetNonce() != 0 {
+		txNonce = tx.GetNonce()
+	}
 	for i, sig := range sigs {
 		signerAccs[i], err = GetSignerAcc(ctx, svd.ak, signerAddrs[i])
 		if err != nil {
 			return ctx, err
 		}
+		if ctx.IsCheckTx() {
+			if txNonce != 0 { // txNonce first
+				err := nonceVerification(ctx, signerAccs[i].GetSequence(), txNonce, ethcmn.BytesToAddress(signerAddrs[i]).String(), simulate)
+				if err != nil {
+					return ctx, err
+				}
+				signerAccs[i].SetSequence(txNonce)
+			} else { // for adaptive pending tx in mempool just in checkTx but not deliverTx
+				pendingNonce := getCheckTxNonceFromMempool(ethcmn.BytesToAddress(signerAddrs[i]).String())
+				if pendingNonce != 0 {
+					signerAccs[i].SetSequence(pendingNonce)
+				}
+			}
+		}
 
 		// retrieve signBytes of tx
-		signBytes := sigTx.GetSignBytes(ctx, signerAccs[i])
+		signBytes := sigTx.GetSignBytes(ctx, i, signerAccs[i])
+		err = sigTx.VerifySequence(i, signerAccs[i])
+		if err != nil {
+			return ctx, sdkerrors.Wrap(sdkerrors.ErrInvalidSequence, "signature verification sequence failed:"+err.Error())
+		}
 
 		// retrieve pubkey
 		pubKey := signerAccs[i].GetPubKey()
@@ -208,12 +271,28 @@ func (svd SigVerificationDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simul
 		}
 
 		// verify signature
-		if !simulate && !pubKey.VerifyBytes(signBytes, sig) {
+		if !simulate && (len(signBytes) == 0 || !verifySig(signBytes, sig, pubKey)) {
 			return ctx, sdkerrors.Wrap(sdkerrors.ErrUnauthorized, "signature verification failed; verify correct account sequence and chain-id, sign msg:"+string(signBytes))
 		}
 	}
 
 	return next(ctx, tx, simulate)
+}
+
+func verifySig(signBytes, sig []byte, pubKey crypto.PubKey) bool {
+	hash := etherhash.Sum(append(signBytes, sig...))
+	cachePub, ok := types2.SignatureCache().Get(hash)
+	if ok {
+		types2.SignatureCache().Remove(hash)
+		return bytes.Equal(pubKey.Bytes(), []byte(cachePub))
+	}
+	if !pubKey.VerifyBytes(signBytes, sig) {
+		return false
+	}
+
+	types2.SignatureCache().Add(hash, string(pubKey.Bytes()))
+
+	return true
 }
 
 // IncrementSequenceDecorator handles incrementing sequences of all signers.
@@ -241,11 +320,22 @@ func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, sim
 		return ctx, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
 	}
 
+	if isd.JudgeIncontinuousNonce(ctx, tx, sigTx.GetSigners(), simulate) { // it's the same as handle evm tx
+		return next(ctx, tx, simulate)
+	}
+
 	// increment sequence of all signers
 	for index, addr := range sigTx.GetSigners() {
 		acc := isd.ak.GetAccount(ctx, addr)
+		// for adaptive pending tx in mempool just in checkTx but not deliverTx
+		if ctx.IsCheckTx() && !ctx.IsReCheckTx() {
+			pendingNonce := getCheckTxNonceFromMempool(ethcmn.BytesToAddress(addr).String())
+			if pendingNonce != 0 {
+				acc.SetSequence(pendingNonce)
+			}
+		}
 		if ctx.IsCheckTx() && index == 0 { // context with the nonce of fee payer
-			ctx = ctx.WithAccountNonce(acc.GetSequence())
+			ctx.SetAccountNonce(acc.GetSequence())
 		}
 		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
 			panic(err)
@@ -255,6 +345,27 @@ func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, sim
 	}
 
 	return next(ctx, tx, simulate)
+}
+
+// judge the incontinuous nonce, incontinuous nonce no need increment sequence
+func (isd IncrementSequenceDecorator) JudgeIncontinuousNonce(ctx sdk.Context, tx sdk.Tx, addrs []sdk.AccAddress, simulate bool) bool {
+	txNonce := tx.GetNonce()
+	if simulate ||
+		(txNonce == 0) || // no wrapCMtx no need verify
+		!ctx.IsCheckTx() || // deliverTx mode no need judge
+		ctx.IsReCheckTx() {
+		return false
+	}
+	if len(addrs) == 1 && txNonce != 0 {
+		acc := isd.ak.GetAccount(ctx, addrs[0])
+		if acc.GetSequence() != txNonce { // incontinuous nonce no need increment sequence
+			if ctx.IsCheckTx() { // context with the nonce of fee payer
+				ctx.SetAccountNonce(acc.GetSequence())
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateSigCountDecorator takes in Params and returns errors if there are too many signatures in the tx for the given params

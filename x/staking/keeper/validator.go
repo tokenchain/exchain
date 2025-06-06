@@ -9,22 +9,6 @@ import (
 	"github.com/okex/exchain/x/staking/types"
 )
 
-// Cache the amino decoding of validators, as it can be the case that repeated slashing calls
-// cause many calls to GetValidator, which were shown to throttle the state machine in our
-// simulation. Note this is quite biased though, as the simulator does more slashes than a
-// live chain should, however we require the slashing to be fast as noone pays gas for it.
-type cachedValidator struct {
-	val        types.Validator
-	marshalled string // marshalled amino bytes for the validator object (not operator address)
-}
-
-func newCachedValidator(val types.Validator, marshalled string) cachedValidator {
-	return cachedValidator{
-		val:        val,
-		marshalled: marshalled,
-	}
-}
-
 // GetValidator gets a single validator
 func (k Keeper) GetValidator(ctx sdk.Context, addr sdk.ValAddress) (validator types.Validator, found bool) {
 	store := ctx.KVStore(k.storeKey)
@@ -32,29 +16,7 @@ func (k Keeper) GetValidator(ctx sdk.Context, addr sdk.ValAddress) (validator ty
 	if value == nil {
 		return validator, false
 	}
-
-	// If these amino encoded bytes are in the cache, return the cached validator
-	strValue := string(value)
-	if val, ok := k.validatorCache[strValue]; ok {
-		valToReturn := val.val
-		// Doesn't mutate the cache's value
-		valToReturn.OperatorAddress = addr
-		return valToReturn, true
-	}
-
-	// amino bytes weren't found in cache, so amino unmarshal and add it to the cache
-	validator = types.MustUnmarshalValidator(k.cdc, value)
-	cachedVal := newCachedValidator(validator, strValue)
-	k.validatorCache[strValue] = newCachedValidator(validator, strValue)
-	k.validatorCacheList.PushBack(cachedVal)
-
-	// if the cache is too big, pop off the last element from it
-	if k.validatorCacheList.Len() > aminoCacheSize {
-		valToRemove := k.validatorCacheList.Remove(k.validatorCacheList.Front()).(cachedValidator)
-		delete(k.validatorCache, valToRemove.marshalled)
-	}
-
-	validator = types.MustUnmarshalValidator(k.cdc, value)
+	validator = types.MustUnmarshalValidator(k.cdcMarshl.GetCdc(), value)
 	return validator, true
 }
 
@@ -88,7 +50,7 @@ func (k Keeper) mustGetValidatorByConsAddr(ctx sdk.Context, consAddr sdk.ConsAdd
 // SetValidator sets the main record holding validator details
 func (k Keeper) SetValidator(ctx sdk.Context, validator types.Validator) {
 	store := ctx.KVStore(k.storeKey)
-	bz := types.MustMarshalValidator(k.cdc, validator)
+	bz := types.MustMarshalValidator(k.cdcMarshl.GetCdc(), validator)
 	store.Set(types.GetValidatorKey(validator.OperatorAddress), bz)
 }
 
@@ -161,7 +123,7 @@ func (k Keeper) GetAllValidators(ctx sdk.Context) (validators types.Validators) 
 	defer iterator.Close()
 
 	for ; iterator.Valid(); iterator.Next() {
-		validator := types.MustUnmarshalValidator(k.cdc, iterator.Value())
+		validator := types.MustUnmarshalValidator(k.cdcMarshl.GetCdc(), iterator.Value())
 		validators = append(validators, validator)
 	}
 	return validators
@@ -184,14 +146,14 @@ func (k Keeper) GetLastValidatorPower(ctx sdk.Context, operator sdk.ValAddress) 
 	if bz == nil {
 		return 0
 	}
-	k.cdc.MustUnmarshalBinaryLengthPrefixed(bz, &power)
+	k.cdcMarshl.GetCdc().MustUnmarshalBinaryLengthPrefixed(bz, &power)
 	return
 }
 
 // SetLastValidatorPower sets the last validator power
 func (k Keeper) SetLastValidatorPower(ctx sdk.Context, operator sdk.ValAddress, power int64) {
 	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshalBinaryLengthPrefixed(power)
+	bz := k.cdcMarshl.GetCdc().MustMarshalBinaryLengthPrefixed(power)
 	store.Set(types.GetLastValidatorPowerKey(operator), bz)
 }
 
@@ -217,7 +179,7 @@ func (k Keeper) IterateLastValidatorPowers(ctx sdk.Context,
 	for ; iter.Valid(); iter.Next() {
 		addr := sdk.ValAddress(iter.Key()[len(types.LastValidatorPowerKey):])
 		var power int64
-		k.cdc.MustUnmarshalBinaryLengthPrefixed(iter.Value(), &power)
+		k.cdcMarshl.GetCdc().MustUnmarshalBinaryLengthPrefixed(iter.Value(), &power)
 		if handler(addr, power) {
 			break
 		}
@@ -235,14 +197,14 @@ func (k Keeper) GetValidatorQueueTimeSlice(ctx sdk.Context, timestamp time.Time)
 	if bz == nil {
 		return []sdk.ValAddress{}
 	}
-	k.cdc.MustUnmarshalBinaryLengthPrefixed(bz, &valAddrs)
+	k.cdcMarshl.GetCdc().MustUnmarshalBinaryLengthPrefixed(bz, &valAddrs)
 	return valAddrs
 }
 
 // SetValidatorQueueTimeSlice sets a specific validator queue timeslice
 func (k Keeper) SetValidatorQueueTimeSlice(ctx sdk.Context, timestamp time.Time, keys []sdk.ValAddress) {
 	store := ctx.KVStore(k.storeKey)
-	bz := k.cdc.MustMarshalBinaryLengthPrefixed(keys)
+	bz := k.cdcMarshl.GetCdc().MustMarshalBinaryLengthPrefixed(keys)
 	store.Set(types.GetValidatorQueueTimeKey(timestamp), bz)
 }
 
@@ -294,7 +256,7 @@ func (k Keeper) UnbondAllMatureValidatorQueue(ctx sdk.Context) {
 
 	for ; validatorTimesliceIterator.Valid(); validatorTimesliceIterator.Next() {
 		timeslice := []sdk.ValAddress{}
-		k.cdc.MustUnmarshalBinaryLengthPrefixed(validatorTimesliceIterator.Value(), &timeslice)
+		k.cdcMarshl.GetCdc().MustUnmarshalBinaryLengthPrefixed(validatorTimesliceIterator.Value(), &timeslice)
 
 		for _, valAddr := range timeslice {
 			val, found := k.GetValidator(ctx, valAddr)

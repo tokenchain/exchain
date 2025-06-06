@@ -3,13 +3,14 @@ package iavl
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	amino "github.com/tendermint/go-amino"
 	cmn "github.com/okex/exchain/libs/iavl/common"
+	amino "github.com/tendermint/go-amino"
 )
 
 func TestTreeGetWithProof(t *testing.T) {
@@ -231,9 +232,16 @@ func verifyProof(t *testing.T, proof *RangeProof, root []byte) {
 		}
 		// may be invalid... errors are okay
 		if err == nil {
-			assert.Errorf(t, badProof.Verify(root),
-				"Proof was still valid after a random mutation:\n%X\n%X",
-				proofBytes, badProofBytes)
+			// bad proof may cause panic
+			assert.Panics(t, func() {
+				err := badProof.Verify(root)
+				if err != nil {
+					assert.Errorf(t, badProof.Verify(root),
+						"Proof was still valid after a random mutation:\n%X\n%X",
+						proofBytes, badProofBytes)
+					panic(err)
+				}
+			}, fmt.Sprintf("Proof was still valid after a random mutation:\n%X\n%X", proofBytes, badProofBytes))
 		}
 	}
 }

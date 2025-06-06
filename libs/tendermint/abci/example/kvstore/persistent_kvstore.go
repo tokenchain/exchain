@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
 
 	"github.com/okex/exchain/libs/tendermint/abci/example/code"
 	"github.com/okex/exchain/libs/tendermint/abci/types"
@@ -80,13 +80,21 @@ func (app *PersistentKVStoreApplication) DeliverTx(req types.RequestDeliverTx) t
 	return app.app.DeliverTx(req)
 }
 
+func (app *PersistentKVStoreApplication) PreDeliverRealTx([]byte) types.TxEssentials {
+	return nil
+}
+
+func (app *PersistentKVStoreApplication) DeliverRealTx(tx types.TxEssentials) types.ResponseDeliverTx {
+	panic("do not support deliver real tx")
+}
+
 func (app *PersistentKVStoreApplication) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
 	return app.app.CheckTx(req)
 }
 
 // Commit will panic if InitChain was not called
-func (app *PersistentKVStoreApplication) Commit() types.ResponseCommit {
-	return app.app.Commit()
+func (app *PersistentKVStoreApplication) Commit(req types.RequestCommit) types.ResponseCommit {
+	return app.app.Commit(req)
 }
 
 // When path=/val and data={validator address}, returns the validator update (types.ValidatorUpdate) varint encoded.
@@ -144,7 +152,7 @@ func (app *PersistentKVStoreApplication) EndBlock(req types.RequestEndBlock) typ
 	return types.ResponseEndBlock{ValidatorUpdates: app.ValUpdates}
 }
 
-func (app *PersistentKVStoreApplication) ParallelTxs(_ [][]byte) []*types.ResponseDeliverTx {
+func (app *PersistentKVStoreApplication) ParallelTxs(_ [][]byte, _ bool) []*types.ResponseDeliverTx {
 	return nil
 }
 

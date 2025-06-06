@@ -2,15 +2,16 @@ package rest
 
 import (
 	"fmt"
+	ttypes "github.com/okex/exchain/libs/tendermint/types"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 
+	"github.com/gorilla/mux"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	"github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/types/rest"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
-	"github.com/gorilla/mux"
 	"github.com/okex/exchain/x/common"
 	"github.com/okex/exchain/x/order/keeper"
 	ordertype "github.com/okex/exchain/x/order/types"
@@ -61,8 +62,9 @@ func depthBookHandlerV2(cliCtx context.CLIContext) http.HandlerFunc {
 
 // BroadcastReq defines a tx broadcasting request.
 type BroadcastReq struct {
-	Tx   auth.StdTx `json:"tx"`
-	Mode string     `json:"mode"`
+	Tx    auth.StdTx `json:"tx"`
+	Mode  string     `json:"mode"`
+	Nonce uint64     `json:"nonce"`
 }
 
 type placeCancelOrderResponse struct {
@@ -99,6 +101,17 @@ func broadcastPlaceOrderRequest(cliCtx context.CLIContext) http.HandlerFunc {
 			return
 		}
 
+		if req.Nonce != 0 {
+			wcmt := &ttypes.WrapCMTx{
+				Tx:    txBytes,
+				Nonce: req.Nonce,
+			}
+			data, err := cliCtx.Codec.MarshalJSON(wcmt)
+			if err == nil {
+				txBytes = data
+			}
+		}
+
 		cliCtx = cliCtx.WithBroadcastMode(req.Mode)
 
 		res, err := cliCtx.BroadcastTx(txBytes)
@@ -108,7 +121,6 @@ func broadcastPlaceOrderRequest(cliCtx context.CLIContext) http.HandlerFunc {
 		}
 		//TODO: OrderID needs to be obtained when the new version of the interface is developed
 		orderID := ""
-
 
 		res2 := placeCancelOrderResponse{
 			res,
@@ -149,6 +161,17 @@ func broadcastCancelOrderRequest(cliCtx context.CLIContext) http.HandlerFunc {
 		if err != nil {
 			rest.WriteErrorResponse(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+
+		if req.Nonce != 0 {
+			wcmt := &ttypes.WrapCMTx{
+				Tx:    txBytes,
+				Nonce: req.Nonce,
+			}
+			data, err := cliCtx.Codec.MarshalJSON(wcmt)
+			if err == nil {
+				txBytes = data
+			}
 		}
 
 		cliCtx = cliCtx.WithBroadcastMode(req.Mode)

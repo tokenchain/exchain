@@ -1,19 +1,24 @@
 package mock
 
 import (
-	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"io"
-
-	dbm "github.com/tendermint/tm-db"
 
 	store "github.com/okex/exchain/libs/cosmos-sdk/store/types"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/iavl"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
+	dbm "github.com/okex/exchain/libs/tm-db"
 )
 
 var _ sdk.MultiStore = multiStore{}
+var _ sdk.CommitMultiStore = multiStore{}
 
 type multiStore struct {
 	kv map[sdk.StoreKey]kvStore
+}
+
+func (ms multiStore) AppendVersionFilters(filters []store.VersionFilter) {
+	panic("not implemented")
 }
 
 func (ms multiStore) CacheMultiStore() sdk.CacheMultiStore {
@@ -21,6 +26,14 @@ func (ms multiStore) CacheMultiStore() sdk.CacheMultiStore {
 }
 
 func (ms multiStore) CacheMultiStoreWithVersion(_ int64) (sdk.CacheMultiStore, error) {
+	panic("not implemented")
+}
+
+func (ms multiStore) AppendCommitFilters(filters []store.StoreFilter) {
+	panic("not implemented")
+}
+
+func (ms multiStore) AppendPruneFilters(filters []store.StoreFilter) {
 	panic("not implemented")
 }
 
@@ -44,11 +57,15 @@ func (ms multiStore) SetTracer(w io.Writer) sdk.MultiStore {
 	panic("not implemented")
 }
 
-func (ms multiStore) Commit() sdk.CommitID {
+func (ms multiStore) CommitterCommit(*iavl.TreeDelta) (store.CommitID, *iavl.TreeDelta) {
 	panic("not implemented")
 }
 
 func (ms multiStore) LastCommitID() sdk.CommitID {
+	panic("not implemented")
+}
+
+func (ms multiStore) LastCommitVersion() int64 {
 	panic("not implemented")
 }
 
@@ -117,6 +134,24 @@ func (ms multiStore) GetNodeReadCount() int {
 
 func (ms multiStore) ResetCount() {
 }
+
+func (ms multiStore) GetFlatKVReadTime() int {
+	return 0
+}
+
+func (ms multiStore) GetFlatKVWriteTime() int {
+	return 0
+}
+
+func (ms multiStore) GetFlatKVReadCount() int {
+	return 0
+}
+
+func (ms multiStore) GetFlatKVWriteCount() int {
+	return 0
+}
+
+func (ms multiStore) SetUpgradeVersion(int64) {}
 
 var _ sdk.KVStore = kvStore{}
 
@@ -190,5 +225,13 @@ func (ms multiStore) StopStore() {
 }
 
 func (ms multiStore) SetLogger(log log.Logger) {
+	panic("not implemented")
+}
+
+func (ms multiStore) GetCommitVersion() (int64, error) {
+	panic("not implemented")
+}
+
+func (ms multiStore) CommitterCommitMap(inputDeltaMap iavl.TreeDeltaMap) (sdk.CommitID, iavl.TreeDeltaMap) {
 	panic("not implemented")
 }

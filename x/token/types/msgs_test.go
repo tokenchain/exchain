@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
 	"github.com/okex/exchain/x/common"
 	"github.com/stretchr/testify/require"
-	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
 )
 
 func TestNewMsgTokenIssue(t *testing.T) {
@@ -236,12 +236,10 @@ func TestNewTokenMultiSend(t *testing.T) {
 	}
 
 	// empty toAddr
-	toAddr1, err := sdk.AccAddressFromBech32("")
-	require.NoError(t, err)
 	decCoin1 := sdk.NewDecCoinFromDec("obk", sdk.NewDec(100))
 	transfers1 := []TransferUnit{
 		{
-			To:    toAddr1,
+			To:    sdk.AccAddress{},
 			Coins: sdk.SysCoins{decCoin1},
 		},
 	}

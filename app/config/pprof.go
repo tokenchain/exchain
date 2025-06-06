@@ -1,16 +1,15 @@
 package config
 
 import (
+	"github.com/okex/exchain/libs/system/trace"
 	"path"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/server"
 
-	"github.com/okex/exchain/x/common/analyzer"
-
 	"github.com/mosn/holmes"
-	"github.com/spf13/viper"
 	"github.com/okex/exchain/libs/tendermint/libs/cli"
 	tmos "github.com/okex/exchain/libs/tendermint/libs/os"
+	"github.com/spf13/viper"
 )
 
 type PporfConfig struct {
@@ -50,7 +49,7 @@ func PprofDownload(context *server.Context) {
 	}
 
 	// auto download pprof by analyzer
-	analyzer.InitializePprofDumper(context.Logger, c.dumpPath, c.coolDown, c.triggerAbciElapsed)
+	trace.InitializePprofDumper(context.Logger, c.dumpPath, c.coolDown, c.triggerAbciElapsed)
 
 	// auto download pprof by holmes
 	h, err := holmes.New(

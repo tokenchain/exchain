@@ -2,11 +2,19 @@ package types
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
-	"strconv"
+	"io"
 	"strings"
 	"sync"
 	"time"
+
+	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/okex/exchain/libs/system/trace"
+	"github.com/okex/exchain/libs/tendermint/libs/compress"
+	tmtime "github.com/okex/exchain/libs/tendermint/types/time"
+
+	"github.com/tendermint/go-amino"
 
 	"github.com/pkg/errors"
 
@@ -35,34 +43,30 @@ const (
 	// Uvarint length of Data.Txs:          4 bytes
 	// Data.Txs field:                      1 byte
 	MaxAminoOverheadForBlock int64 = 11
+
+	// CompressDividing is used to divide compressType and compressFlag of compressSign
+	// the compressSign = CompressType * CompressDividing + CompressFlag
+	CompressDividing int = 10
+
+	FlagBlockCompressType      = "block-compress-type"
+	FlagBlockCompressFlag      = "block-compress-flag"
+	FlagBlockCompressThreshold = "block-compress-threshold"
 )
 
-// GetStartBlockHeight() is the block height from which the chain starts
 var (
-	startBlockHeightStr       = "0"
-	startBlockHeight    int64 = 0
-	once                sync.Once
+	BlockCompressType      = 0x00
+	BlockCompressFlag      = 0
+	BlockCompressThreshold = 1024000
 )
 
-func initStartBlockHeight() {
-	once.Do(func() {
-		var err error
-		if len(startBlockHeightStr) == 0 {
-			startBlockHeightStr = "0"
-		}
-		startBlockHeight, err = strconv.ParseInt(startBlockHeightStr, 10, 64)
-		if err != nil {
-			panic(err)
-		}
-	})
+type BlockExInfo struct {
+	BlockCompressType int
+	BlockCompressFlag int
+	BlockPartSize     int
 }
 
-func init() {
-	initStartBlockHeight()
-}
-
-func GetStartBlockHeight() int64 {
-	return startBlockHeight
+func (info BlockExInfo) IsCompressed() bool {
+	return info.BlockCompressType != 0
 }
 
 // Block defines the atomic unit of a Tendermint blockchain.
@@ -73,6 +77,92 @@ type Block struct {
 	Data       `json:"data"`
 	Evidence   EvidenceData `json:"evidence"`
 	LastCommit *Commit      `json:"last_commit"`
+}
+
+func (b *Block) AminoSize(cdc *amino.Codec) int {
+	var size = 0
+
+	headerSize := b.Header.AminoSize(cdc)
+	if headerSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(headerSize)) + headerSize
+	}
+
+	dataSize := b.Data.AminoSize(cdc)
+	if dataSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(dataSize)) + dataSize
+	}
+
+	evidenceSize := b.Evidence.AminoSize(cdc)
+	if evidenceSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(evidenceSize)) + evidenceSize
+	}
+
+	if b.LastCommit != nil {
+		commitSize := b.LastCommit.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(commitSize)) + commitSize
+	}
+
+	return size
+}
+
+func (b *Block) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("not enough data to read field %d", pos)
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			err = b.Header.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 2:
+			err = b.Data.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 3:
+			err = b.Evidence.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 4:
+			b.LastCommit = new(Commit)
+			err = b.LastCommit.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }
 
 // ValidateBasic performs basic validation that doesn't involve state data.
@@ -108,10 +198,10 @@ func (b *Block) ValidateBasic() error {
 	}
 
 	// NOTE: b.Data.Txs may be nil, but b.Data.Hash() still works fine.
-	if !bytes.Equal(b.DataHash, b.Data.Hash()) {
+	if !bytes.Equal(b.DataHash, b.Data.Hash(b.Height)) {
 		return fmt.Errorf(
 			"wrong Header.DataHash. Expected %v, got %v",
-			b.Data.Hash(),
+			b.Data.Hash(b.Height),
 			b.DataHash,
 		)
 	}
@@ -139,7 +229,7 @@ func (b *Block) fillHeader() {
 		b.LastCommitHash = b.LastCommit.Hash()
 	}
 	if b.DataHash == nil {
-		b.DataHash = b.Data.Hash()
+		b.DataHash = b.Data.Hash(b.Height)
 	}
 	if b.EvidenceHash == nil {
 		b.EvidenceHash = b.Evidence.Hash()
@@ -159,6 +249,7 @@ func (b *Block) Hash() tmbytes.HexBytes {
 		return nil
 	}
 	b.fillHeader()
+
 	return b.Header.Hash()
 }
 
@@ -166,8 +257,23 @@ func (b *Block) Hash() tmbytes.HexBytes {
 // This is the form in which the block is gossipped to peers.
 // CONTRACT: partSize is greater than zero.
 func (b *Block) MakePartSet(partSize int) *PartSet {
+	return b.MakePartSetByExInfo(&BlockExInfo{
+		BlockCompressType: BlockCompressType,
+		BlockCompressFlag: BlockCompressFlag,
+		BlockPartSize:     partSize,
+	})
+}
+
+func (b *Block) MakePartSetByExInfo(exInfo *BlockExInfo) *PartSet {
 	if b == nil {
 		return nil
+	}
+	if exInfo == nil {
+		exInfo = &BlockExInfo{
+			BlockCompressType: BlockCompressType,
+			BlockCompressFlag: BlockCompressFlag,
+			BlockPartSize:     BlockPartSizeBytes,
+		}
 	}
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
@@ -178,7 +284,91 @@ func (b *Block) MakePartSet(partSize int) *PartSet {
 	if err != nil {
 		panic(err)
 	}
-	return NewPartSetFromData(bz, partSize)
+
+	payload := compressBlock(bz, exInfo.BlockCompressType, exInfo.BlockCompressFlag)
+
+	return NewPartSetFromData(payload, exInfo.BlockPartSize)
+
+}
+
+func compressBlock(bz []byte, compressType, compressFlag int) []byte {
+	if compressType == 0 || len(bz) <= BlockCompressThreshold {
+		return bz
+	}
+	if compressType >= CompressDividing || compressFlag >= CompressDividing {
+		// unsupported compressType or compressFlag
+		return bz
+	}
+
+	t0 := tmtime.Now()
+	cz, err := compress.Compress(compressType, compressFlag, bz)
+	if err != nil {
+		return bz
+	}
+	t1 := tmtime.Now()
+
+	trace.GetElapsedInfo().AddInfo(trace.CompressBlock, fmt.Sprintf("%dms", t1.Sub(t0).Milliseconds()))
+	// tell receiver which compress type and flag
+	// tens digit is compressType and unit digit is compressFlag
+	// compressSign: XY means, compressType: X, compressFlag: Y
+	compressSign := compressType*CompressDividing + compressFlag
+	return append(cz, byte(compressSign))
+}
+
+func UncompressBlockFromReader(pbpReader io.Reader) (io.Reader, error) {
+	// received compressed block bytes, uncompress with the flag:Proposal.CompressBlock
+	compressed, err := io.ReadAll(pbpReader)
+	if err != nil {
+		return nil, err
+	}
+	t0 := tmtime.Now()
+	original, compressSign, err := UncompressBlockFromBytes(compressed)
+	if err != nil {
+		return nil, err
+	}
+	t1 := tmtime.Now()
+
+	if compressSign != 0 {
+		compressRatio := float64(len(compressed)) / float64(len(original))
+		trace.GetElapsedInfo().AddInfo(trace.UncompressBlock, fmt.Sprintf("%.2f/%dms",
+			compressRatio, t1.Sub(t0).Milliseconds()))
+	}
+
+	return bytes.NewBuffer(original), nil
+}
+
+// UncompressBlockFromBytes uncompress from compressBytes to blockPart bytes, and returns the compressSign
+// compressSign contains compressType and compressFlag
+// the compressSign: XY means, compressType: X, compressFlag: Y
+func UncompressBlockFromBytes(payload []byte) (res []byte, compressSign int, err error) {
+	var buf bytes.Buffer
+	compressSign, err = UncompressBlockFromBytesTo(payload, &buf)
+	if err == nil && compressSign == 0 {
+		return payload, 0, nil
+	}
+	res = buf.Bytes()
+	return
+}
+
+func IsBlockDataCompressed(payload []byte) bool {
+	// try parse Uvarint to check if it is compressed
+	compressBytesLen, n := binary.Uvarint(payload)
+	if compressBytesLen == uint64(len(payload)-n) {
+		return false
+	} else {
+		return true
+	}
+}
+
+// UncompressBlockFromBytesTo uncompress payload to buf, and returns the compressSign,
+// if payload is not compressed, compressSign will be 0, and buf will not be changed.
+func UncompressBlockFromBytesTo(payload []byte, buf *bytes.Buffer) (compressSign int, err error) {
+	if IsBlockDataCompressed(payload) {
+		// the block has compressed and the last byte is compressSign
+		compressSign = int(payload[len(payload)-1])
+		err = compress.UnCompressTo(compressSign/CompressDividing, payload[:len(payload)-1], buf)
+	}
+	return
 }
 
 // HashesTo is a convenience function that checks if a block hashes to the given argument.
@@ -202,6 +392,19 @@ func (b *Block) Size() int {
 	return len(bz)
 }
 
+// TODO : Replace the original logic of Size with the logic of FastSize
+
+// FastSize returns size of the block in bytes. and more efficient than Size().
+// But we can't make sure it's completely correct yet, when we're done testing, we'll replace Size with FastSize
+func (b *Block) FastSize() (size int) {
+	defer func() {
+		if r := recover(); r != nil {
+			size = 0
+		}
+	}()
+	return b.AminoSize(cdc)
+}
+
 // String returns a string representation of the block
 func (b *Block) String() string {
 	return b.StringIndented("")
@@ -219,7 +422,7 @@ func (b *Block) StringIndented(indent string) string {
 %s  %v
 %s}#%v`,
 		indent, b.Header.StringIndented(indent+"  "),
-		indent, b.Data.StringIndented(indent+"  "),
+		indent, b.Data.StringIndented(indent+"  ", b.Height),
 		indent, b.Evidence.StringIndented(indent+"  "),
 		indent, b.LastCommit.StringIndented(indent+"  "),
 		indent, b.Hash())
@@ -337,6 +540,166 @@ type Header struct {
 	ProposerAddress Address          `json:"proposer_address"` // original proposer of the block
 }
 
+func (h Header) AminoSize(cdc *amino.Codec) int {
+	var size int
+
+	versionSize := h.Version.AminoSize()
+	if versionSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(versionSize)) + versionSize
+	}
+
+	if h.ChainID != "" {
+		size += 1 + amino.UvarintSize(uint64(len(h.ChainID))) + len(h.ChainID)
+	}
+
+	if h.Height != 0 {
+		size += 1 + amino.UvarintSize(uint64(h.Height))
+	}
+
+	timeSize := amino.TimeSize(h.Time)
+	if timeSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(timeSize)) + timeSize
+	}
+
+	blockIDSize := h.LastBlockID.AminoSize(cdc)
+	if blockIDSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(blockIDSize)) + blockIDSize
+	}
+
+	if len(h.LastCommitHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.LastCommitHash)
+	}
+
+	if len(h.DataHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.DataHash)
+	}
+
+	if len(h.ValidatorsHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.ValidatorsHash)
+	}
+
+	if len(h.NextValidatorsHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.NextValidatorsHash)
+	}
+
+	if len(h.ConsensusHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.ConsensusHash)
+	}
+
+	if len(h.AppHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.AppHash)
+	}
+
+	if len(h.LastResultsHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.LastResultsHash)
+	}
+
+	if len(h.EvidenceHash) != 0 {
+		size += 1 + amino.ByteSliceSize(h.EvidenceHash)
+	}
+
+	if len(h.ProposerAddress) != 0 {
+		size += 1 + amino.ByteSliceSize(h.ProposerAddress)
+	}
+
+	return size
+}
+
+func (h *Header) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+	var timeUpdated = false
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("not enough data for field, need %d, have %d", dataLen, len(data))
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			err = h.Version.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 2:
+			h.ChainID = string(subData)
+		case 3:
+			uvint, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			h.Height = int64(uvint)
+			dataLen = uint64(n)
+		case 4:
+			h.Time, _, err = amino.DecodeTime(subData)
+			if err != nil {
+				return err
+			}
+			timeUpdated = true
+		case 5:
+			err = h.LastBlockID.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 6:
+			h.LastCommitHash = make([]byte, len(subData))
+			copy(h.LastCommitHash, subData)
+		case 7:
+			h.DataHash = make([]byte, len(subData))
+			copy(h.DataHash, subData)
+		case 8:
+			h.ValidatorsHash = make([]byte, len(subData))
+			copy(h.ValidatorsHash, subData)
+		case 9:
+			h.NextValidatorsHash = make([]byte, len(subData))
+			copy(h.NextValidatorsHash, subData)
+		case 10:
+			h.ConsensusHash = make([]byte, len(subData))
+			copy(h.ConsensusHash, subData)
+		case 11:
+			h.AppHash = make([]byte, len(subData))
+			copy(h.AppHash, subData)
+		case 12:
+			h.LastResultsHash = make([]byte, len(subData))
+			copy(h.LastResultsHash, subData)
+		case 13:
+			h.EvidenceHash = make([]byte, len(subData))
+			copy(h.EvidenceHash, subData)
+		case 14:
+			h.ProposerAddress = make([]byte, len(subData))
+			copy(h.ProposerAddress, subData)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	if !timeUpdated {
+		h.Time = amino.ZeroTime
+	}
+	return nil
+}
+
 // Populate the Header with state-derived data.
 // Call this after MakeBlock to complete the Header.
 func (h *Header) Populate(
@@ -421,10 +784,17 @@ func (h Header) ValidateBasic() error {
 // Returns nil if ValidatorHash is missing,
 // since a Header is not valid unless there is
 // a ValidatorsHash (corresponding to the validator set).
+
 func (h *Header) Hash() tmbytes.HexBytes {
 	if h == nil || len(h.ValidatorsHash) == 0 {
 		return nil
 	}
+	if HigherThanVenus1(h.Height) {
+		return h.IBCHash()
+	}
+	return h.originHash()
+}
+func (h *Header) originHash() tmbytes.HexBytes {
 	return merkle.SimpleHashFromByteSlices([][]byte{
 		cdcEncode(h.Version),
 		cdcEncode(h.ChainID),
@@ -441,6 +811,43 @@ func (h *Header) Hash() tmbytes.HexBytes {
 		cdcEncode(h.EvidenceHash),
 		cdcEncode(h.ProposerAddress),
 	})
+}
+
+func (h *Header) IBCHash() tmbytes.HexBytes {
+	if h == nil || len(h.ValidatorsHash) == 0 {
+		return nil
+	}
+	hbz, err := h.Version.Marshal()
+	if err != nil {
+		return nil
+	}
+	pbt, err := gogotypes.StdTimeMarshal(h.Time)
+	if err != nil {
+		return nil
+	}
+
+	pbbi := h.LastBlockID.ToIBCProto()
+	bzbi, err := pbbi.Marshal()
+	if err != nil {
+		return nil
+	}
+	ret := merkle.HashFromByteSlices([][]byte{
+		hbz,
+		ibccdcEncode(h.ChainID),
+		ibccdcEncode(h.Height),
+		pbt,
+		bzbi,
+		ibccdcEncode(h.LastCommitHash),
+		ibccdcEncode(h.DataHash),
+		ibccdcEncode(h.ValidatorsHash),
+		ibccdcEncode(h.NextValidatorsHash),
+		ibccdcEncode(h.ConsensusHash),
+		ibccdcEncode(h.AppHash),
+		ibccdcEncode(h.LastResultsHash),
+		ibccdcEncode(h.EvidenceHash),
+		ibccdcEncode(h.ProposerAddress),
+	})
+	return ret
 }
 
 // StringIndented returns a string representation of the header
@@ -487,7 +894,7 @@ func (h *Header) ToProto() *tmproto.Header {
 		return nil
 	}
 	return &tmproto.Header{
-		Version:            tmversion.Consensus{Block: h.Version.App.Uint64(), App: h.Version.App.Uint64()},
+		Version:            tmversion.Consensus{Block: h.Version.Block.Uint64(), App: h.Version.App.Uint64()},
 		ChainID:            h.ChainID,
 		Height:             h.Height,
 		Time:               h.Time,
@@ -557,6 +964,89 @@ type CommitSig struct {
 	ValidatorAddress Address     `json:"validator_address"`
 	Timestamp        time.Time   `json:"timestamp"`
 	Signature        []byte      `json:"signature"`
+}
+
+func (cs CommitSig) AminoSize(_ *amino.Codec) int {
+	var size = 0
+
+	if cs.BlockIDFlag != 0 {
+		size += 1 + amino.UvarintSize(uint64(cs.BlockIDFlag))
+	}
+
+	if len(cs.ValidatorAddress) != 0 {
+		size += 1 + amino.ByteSliceSize(cs.ValidatorAddress)
+	}
+
+	timestampSize := amino.TimeSize(cs.Timestamp)
+	if timestampSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(timestampSize)) + timestampSize
+	}
+
+	if len(cs.Signature) != 0 {
+		size += 1 + amino.ByteSliceSize(cs.Signature)
+	}
+
+	return size
+}
+
+func (cs *CommitSig) UnmarshalFromAmino(_ *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+	var timestampUpdated bool
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			cs.BlockIDFlag = BlockIDFlag(u64)
+			dataLen = uint64(n)
+		case 2:
+			cs.ValidatorAddress = make([]byte, len(subData))
+			copy(cs.ValidatorAddress, subData)
+		case 3:
+			cs.Timestamp, _, err = amino.DecodeTime(subData)
+			if err != nil {
+				return err
+			}
+			timestampUpdated = true
+		case 4:
+			cs.Signature = make([]byte, len(subData))
+			copy(cs.Signature, subData)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	if !timestampUpdated {
+		cs.Timestamp = amino.ZeroTime
+	}
+	return nil
 }
 
 // NewCommitSigForBlock returns new CommitSig with BlockIDFlagCommit.
@@ -697,6 +1187,93 @@ type Commit struct {
 	// unmarshaling.
 	hash     tmbytes.HexBytes
 	bitArray *bits.BitArray
+}
+
+func (commit Commit) AminoSize(cdc *amino.Codec) int {
+	var size int = 0
+
+	if commit.Height != 0 {
+		size += 1 + amino.UvarintSize(uint64(commit.Height))
+	}
+
+	if commit.Round != 0 {
+		size += 1 + amino.UvarintSize(uint64(commit.Round))
+	}
+
+	blockIDSize := commit.BlockID.AminoSize(cdc)
+	if blockIDSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(blockIDSize)) + blockIDSize
+	}
+
+	for _, sig := range commit.Signatures {
+		sigSize := sig.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(sigSize)) + sigSize
+	}
+
+	return size
+}
+
+func (commit *Commit) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			commit.Height = int64(u64)
+			dataLen = uint64(n)
+		case 2:
+			u64, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			commit.Round = int(u64)
+			dataLen = uint64(n)
+		case 3:
+			err = commit.BlockID.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 4:
+			var cs CommitSig
+			err = cs.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+			commit.Signatures = append(commit.Signatures, cs)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }
 
 // NewCommit returns a new Commit.
@@ -946,6 +1523,10 @@ type SignedHeader struct {
 // sure to use a Verifier to validate the signatures actually provide a
 // significantly strong proof for this header's validity.
 func (sh SignedHeader) ValidateBasic(chainID string) error {
+	return sh.commonValidateBasic(chainID, false)
+}
+
+func (sh SignedHeader) commonValidateBasic(chainID string, isIbc bool) error {
 	if sh.Header == nil {
 		return errors.New("missing header")
 	}
@@ -968,7 +1549,14 @@ func (sh SignedHeader) ValidateBasic(chainID string) error {
 	if sh.Commit.Height != sh.Height {
 		return fmt.Errorf("header and commit height mismatch: %d vs %d", sh.Height, sh.Commit.Height)
 	}
-	if hhash, chash := sh.Hash(), sh.Commit.BlockID.Hash; !bytes.Equal(hhash, chash) {
+
+	var hhash tmbytes.HexBytes
+	if isIbc {
+		hhash = sh.PureIBCHash()
+	} else {
+		hhash = sh.Hash()
+	}
+	if chash := sh.Commit.BlockID.Hash; !bytes.Equal(hhash, chash) {
 		return fmt.Errorf("commit signs block %X, header is block %X", chash, hhash)
 	}
 	return nil
@@ -1048,19 +1636,73 @@ type Data struct {
 	hash tmbytes.HexBytes
 }
 
+func (d Data) AminoSize(_ *amino.Codec) int {
+	var size = 0
+
+	for _, tx := range d.Txs {
+		size += 1 + amino.ByteSliceSize(tx)
+	}
+
+	return size
+}
+
+func (d *Data) UnmarshalFromAmino(_ *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			var tx []byte
+			if dataLen > 0 {
+				tx = make([]byte, len(subData))
+				copy(tx, subData)
+			}
+			d.Txs = append(d.Txs, tx)
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
+}
+
 // Hash returns the hash of the data
-func (data *Data) Hash() tmbytes.HexBytes {
+func (data *Data) Hash(height int64) tmbytes.HexBytes {
 	if data == nil {
-		return (Txs{}).Hash()
+		return (Txs{}).Hash(height)
 	}
 	if data.hash == nil {
-		data.hash = data.Txs.Hash() // NOTE: leaves of merkle tree are TxIDs
+		data.hash = data.Txs.Hash(height) // NOTE: leaves of merkle tree are TxIDs
 	}
 	return data.hash
 }
 
 // StringIndented returns a string representation of the transactions
-func (data *Data) StringIndented(indent string) string {
+func (data *Data) StringIndented(indent string, height int64) string {
 	if data == nil {
 		return "nil-Data"
 	}
@@ -1070,7 +1712,7 @@ func (data *Data) StringIndented(indent string) string {
 			txStrings[i] = fmt.Sprintf("... (%v total)", len(data.Txs))
 			break
 		}
-		txStrings[i] = fmt.Sprintf("%X (%d bytes)", tx.Hash(), len(tx))
+		txStrings[i] = fmt.Sprintf("%X (%d bytes)", tx.Hash(height), len(tx))
 	}
 	return fmt.Sprintf(`Data{
 %s  %v
@@ -1087,6 +1729,82 @@ type EvidenceData struct {
 
 	// Volatile
 	hash tmbytes.HexBytes
+}
+
+func (d EvidenceData) AminoSize(cdc *amino.Codec) int {
+	var size = 0
+
+	for _, ev := range d.Evidence {
+		if ev != nil {
+			var evSize int
+			if sizer, ok := ev.(amino.Sizer); ok {
+				evSize = 4 + sizer.AminoSize(cdc)
+			} else {
+				evSize = len(cdc.MustMarshalBinaryBare(ev))
+			}
+			size += 1 + amino.UvarintSize(uint64(evSize)) + evSize
+		} else {
+			size += 1 + amino.UvarintSize(0)
+		}
+	}
+
+	return size
+}
+
+func (d *EvidenceData) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		} else {
+			return fmt.Errorf("unexpect pb type %d", pbType)
+		}
+
+		switch pos {
+		case 1:
+			var evi Evidence
+			if dataLen == 0 {
+				d.Evidence = append(d.Evidence, nil)
+			} else {
+				eviTmp, err := cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(subData, &evi)
+				if err != nil {
+					err = cdc.UnmarshalBinaryBare(subData, &evi)
+					if err != nil {
+						return err
+					} else {
+						d.Evidence = append(d.Evidence, evi)
+					}
+				} else {
+					d.Evidence = append(d.Evidence, eviTmp.(Evidence))
+				}
+			}
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }
 
 // Hash returns the hash of the data.
@@ -1123,6 +1841,65 @@ func (data *EvidenceData) StringIndented(indent string) string {
 type BlockID struct {
 	Hash        tmbytes.HexBytes `json:"hash"`
 	PartsHeader PartSetHeader    `json:"parts"`
+}
+
+func (blockID BlockID) AminoSize(_ *amino.Codec) int {
+	var size int
+	if len(blockID.Hash) > 0 {
+		size += 1 + amino.UvarintSize(uint64(len(blockID.Hash))) + len(blockID.Hash)
+	}
+	headerSize := blockID.PartsHeader.AminoSize()
+	if headerSize > 0 {
+		size += 1 + amino.UvarintSize(uint64(headerSize)) + headerSize
+	}
+	return size
+}
+
+func (blockID *BlockID) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return fmt.Errorf("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			blockID.Hash = make([]byte, len(subData))
+			copy(blockID.Hash, subData)
+		case 2:
+			err = blockID.PartsHeader.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
 }
 
 // Equals returns true if the BlockID matches the given BlockID
@@ -1179,6 +1956,16 @@ func (blockID *BlockID) ToProto() tmproto.BlockID {
 	return tmproto.BlockID{
 		Hash:        blockID.Hash,
 		PartsHeader: blockID.PartsHeader.ToProto(),
+	}
+}
+
+func (blockID *BlockID) ToIBCProto() tmproto.BlockID {
+	if blockID == nil {
+		return tmproto.BlockID{}
+	}
+	return tmproto.BlockID{
+		Hash:        blockID.Hash,
+		PartsHeader: blockID.PartsHeader.ToIBCProto(),
 	}
 }
 

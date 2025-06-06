@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	evmtypes "github.com/okex/exchain/x/evm/types"
+
 	"github.com/stretchr/testify/require"
 	yaml "gopkg.in/yaml.v2"
 
@@ -42,15 +44,15 @@ func TestEmptyAddresses(t *testing.T) {
 
 	accAddr, err := types.AccAddressFromBech32("")
 	require.True(t, accAddr.Empty())
-	require.Nil(t, err)
+	require.Error(t, err)
 
 	valAddr, err := types.ValAddressFromBech32("")
 	require.True(t, valAddr.Empty())
-	require.Nil(t, err)
+	require.Error(t, err)
 
 	consAddr, err := types.ConsAddressFromBech32("")
 	require.True(t, consAddr.Empty())
-	require.Nil(t, err)
+	require.Error(t, err)
 }
 
 func TestRandBech32PubkeyConsistency(t *testing.T) {
@@ -343,4 +345,39 @@ func TestCustomAddressVerifier(t *testing.T) {
 	require.Nil(t, err)
 	_, err = types.ConsAddressFromBech32(consBech)
 	require.Nil(t, err)
+}
+
+func BenchmarkAccAddress_Bech32String(b *testing.B) {
+	acc := types.AccAddress(evmtypes.GenerateEthAddress().Bytes())
+	prefix := types.GetConfig().GetBech32AccountAddrPrefix()
+	b.ResetTimer()
+	b.Run("Bench32 origin", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = acc.Bech32String(prefix)
+		}
+	})
+	b.Run("Bench32 Optimized", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = acc.Bech32StringOptimized(prefix)
+		}
+	})
+	require.EqualValues(b, acc.Bech32String(prefix), acc.Bech32StringOptimized(prefix))
+}
+
+func BenchmarkAccAddressFromBech32String(b *testing.B) {
+	buffer := make([]byte, 32)
+	copy(buffer, []byte("test"))
+	acc := types.AccAddress(buffer)
+	prefix := types.GetConfig().GetBech32AccountAddrPrefix()
+	sender := acc.Bech32String(prefix)
+	b.ResetTimer()
+	b.Run("AccAddressFromBech32", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, err := types.AccAddressFromBech32(sender)
+			require.NoError(b, err)
+		}
+	})
 }

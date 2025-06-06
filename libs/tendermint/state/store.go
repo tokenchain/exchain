@@ -1,14 +1,18 @@
 package state
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 
-	dbm "github.com/tendermint/tm-db"
+	"github.com/tendermint/go-amino"
 
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	tmmath "github.com/okex/exchain/libs/tendermint/libs/math"
 	tmos "github.com/okex/exchain/libs/tendermint/libs/os"
 	"github.com/okex/exchain/libs/tendermint/types"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -125,6 +129,159 @@ type ABCIResponses struct {
 	BeginBlock *abci.ResponseBeginBlock  `json:"begin_block"`
 }
 
+func (arz ABCIResponses) AminoSize(cdc *amino.Codec) int {
+	size := 0
+	for _, tx := range arz.DeliverTxs {
+		txSize := tx.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(txSize)) + txSize
+	}
+	if arz.EndBlock != nil {
+		endBlockSize := arz.EndBlock.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(endBlockSize)) + endBlockSize
+	}
+	if arz.BeginBlock != nil {
+		beginBlockSize := arz.BeginBlock.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(beginBlockSize)) + beginBlockSize
+	}
+	return size
+}
+
+func (arz ABCIResponses) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(arz.AminoSize(cdc))
+	err := arz.MarshalAminoTo(cdc, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (arz ABCIResponses) MarshalAminoTo(cdc *amino.Codec, buf *bytes.Buffer) error {
+	var err error
+	// field 1
+	for i := 0; i < len(arz.DeliverTxs); i++ {
+		const pbKey = 1<<3 | 2
+		buf.WriteByte(pbKey)
+		txSize := arz.DeliverTxs[i].AminoSize(cdc)
+		err = amino.EncodeUvarintToBuffer(buf, uint64(txSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = arz.DeliverTxs[i].MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != txSize {
+			return amino.NewSizerError(arz.DeliverTxs[i], buf.Len()-lenBeforeData, txSize)
+		}
+	}
+	// field 2
+	if arz.EndBlock != nil {
+		const pbKey = 2<<3 | 2
+		buf.WriteByte(pbKey)
+		endBlockSize := arz.EndBlock.AminoSize(cdc)
+		err = amino.EncodeUvarintToBuffer(buf, uint64(endBlockSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = arz.EndBlock.MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != endBlockSize {
+			return amino.NewSizerError(arz.EndBlock, buf.Len()-lenBeforeData, endBlockSize)
+		}
+	}
+	// field 3
+	if arz.BeginBlock != nil {
+		const pbKey = 3<<3 | 2
+		buf.WriteByte(pbKey)
+		beginBlockSize := arz.BeginBlock.AminoSize(cdc)
+		err = amino.EncodeUvarintToBuffer(buf, uint64(beginBlockSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = arz.BeginBlock.MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != beginBlockSize {
+			return amino.NewSizerError(arz.BeginBlock, buf.Len()-lenBeforeData, beginBlockSize)
+		}
+	}
+
+	return nil
+}
+
+// UnmarshalFromAmino unmarshal data from amino bytes.
+func (arz *ABCIResponses) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+		if len(data) == 0 {
+			break
+		}
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, _ = amino.DecodeUvarint(data)
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return errors.New("not enough data")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			var resDeliverTx *abci.ResponseDeliverTx = nil
+			if len(subData) != 0 {
+				resDeliverTx = &abci.ResponseDeliverTx{}
+				err := resDeliverTx.UnmarshalFromAmino(cdc, subData)
+				if err != nil {
+					return err
+				}
+			}
+			arz.DeliverTxs = append(arz.DeliverTxs, resDeliverTx)
+
+		case 2:
+			eBlock := &abci.ResponseEndBlock{}
+			if len(subData) != 0 {
+				err := eBlock.UnmarshalFromAmino(cdc, subData)
+				if err != nil {
+					return err
+				}
+			}
+			arz.EndBlock = eBlock
+
+		case 3:
+			bBlock := &abci.ResponseBeginBlock{}
+			if len(subData) != 0 {
+				err := bBlock.UnmarshalFromAmino(cdc, subData)
+				if err != nil {
+					return err
+				}
+			}
+			arz.BeginBlock = bBlock
+
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
+}
+
 // PruneStates deletes states between the given heights (including from, excluding to). It is not
 // guaranteed to delete all states, since the last checkpointed state and states being pointed to by
 // e.g. `LastHeightChanged` must remain. The state at to must also exist.
@@ -235,12 +392,24 @@ func NewABCIResponses(block *types.Block) *ABCIResponses {
 
 // Bytes serializes the ABCIResponse using go-amino.
 func (arz *ABCIResponses) Bytes() []byte {
-	return cdc.MustMarshalBinaryBare(arz)
+	bz, err := arz.MarshalToAmino(cdc)
+	if err != nil {
+		return cdc.MustMarshalBinaryBare(arz)
+	}
+	return bz
 }
 
 func (arz *ABCIResponses) ResultsHash() []byte {
 	results := types.NewResults(arz.DeliverTxs)
 	return results.Hash()
+}
+func (arz *ABCIResponses) String() string {
+	str := strings.Builder{}
+	results := types.NewResults(arz.DeliverTxs)
+	for _, v := range results {
+		str.WriteString(fmt.Sprintf("code:%d,msg:=%s\n", v.Code, v.Data.String()))
+	}
+	return str.String()
 }
 
 // LoadABCIResponses loads the ABCIResponses for the given height from the database.
@@ -293,9 +462,16 @@ func (valInfo *ValidatorsInfo) Bytes() []byte {
 // LoadValidators loads the ValidatorSet for a given height.
 // Returns ErrNoValSetForHeight if the validator set can't be found for this height.
 func LoadValidators(db dbm.DB, height int64) (*types.ValidatorSet, error) {
+	valSet, _, err := LoadValidatorsWithStoredHeight(db, height)
+	return valSet, err
+}
+
+// LoadValidators loads the ValidatorSet for a given height. plus the last LastHeightChanged
+// Returns ErrNoValSetForHeight if the validator set can't be found for this height.
+func LoadValidatorsWithStoredHeight(db dbm.DB, height int64) (*types.ValidatorSet, int64, error) {
 	valInfo := loadValidatorsInfo(db, height)
 	if valInfo == nil {
-		return nil, ErrNoValSetForHeight{height}
+		return nil, -1, ErrNoValSetForHeight{height}
 	}
 	if valInfo.ValidatorSet == nil {
 		lastStoredHeight := lastStoredHeightFor(height, valInfo.LastHeightChanged)
@@ -312,7 +488,7 @@ func LoadValidators(db dbm.DB, height int64) (*types.ValidatorSet, error) {
 		valInfo = valInfo2
 	}
 
-	return valInfo.ValidatorSet, nil
+	return valInfo.ValidatorSet, valInfo.LastHeightChanged, nil
 }
 
 func lastStoredHeightFor(height, lastHeightChanged int64) int64 {
@@ -348,7 +524,7 @@ func loadValidatorsInfo(db dbm.DB, height int64) *ValidatorsInfo {
 // signing. It should be called from s.Save(), right before the state itself is
 // persisted.
 func saveValidatorsInfo(db dbm.DB, height, lastHeightChanged int64, valSet *types.ValidatorSet) {
-	if lastHeightChanged > height {
+	if !IgnoreSmbCheck && lastHeightChanged > height {
 		panic("LastHeightChanged cannot be greater than ValidatorsInfo height")
 	}
 	valInfo := &ValidatorsInfo{

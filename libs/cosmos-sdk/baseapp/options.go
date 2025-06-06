@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"io"
 
-	dbm "github.com/tendermint/tm-db"
-
 	"github.com/okex/exchain/libs/cosmos-sdk/store"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/tendermint/rpc/client"
+	dbm "github.com/okex/exchain/libs/tm-db"
 )
 
 // File for storing in-package BaseApp optional functions,
@@ -113,11 +113,11 @@ func (app *BaseApp) SetGasRefundHandler(gh sdk.GasRefundHandler) {
 	app.GasRefundHandler = gh
 }
 
-func (app *BaseApp) SetAccHandler(ah sdk.AccHandler) {
+func (app *BaseApp) SetAccNonceHandler(anh sdk.AccNonceHandler) {
 	if app.sealed {
-		panic("SetAccHandler() on sealed BaseApp")
+		panic("SetAccNonceHandler() on sealed BaseApp")
 	}
-	app.AccHandler = ah
+	app.accNonceHandler = anh
 }
 
 func (app *BaseApp) SetAddrPeerFilter(pf sdk.PeerFilter) {
@@ -163,12 +163,94 @@ func (app *BaseApp) SetRouter(router sdk.Router) {
 	app.router = router
 }
 
-// SetParallelTxHandler some resources for parallel txs
-func (app *BaseApp) SetParallelTxHandlers(feeCollectt sdk.UpdateFeeCollectorAccHandler, txFee sdk.GetTxFeeHandler, fixLog sdk.LogFix) {
+func (app *BaseApp) SetUpdateFeeCollectorAccHandler(handler sdk.UpdateFeeCollectorAccHandler) {
 	if app.sealed {
-		panic("SetPallTxHandler() on sealed BaseApp")
+		panic("SetUpdateFeeCollectorAccHandler() on sealed BaseApp")
 	}
-	app.updateFeeCollectorAccHandler = feeCollectt
-	app.getTxFee = txFee
+	app.updateFeeCollectorAccHandler = handler
+}
+
+func (app *BaseApp) SetGetFeeCollectorInfo(handle sdk.GetFeeCollectorInfo) {
+	if app.sealed {
+		panic("SetGetFeeCollectorBalance() on sealed BaseApp")
+	}
+	app.getFeeCollectorInfoHandler = handle
+}
+
+func (app *BaseApp) SetParallelTxLogHandlers(fixLog sdk.LogFix) {
+	if app.sealed {
+		panic("SetPallTxLogHandler() on sealed BaseApp")
+	}
 	app.logFix = fixLog
+}
+
+func (app *BaseApp) SetUpdateWasmTxCount(d sdk.UpdateCosmosTxCount) {
+	app.updateCosmosTxCount = d
+}
+
+func (app *BaseApp) SetEvmWatcherCollector(collector sdk.EvmWatcherCollector) {
+	if app.sealed {
+		panic("SetEvmWatcherCollector() on sealed BaseApp")
+	}
+	app.watcherCollector = collector
+}
+
+func (app *BaseApp) AddCustomizeModuleOnStopLogic(cs sdk.CustomizeOnStop) {
+	if app.sealed {
+		panic("AddCustomizeModuleOnStopLogic() on sealed BaseApp")
+	}
+	app.customizeModuleOnStop = append(app.customizeModuleOnStop, cs)
+}
+
+func (app *BaseApp) SetMptCommitHandler(mch sdk.MptCommitHandler) {
+	if app.sealed {
+		panic("SetMptCommitHandler() on sealed BaseApp")
+	}
+	app.mptCommitHandler = mch
+}
+
+func (app *BaseApp) SetPreDeliverTxHandler(handler sdk.PreDeliverTxHandler) {
+	if app.sealed {
+		panic("SetPreDeliverTxHandler() on sealed BaseApp")
+	}
+	app.preDeliverTxHandler = handler
+}
+
+func (app *BaseApp) SetPartialConcurrentHandlers(etf sdk.GetTxFeeAndFromHandler) {
+	if app.sealed {
+		panic("SetPartialConcurrentHandlers() on sealed BaseApp")
+	}
+	app.getTxFeeAndFromHandler = etf
+}
+
+func (app *BaseApp) SetGetTxFeeHandler(handler sdk.GetTxFeeHandler) {
+	if app.sealed {
+		panic("SetGetTxFeeHandler() on sealed BaseApp")
+	}
+	app.getTxFeeHandler = handler
+}
+
+func (app *BaseApp) SetTmClient(client client.Client) {
+	app.tmClient = client
+}
+
+func (app *BaseApp) SetUpdateCMTxNonceHandler(handler sdk.UpdateCMTxNonceHandler) {
+	if app.sealed {
+		panic("SetUpdateCMTxNonceHandler() on sealed BaseApp")
+	}
+	app.updateCMTxNonceHandler = handler
+}
+
+func (app *BaseApp) SetGetGasConfigHandler(handler sdk.GetGasConfigHandler) {
+	if app.sealed {
+		panic("SetGetGasConfigHandler() on sealed BaseApp")
+	}
+	app.getGasConfigHandler = handler
+}
+
+func (app *BaseApp) SetGetBlockConfigHandler(handler sdk.GetBlockConfigHandler) {
+	if app.sealed {
+		panic("SetGetBlockConfigHandler() on sealed BaseApp")
+	}
+	app.getBlockConfigHandler = handler
 }

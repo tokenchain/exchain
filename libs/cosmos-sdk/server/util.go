@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/signal"
@@ -9,23 +10,24 @@ import (
 	"syscall"
 	"time"
 
-	"errors"
-
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-
-	tcmd "github.com/okex/exchain/libs/tendermint/cmd/tendermint/commands"
-	cfg "github.com/okex/exchain/libs/tendermint/config"
-	"github.com/okex/exchain/libs/tendermint/libs/cli"
-	tmflags "github.com/okex/exchain/libs/tendermint/libs/cli/flags"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
-
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/google/gops/agent"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/flags"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/lcd"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	"github.com/okex/exchain/libs/cosmos-sdk/server/config"
 	"github.com/okex/exchain/libs/cosmos-sdk/version"
+	tcmd "github.com/okex/exchain/libs/tendermint/cmd/tendermint/commands"
+	cfg "github.com/okex/exchain/libs/tendermint/config"
+	"github.com/okex/exchain/libs/tendermint/libs/cli"
+	tmflags "github.com/okex/exchain/libs/tendermint/libs/cli/flags"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
+	"github.com/okex/exchain/libs/tendermint/state"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
+
+const FlagGops = "gops"
 
 // server context
 type Context struct {
@@ -58,6 +60,11 @@ func PersistentPreRunEFn(context *Context) func(*cobra.Command, []string) error 
 		if err != nil {
 			return err
 		}
+		if !viper.IsSet(state.FlagDeliverTxsExecMode) {
+			if viper.GetBool(state.FlagEnableConcurrency) {
+				viper.Set(state.FlagDeliverTxsExecMode, state.DeliverTxsExecModeParallel)
+			}
+		}
 		// okchain
 		output := os.Stdout
 		if !config.LogStdout {
@@ -78,6 +85,14 @@ func PersistentPreRunEFn(context *Context) func(*cobra.Command, []string) error 
 		logger = logger.With("module", "main")
 		context.Config = config
 		context.Logger = logger
+
+		if viper.GetBool(FlagGops) {
+			err = agent.Listen(agent.Options{ShutdownCleanup: true})
+			if err != nil {
+				logger.Error("gops agent error", "err", err)
+			}
+		}
+
 		return nil
 	}
 }
@@ -102,6 +117,7 @@ func interceptLoadConfig() (conf *cfg.Config, err error) {
 		conf.P2P.SendRate = 5120000
 		conf.TxIndex.IndexAllKeys = true
 		conf.Consensus.TimeoutCommit = 3 * time.Second
+		conf.Consensus.TimeoutConsensus = 1 * time.Second
 		cfg.WriteConfigFile(configFilePath, conf)
 		// Fall through, just so that its parsed into memory.
 	}
@@ -113,7 +129,6 @@ func interceptLoadConfig() (conf *cfg.Config, err error) {
 		}
 	}
 
-	config.SetNodeHome(rootDir)
 	appConfigFilePath := filepath.Join(rootDir, "config/exchaind.toml")
 	if _, err := os.Stat(appConfigFilePath); os.IsNotExist(err) {
 		appConf, _ := config.ParseConfig()
@@ -128,12 +143,14 @@ func interceptLoadConfig() (conf *cfg.Config, err error) {
 
 // add server commands
 func AddCommands(
-	ctx *Context, cdc *codec.Codec,
+	ctx *Context, cdc *codec.CodecProxy,
+	registry jsonpb.AnyResolver,
 	rootCmd *cobra.Command,
 	appCreator AppCreator, appStop AppStop, appExport AppExporter,
 	registerRouters func(rs *lcd.RestServer),
 	registerAppFlagFn func(cmd *cobra.Command),
-	appPreRun func(ctx *Context)) {
+	appPreRun func(ctx *Context, cmd *cobra.Command) error,
+	subFunc func(logger log.Logger) log.Subscriber) {
 
 	rootCmd.PersistentFlags().String("log_level", ctx.Config.LogLevel, "Log level")
 	rootCmd.PersistentFlags().String("log_file", ctx.Config.LogFile, "Log file")
@@ -152,12 +169,12 @@ func AddCommands(
 	)
 
 	rootCmd.AddCommand(
-		StartCmd(ctx, cdc, appCreator, appStop, registerRouters, registerAppFlagFn, appPreRun),
+		StartCmd(ctx, cdc, registry, appCreator, appStop, registerRouters, registerAppFlagFn, appPreRun, subFunc),
 		StopCmd(ctx),
 		UnsafeResetAllCmd(ctx),
 		flags.LineBreak,
 		tendermintCmd,
-		ExportCmd(ctx, cdc, appExport),
+		ExportCmd(ctx, cdc.GetCdc(), appExport),
 		flags.LineBreak,
 		version.Cmd,
 	)

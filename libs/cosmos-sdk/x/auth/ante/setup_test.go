@@ -3,8 +3,8 @@ package ante_test
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	"github.com/okex/exchain/libs/tendermint/crypto"
+	"github.com/stretchr/testify/require"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
@@ -32,7 +32,7 @@ func TestSetup(t *testing.T) {
 	antehandler := sdk.ChainAnteDecorators(sud)
 
 	// Set height to non-zero value for GasMeter to be set
-	ctx = ctx.WithBlockHeight(1)
+	ctx.SetBlockHeight(1)
 
 	// Context GasMeter Limit not set
 	require.Equal(t, uint64(0), ctx.GasMeter().Limit(), "GasMeter set with limit before setup")
@@ -64,7 +64,7 @@ func TestRecoverPanic(t *testing.T) {
 	antehandler := sdk.ChainAnteDecorators(sud, OutOfGasDecorator{})
 
 	// Set height to non-zero value for GasMeter to be set
-	ctx = ctx.WithBlockHeight(1)
+	ctx.SetBlockHeight(1)
 
 	newCtx, err := antehandler(ctx, tx, false)
 

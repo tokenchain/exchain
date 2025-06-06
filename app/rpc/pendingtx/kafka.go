@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 
-	rpctypes "github.com/okex/exchain/app/rpc/types"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -19,22 +18,39 @@ func NewKafkaClient(addrs []string, topic string) *KafkaClient {
 		Writer: kafka.NewWriter(kafka.WriterConfig{
 			Brokers:  addrs,
 			Topic:    topic,
-			Balancer: &kafka.LeastBytes{},
+			Balancer: &kafka.Hash{},
+			Async:    true,
 		}),
 	}
 }
 
-type KafkaMsg struct {
-	Topic  string                `json:"topic"`
-	Source interface{}           `json:"source"`
-	Data   *rpctypes.Transaction `json:"data"`
-}
-
-func (kc *KafkaClient) Send(hash []byte, tx *rpctypes.Transaction) error {
-	msg, err := json.Marshal(KafkaMsg{
+func (kc *KafkaClient) SendPending(hash []byte, tx *PendingTx) error {
+	kafkaMsg := PendingMsg{
 		Topic: kc.Topic,
 		Data:  tx,
-	})
+	}
+
+	msg, err := json.Marshal(kafkaMsg)
+	if err != nil {
+		return err
+	}
+
+	// Automatic retries and reconnections on errors.
+	return kc.WriteMessages(context.Background(),
+		kafka.Message{
+			Key:   hash,
+			Value: msg,
+		},
+	)
+}
+
+func (kc *KafkaClient) SendRmPending(hash []byte, tx *RmPendingTx) error {
+	kafkaMsg := RmPendingMsg{
+		Topic: kc.Topic,
+		Data:  tx,
+	}
+
+	msg, err := json.Marshal(kafkaMsg)
 	if err != nil {
 		return err
 	}

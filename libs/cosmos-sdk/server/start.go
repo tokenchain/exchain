@@ -3,38 +3,44 @@ package server
 // DONTCOVER
 
 import (
-	"fmt"
 	"os"
 	"runtime/pprof"
+
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/baseapp"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/lcd"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
+	"github.com/okex/exchain/libs/cosmos-sdk/server/grpc"
+	app2 "github.com/okex/exchain/libs/cosmos-sdk/server/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/store/iavl"
-	storetypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
+	"github.com/okex/exchain/libs/cosmos-sdk/store/mpt"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
 	tmiavl "github.com/okex/exchain/libs/iavl"
-	"github.com/okex/exchain/libs/tendermint/abci/server"
+	"github.com/okex/exchain/libs/system"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	bcv0 "github.com/okex/exchain/libs/tendermint/blockchain/v0"
 	tcmd "github.com/okex/exchain/libs/tendermint/cmd/tendermint/commands"
+	"github.com/okex/exchain/libs/tendermint/consensus"
 	"github.com/okex/exchain/libs/tendermint/libs/cli"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
 	tmos "github.com/okex/exchain/libs/tendermint/libs/os"
 	"github.com/okex/exchain/libs/tendermint/mempool"
 	"github.com/okex/exchain/libs/tendermint/node"
 	"github.com/okex/exchain/libs/tendermint/p2p"
 	pvm "github.com/okex/exchain/libs/tendermint/privval"
 	"github.com/okex/exchain/libs/tendermint/proxy"
+	"github.com/okex/exchain/libs/tendermint/rpc/client"
 	"github.com/okex/exchain/libs/tendermint/rpc/client/local"
 	"github.com/okex/exchain/libs/tendermint/state"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	tmdb "github.com/tendermint/tm-db"
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
 )
 
 // Tendermint full-node start flags
 const (
-	flagWithTendermint     = "with-tendermint"
 	flagAddress            = "address"
 	flagTraceStore         = "trace-store"
 	flagCPUProfile         = "cpu-profile"
@@ -56,15 +62,32 @@ const (
 	FlagGoroutineNum      = "goroutine-num"
 
 	FlagPruningMaxWsNum = "pruning-max-worldstate-num"
+	FlagExportKeystore  = "export-keystore"
+	FlagLogServerUrl    = "log-server"
+
+	FlagActiveViewChange = "active-view-change"
+	FlagCommitGapHeight  = "commit-gap-height"
+
+	FlagBlockPartSizeBytes = "block-part-size"
+
+	FlagFastSyncGap = "fastsync-gap"
+
+	FlagEventBlockTime    = "event-block-time"
+	FlagStartFromSnapshot = "start-from-snapshot"
 )
 
 // StartCmd runs the service passed in, either stand-alone or in-process with
 // Tendermint.
 func StartCmd(ctx *Context,
-	cdc *codec.Codec, appCreator AppCreator, appStop AppStop,
+	cdc *codec.CodecProxy,
+	registry jsonpb.AnyResolver,
+	appCreator AppCreator,
+	appStop AppStop,
 	registerRoutesFn func(restServer *lcd.RestServer),
 	registerAppFlagFn func(cmd *cobra.Command),
-	appPreRun func(ctx *Context)) *cobra.Command {
+	appPreRun func(ctx *Context, cmd *cobra.Command) error,
+	subFunc func(logger log.Logger) log.Subscriber,
+) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Run the full node",
@@ -91,139 +114,36 @@ For profiling and benchmarking purposes, CPU profiling can be enabled via the '-
 which accepts a path for the resulting pprof file.
 `,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			// set external package flags
-			setExternalPackageValue(cmd)
 			// app pre run
-			appPreRun(ctx)
-			// pruning options
-			_, err := GetPruningOptionsFromFlags()
-			return err
+			if err := appPreRun(ctx, cmd); err != nil {
+				return err
+			}
+			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !viper.GetBool(flagWithTendermint) {
-				ctx.Logger.Info("starting ABCI without Tendermint")
-				return startStandAlone(ctx, appCreator)
-			}
 
-			ctx.Logger.Info("starting ABCI with Tendermint")
+			ctx.Logger.Info("Starting ABCI with Tendermint")
+
+			sub := subFunc(ctx.Logger)
+			log.SetSubscriber(sub)
 
 			setPID(ctx)
-			_, err := startInProcess(ctx, cdc, appCreator, appStop, registerRoutesFn)
+			_, err := startInProcess(ctx, cdc, registry, appCreator, appStop, registerRoutesFn)
 			if err != nil {
 				tmos.Exit(err.Error())
 			}
 			return nil
 		},
 	}
-
-	// core flags for the ABCI application
-	cmd.Flags().Bool(flagWithTendermint, true, "Run abci app embedded in-process with tendermint")
-	cmd.Flags().String(flagAddress, "tcp://0.0.0.0:26658", "Listen address")
-	cmd.Flags().String(flagTraceStore, "", "Enable KVStore tracing to an output file")
-	cmd.Flags().Bool(FlagTrace, false, "Provide full stack traces for errors in ABCI Log")
-	cmd.Flags().String(
-		FlagMinGasPrices, "",
-		"Minimum gas prices to accept for transactions; Any fee in a tx must meet this minimum (e.g. 0.01photino;0.0001stake)",
-	)
-	cmd.Flags().IntSlice(FlagUnsafeSkipUpgrades, []int{}, "Skip a set of upgrade heights to continue the old binary")
-	cmd.Flags().Uint64(FlagHaltHeight, 0, "Block height at which to gracefully halt the chain and shutdown the node")
-	cmd.Flags().Uint64(FlagHaltTime, 0, "Minimum block time (in Unix seconds) at which to gracefully halt the chain and shutdown the node")
-	cmd.Flags().Bool(FlagInterBlockCache, true, "Enable inter-block caching")
-	cmd.Flags().String(flagCPUProfile, "", "Enable CPU profiling and write to the provided file")
-
-	cmd.Flags().String(FlagPruning, storetypes.PruningOptionDefault, "Pruning strategy (default|nothing|everything|custom)")
-	cmd.Flags().Uint64(FlagPruningKeepRecent, 0, "Number of recent heights to keep on disk (ignored if pruning is not 'custom')")
-	cmd.Flags().Uint64(FlagPruningKeepEvery, 0, "Offset heights to keep on disk after 'keep-every' (ignored if pruning is not 'custom')")
-	cmd.Flags().Uint64(FlagPruningInterval, 0, "Height interval at which pruned heights are removed from disk (ignored if pruning is not 'custom')")
-	cmd.Flags().Uint64(FlagPruningMaxWsNum, 0, "Max number of historic states to keep on disk (ignored if pruning is not 'custom')")
-	cmd.Flags().String(FlagLocalRpcPort, "", "Local rpc port for mempool and block monitor on cosmos layer(ignored if mempool/block monitoring is not required)")
-	cmd.Flags().String(FlagPortMonitor, "", "Local target ports for connecting number monitoring(ignored if connecting number monitoring is not required)")
-	cmd.Flags().String(FlagEvmImportMode, "default", "Select import mode for evm state (default|files|db)")
-	cmd.Flags().String(FlagEvmImportPath, "", "Evm contract & storage db or files used for InitGenesis")
-	cmd.Flags().Uint64(FlagGoroutineNum, 0, "Limit on the number of goroutines used to import evm data(ignored if evm-import-mode is 'default')")
-	cmd.Flags().Int(iavl.FlagIavlCacheSize, 1000000, "Max size of iavl cache")
-	cmd.Flags().StringToInt(tmiavl.FlagOutputModules, map[string]int{"evm": 1, "acc": 1}, "decide which module in iavl to be printed")
-	cmd.Flags().Int64(tmiavl.FlagIavlCommitIntervalHeight, 100, "Max interval to commit node cache into leveldb")
-	cmd.Flags().Int64(tmiavl.FlagIavlMinCommitItemCount, 500000, "Min nodes num to triggle node cache commit")
-	cmd.Flags().Int(tmiavl.FlagIavlHeightOrphansCacheSize, 8, "Max orphan version to cache in memory")
-	cmd.Flags().Int(tmiavl.FlagIavlMaxCommittedHeightNum, 30, "Max committed version to cache in memory")
-	cmd.Flags().Bool(tmiavl.FlagIavlEnableAsyncCommit, false, "Enable async commit")
-	cmd.Flags().Int(tmdb.FlagLevelDBCacheSize, 128, "The amount of memory in megabytes to allocate to leveldb")
-	cmd.Flags().Int(tmdb.FlagLevelDBHandlersNum, 1024, "The number of files handles to allocate to the open database files")
-	cmd.Flags().Bool(abci.FlagDisableQueryMutex, false, "Disable local client query mutex for better concurrency")
-	cmd.Flags().Bool(abci.FlagDisableCheckTxMutex, false, "Disable local client checkTx mutex for better concurrency")
-	cmd.Flags().Bool(abci.FlagDisableCheckTx, false, "Disable checkTx for test")
-	cmd.Flags().MarkHidden(abci.FlagDisableCheckTx)
-	cmd.Flags().Bool(abci.FlagCloseMutex, false, fmt.Sprintf("Deprecated in v0.19.13 version, use --%s instead.", abci.FlagDisableQueryMutex))
-	cmd.Flags().MarkHidden(abci.FlagCloseMutex)
-	cmd.Flags().Bool(tmiavl.FlagIavlEnableGid, false, "Display goroutine id in iavl log")
-
-	cmd.Flags().Int(state.FlagApplyBlockPprofTime, -1, "time(ms) of executing ApplyBlock, if it is higher than this value, save pprof")
-
-	// Don`t use cmd.Flags().*Var functions(such as cmd.Flags.IntVar) here, because it doesn't work with environment variables.
-	// Use setExternalPackageValue function instead.
-	viper.BindPFlag(FlagTrace, cmd.Flags().Lookup(FlagTrace))
-	viper.BindPFlag(FlagPruning, cmd.Flags().Lookup(FlagPruning))
-	viper.BindPFlag(FlagPruningKeepRecent, cmd.Flags().Lookup(FlagPruningKeepRecent))
-	viper.BindPFlag(FlagPruningKeepEvery, cmd.Flags().Lookup(FlagPruningKeepEvery))
-	viper.BindPFlag(FlagPruningInterval, cmd.Flags().Lookup(FlagPruningInterval))
-	viper.BindPFlag(FlagPruningMaxWsNum, cmd.Flags().Lookup(FlagPruningMaxWsNum))
-	viper.BindPFlag(FlagLocalRpcPort, cmd.Flags().Lookup(FlagLocalRpcPort))
-	viper.BindPFlag(FlagPortMonitor, cmd.Flags().Lookup(FlagPortMonitor))
-	viper.BindPFlag(FlagEvmImportMode, cmd.Flags().Lookup(FlagEvmImportMode))
-	viper.BindPFlag(FlagEvmImportPath, cmd.Flags().Lookup(FlagEvmImportPath))
-	viper.BindPFlag(FlagGoroutineNum, cmd.Flags().Lookup(FlagGoroutineNum))
-
-	cmd.Flags().Bool(state.FlagParalleledTx, false, "Enable Parallel Tx")
-	registerRestServerFlags(cmd)
+	RegisterServerFlags(cmd)
 	registerAppFlagFn(cmd)
-	registerExChainPluginFlags(cmd)
 	// add support for all Tendermint-specific command line options
 	tcmd.AddNodeFlags(cmd)
+	cmd.AddCommand(nodeModeCmd(ctx))
 	return cmd
 }
 
-func startStandAlone(ctx *Context, appCreator AppCreator) error {
-	addr := viper.GetString(flagAddress)
-	home := viper.GetString("home")
-	traceWriterFile := viper.GetString(flagTraceStore)
-
-	db, err := openDB(home)
-	if err != nil {
-		return err
-	}
-	traceWriter, err := openTraceWriter(traceWriterFile)
-	if err != nil {
-		return err
-	}
-
-	app := appCreator(ctx.Logger, db, traceWriter)
-
-	svr, err := server.NewServer(addr, "socket", app)
-	if err != nil {
-		return fmt.Errorf("error creating listener: %v", err)
-	}
-
-	svr.SetLogger(ctx.Logger.With("module", "abci-server"))
-
-	err = svr.Start()
-	if err != nil {
-		tmos.Exit(err.Error())
-	}
-
-	tmos.TrapSignal(ctx.Logger, func() {
-		// cleanup
-		err = svr.Stop()
-		if err != nil {
-			tmos.Exit(err.Error())
-		}
-	})
-
-	// run forever (the node will not be returned)
-	select {}
-}
-
-func startInProcess(ctx *Context, cdc *codec.Codec, appCreator AppCreator, appStop AppStop,
+func startInProcess(ctx *Context, cdc *codec.CodecProxy, registry jsonpb.AnyResolver, appCreator AppCreator, appStop AppStop,
 	registerRoutesFn func(restServer *lcd.RestServer)) (*node.Node, error) {
 
 	cfg := ctx.Config
@@ -264,6 +184,21 @@ func startInProcess(ctx *Context, cdc *codec.Codec, appCreator AppCreator, appSt
 		return nil, err
 	}
 
+	app.SetOption(abci.RequestSetOption{
+		Key:   "CheckChainID",
+		Value: tmNode.ConsensusState().GetState().ChainID,
+	})
+
+	if clientSetter, ok := app.(interface {
+		SetTmClient(client client.Client)
+	}); ok {
+		clientSetter.SetTmClient(local.New(tmNode))
+	}
+
+	ctx.Logger.Info("startInProcess",
+		"ConsensusStateChainID", tmNode.ConsensusState().GetState().ChainID,
+		"GenesisDocChainID", tmNode.GenesisDoc().ChainID,
+	)
 	if err := tmNode.Start(); err != nil {
 		return nil, err
 	}
@@ -302,13 +237,17 @@ func startInProcess(ctx *Context, cdc *codec.Codec, appCreator AppCreator, appSt
 	})
 
 	if registerRoutesFn != nil {
-		go lcd.StartRestServer(cdc, registerRoutesFn, tmNode, viper.GetString(FlagListenAddr))
+		go lcd.StartRestServer(cdc, registry, registerRoutesFn, tmNode, viper.GetString(FlagListenAddr))
+	}
+
+	if cfg.GRPC.Enable {
+		go grpc.StartGRPCServer(cdc, registry, app.(app2.ApplicationAdapter), cfg.GRPC, tmNode)
 	}
 
 	baseapp.SetGlobalMempool(tmNode.Mempool(), cfg.Mempool.SortTxByGp, cfg.Mempool.EnablePendingPool)
 
 	if cfg.Mempool.EnablePendingPool {
-		cliCtx := context.NewCLIContext().WithCodec(cdc)
+		cliCtx := context.NewCLIContext().WithProxy(cdc)
 		cliCtx.Client = local.New(tmNode)
 		cliCtx.TrustNode = true
 		accRetriever := types.NewAccountRetriever(cliCtx)
@@ -323,23 +262,97 @@ func startInProcess(ctx *Context, cdc *codec.Codec, appCreator AppCreator, appSt
 	select {}
 }
 
-// Use setExternalPackageValue to set external package config value.
-func setExternalPackageValue(cmd *cobra.Command) {
+func StartRestWithNode(ctx *Context, cdc *codec.CodecProxy, blockStoreDir string,
+	registry jsonpb.AnyResolver, appCreator AppCreator,
+	registerRoutesFn func(restServer *lcd.RestServer)) (*node.Node, error) {
+
+	cfg := ctx.Config
+	home := cfg.RootDir
+	////startInProcess hooker
+	//callHooker(FlagHookstartInProcess, ctx)
+
+	traceWriterFile := viper.GetString(flagTraceStore)
+	db, err := openDB(home)
+	if err != nil {
+		return nil, err
+	}
+
+	traceWriter, err := openTraceWriter(traceWriterFile)
+	if err != nil {
+		return nil, err
+	}
+
+	app := appCreator(ctx.Logger, db, traceWriter)
+
+	nodeKey, err := p2p.LoadOrGenNodeKey(cfg.NodeKeyFile())
+	if err != nil {
+		return nil, err
+	}
+
+	// create & start tendermint node
+	tmNode, err := node.NewLRPNode(
+		cfg,
+		pvm.LoadFilePVEmptyState(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile()),
+		nodeKey,
+		proxy.NewLocalClientCreator(app),
+		node.DefaultGenesisDocProviderFunc(cfg),
+		node.DefaultDBProvider,
+		blockStoreDir,
+		ctx.Logger.With("module", "node"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	app.SetOption(abci.RequestSetOption{
+		Key:   "CheckChainID",
+		Value: tmNode.ConsensusState().GetState().ChainID,
+	})
+
+	if registerRoutesFn != nil {
+		go lcd.StartRestServer(cdc, registry, registerRoutesFn, tmNode, viper.GetString(FlagListenAddr))
+	}
+
+	// run forever (the node will not be returned)
+	//select {}
+	return tmNode, nil
+}
+
+// Use SetExternalPackageValue to set external package config value.
+func SetExternalPackageValue(cmd *cobra.Command) {
 	iavl.IavlCacheSize = viper.GetInt(iavl.FlagIavlCacheSize)
+	tmiavl.IavlCacheInitRatio = viper.GetFloat64(tmiavl.FlagIavlCacheInitRatio)
 	tmiavl.OutputModules, _ = cmd.Flags().GetStringToInt(tmiavl.FlagOutputModules)
 	tmiavl.CommitIntervalHeight = viper.GetInt64(tmiavl.FlagIavlCommitIntervalHeight)
 	tmiavl.MinCommitItemCount = viper.GetInt64(tmiavl.FlagIavlMinCommitItemCount)
 	tmiavl.HeightOrphansCacheSize = viper.GetInt(tmiavl.FlagIavlHeightOrphansCacheSize)
 	tmiavl.MaxCommittedHeightNum = viper.GetInt(tmiavl.FlagIavlMaxCommittedHeightNum)
 	tmiavl.EnableAsyncCommit = viper.GetBool(tmiavl.FlagIavlEnableAsyncCommit)
-	tmiavl.EnableGid = viper.GetBool(tmiavl.FlagIavlEnableGid)
-	tmdb.LevelDBCacheSize = viper.GetInt(tmdb.FlagLevelDBCacheSize)
-	tmdb.LevelDBHandlersNum = viper.GetInt(tmdb.FlagLevelDBHandlersNum)
+	if viper.GetBool(tmiavl.FlagIavlDiscardFastStorage) {
+		tmiavl.SetEnableFastStorage(false)
+		viper.Set(tmiavl.FlagIavlEnableFastStorage, false)
+	}
+	system.EnableGid = viper.GetBool(system.FlagEnableGid)
 
 	state.ApplyBlockPprofTime = viper.GetInt(state.FlagApplyBlockPprofTime)
 	state.HomeDir = viper.GetString(cli.HomeFlag)
 
-	abci.SetDisableQueryMutex(viper.GetBool(abci.FlagDisableQueryMutex))
-	abci.SetDisableCheckTxMutex(viper.GetBool(abci.FlagDisableCheckTxMutex))
+	abci.SetDisableABCIQueryMutex(viper.GetBool(abci.FlagDisableABCIQueryMutex))
 	abci.SetDisableCheckTx(viper.GetBool(abci.FlagDisableCheckTx))
+
+	tmtypes.DownloadDelta = viper.GetBool(tmtypes.FlagDownloadDDS)
+	tmtypes.UploadDelta = viper.GetBool(tmtypes.FlagUploadDDS)
+	tmtypes.FastQuery = viper.GetBool(tmtypes.FlagFastQuery)
+	tmtypes.DeltaVersion = viper.GetInt(tmtypes.FlagDeltaVersion)
+	tmtypes.BlockCompressType = viper.GetInt(tmtypes.FlagBlockCompressType)
+	tmtypes.BlockCompressFlag = viper.GetInt(tmtypes.FlagBlockCompressFlag)
+	tmtypes.BlockCompressThreshold = viper.GetInt(tmtypes.FlagBlockCompressThreshold)
+
+	mpt.TrieCommitGap = viper.GetInt64(FlagCommitGapHeight)
+
+	bcv0.MaxIntervalForFastSync = viper.GetInt64(FlagFastSyncGap)
+
+	consensus.SetActiveVC(viper.GetBool(FlagActiveViewChange))
+
+	tmtypes.EnableEventBlockTime = viper.GetBool(FlagEventBlockTime)
 }

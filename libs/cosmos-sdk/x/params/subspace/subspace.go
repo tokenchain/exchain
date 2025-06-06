@@ -1,11 +1,18 @@
 package subspace
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
+	"strconv"
+
+	"github.com/valyala/fastjson"
+
+	"encoding/json"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/tendermint/go-amino"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/store/prefix"
 )
@@ -26,6 +33,7 @@ type Subspace struct {
 	key   sdk.StoreKey // []byte -> []byte, stores parameter
 	tkey  sdk.StoreKey // []byte -> bool, stores parameter change
 	name  []byte
+	cName []byte
 	table KeyTable
 }
 
@@ -36,6 +44,7 @@ func NewSubspace(cdc *codec.Codec, key sdk.StoreKey, tkey sdk.StoreKey, name str
 		key:   key,
 		tkey:  tkey,
 		name:  []byte(name),
+		cName: []byte("custom/" + name + "/"),
 		table: NewKeyTable(),
 	}
 }
@@ -52,6 +61,30 @@ func (s Subspace) WithKeyTable(table KeyTable) Subspace {
 	}
 	if len(s.table.m) != 0 {
 		panic("SetKeyTable() called on already initialized Subspace")
+	}
+	if s.table.m == nil {
+		s.table.m = make(map[string]attribute)
+	}
+
+	for k, v := range table.m {
+		s.table.m[k] = v
+	}
+
+	// Allocate additional capacity for Subspace.name
+	// So we don't have to allocate extra space each time appending to the key
+	name := s.name
+	s.name = make([]byte, len(name), len(name)+table.maxKeyLength())
+	copy(s.name, name)
+
+	return s
+}
+
+func (s Subspace) LazyWithKeyTable(table KeyTable) Subspace {
+	if table.m == nil {
+		panic("SetKeyTable() called with nil KeyTable")
+	}
+	if len(s.table.m) == 0 {
+		panic("SetKeyTable() should call on already initialized Subspace")
 	}
 
 	for k, v := range table.m {
@@ -72,6 +105,13 @@ func (s Subspace) kvStore(ctx sdk.Context) sdk.KVStore {
 	// append here is safe, appends within a function won't cause
 	// weird side effects when its singlethreaded
 	return prefix.NewStore(ctx.KVStore(s.key), append(s.name, '/'))
+}
+
+// Returns a KVStore identical with ctx.KVStore(s.key).Prefix()
+func (s Subspace) CustomKVStore(ctx sdk.Context) sdk.KVStore {
+	// append here is safe, appends within a function won't cause
+	// weird side effects when its singlethreaded
+	return prefix.NewStore(ctx.KVStore(s.key), s.cName)
 }
 
 // Returns a transient store for modification
@@ -102,9 +142,160 @@ func (s Subspace) Get(ctx sdk.Context, key []byte, ptr interface{}) {
 	store := s.kvStore(ctx)
 	bz := store.Get(key)
 
-	if err := s.cdc.UnmarshalJSON(bz, ptr); err != nil {
+	if err := tryParseJSON(bz, ptr, s.cdc); err != nil {
 		panic(err)
 	}
+}
+
+func isJsonString(bz []byte) bool {
+	return len(bz) >= 2 && bz[0] == '"' && bz[len(bz)-1] == '"'
+}
+
+func getString(rawbz []byte, tptr *string) bool {
+	ok := true
+	for _, c := range rawbz {
+		if c < 0x20 || c == '\\' {
+			ok = false
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	*tptr = string(rawbz)
+	return true
+}
+
+func getUint64(rawbz []byte, tptr *uint64) bool {
+	ok := true
+	for _, c := range rawbz {
+		if c < '0' || c > '9' {
+			ok = false
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	ui, err := strconv.ParseUint(amino.BytesToStr(rawbz), 10, 64)
+	if err == nil {
+		*tptr = ui
+		return true
+	}
+	return false
+}
+
+func getInt64(rawbz []byte, tptr *int64) bool {
+	ok := true
+	rawbz2 := rawbz
+	if rawbz2[0] == '-' {
+		rawbz2 = rawbz[1:]
+	}
+	for _, c := range rawbz2 {
+		if c < '0' || c > '9' {
+			ok = false
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	ui, err := strconv.ParseInt(amino.BytesToStr(rawbz), 10, 64)
+	if err == nil {
+		*tptr = ui
+		return true
+	}
+	return false
+}
+
+func getDec(rawbz []byte, tptr *sdk.Dec) bool {
+	ok := true
+	for _, c := range rawbz {
+		if c < 0x20 || c == '\\' {
+			ok = false
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	nd, err := sdk.NewDecFromStr(amino.BytesToStr(rawbz))
+	if err == nil {
+		tptr.Int = nd.Int
+		return true
+	}
+	return false
+}
+
+func getDecCoin(bz []byte, tptr *sdk.DecCoin) bool {
+	if amino.BytesToStr(bz) == "null" {
+		return false
+	}
+	v, err := fastjson.Parse(amino.BytesToStr(bz))
+	if err == nil {
+		tptr.Denom = string(v.GetStringBytes("denom"))
+		amount := v.GetStringBytes("amount")
+		newDec, err := sdk.NewDecFromStr(amino.BytesToStr(amount))
+		if err == nil {
+			tptr.Amount.Int = newDec.Int
+			return true
+		}
+	}
+	return false
+}
+
+func tryParseJSON(bz []byte, ptr interface{}, cdc *amino.Codec) error {
+	if len(bz) < 2 {
+		return cdc.UnmarshalJSON(bz, ptr)
+	}
+	if isJsonString(bz) {
+		rawbz := bz[1 : len(bz)-1] // trim leading & trailing "
+		switch tptr := ptr.(type) {
+		case *string:
+			if getString(rawbz, tptr) {
+				return nil
+			}
+			return json.Unmarshal(bz, ptr)
+		case *uint64:
+			if getUint64(rawbz, tptr) {
+				return nil
+			}
+			return json.Unmarshal(rawbz, ptr)
+		case *int64:
+			if getInt64(rawbz, tptr) {
+				return nil
+			}
+			return json.Unmarshal(rawbz, ptr)
+		case *sdk.Dec:
+			if getDec(rawbz, tptr) {
+				return nil
+			}
+			return tptr.UnmarshalJSON(bz)
+		}
+	} else {
+		switch tptr := ptr.(type) {
+		case *sdk.DecCoin:
+			if getDecCoin(bz, tptr) {
+				return nil
+			}
+		case *bool:
+			switch amino.BytesToStr(bz) {
+			case "true":
+				*tptr = true
+				return nil
+			case "false":
+				*tptr = false
+				return nil
+			}
+		case *[]int:
+			if amino.BytesToStr(bz) == "null" {
+				*tptr = nil
+				return nil
+			}
+		}
+	}
+
+	return cdc.UnmarshalJSON(bz, ptr)
 }
 
 // GetIfExists queries for a parameter by key from the Subspace's KVStore and
@@ -218,10 +409,60 @@ func (s Subspace) GetParamSet(ctx sdk.Context, ps ParamSet) {
 	}
 }
 
+// GetParamSetForInitGenesis iterates through each ParamSetPair where for each pair, it will
+// retrieve the value and set it to the corresponding value pointer provided, ignore the target keys for additional
+// in the ParamSetPair by calling Subspace#Get.
+func (s Subspace) GetParamSetForInitGenesis(ctx sdk.Context, ps ParamSet, ignoreList [][]byte) {
+	for _, pair := range ps.ParamSetPairs() {
+		beIgnore := false
+		for _, ignore := range ignoreList {
+			if bytes.Equal(ignore, pair.Key) {
+				beIgnore = true
+				break
+			}
+		}
+
+		if beIgnore {
+			continue
+		}
+		s.Get(ctx, pair.Key, pair.Value)
+	}
+}
+
 // SetParamSet iterates through each ParamSetPair and sets the value with the
 // corresponding parameter key in the Subspace's KVStore.
 func (s Subspace) SetParamSet(ctx sdk.Context, ps ParamSet) {
 	for _, pair := range ps.ParamSetPairs() {
+		// pair.Field is a pointer to the field, so indirecting the ptr.
+		// go-amino automatically handles it but just for sure,
+		// since SetStruct is meant to be used in InitGenesis
+		// so this method will not be called frequently
+		v := reflect.Indirect(reflect.ValueOf(pair.Value)).Interface()
+
+		if err := pair.ValidatorFn(v); err != nil {
+			panic(fmt.Sprintf("value from ParamSetPair is invalid: %s", err))
+		}
+
+		s.Set(ctx, pair.Key, v)
+	}
+}
+
+// SetParamSetForInitGenesis iterates through each ParamSetPair and sets the value with the
+// corresponding parameter key in the Subspace's KVStore, ignore the target keys for additional
+func (s Subspace) SetParamSetForInitGenesis(ctx sdk.Context, ps ParamSet, ignoreList [][]byte) {
+	for _, pair := range ps.ParamSetPairs() {
+		beIgnore := false
+		for _, ignore := range ignoreList {
+			if bytes.Equal(ignore, pair.Key) {
+				beIgnore = true
+				break
+			}
+		}
+
+		if beIgnore {
+			continue
+		}
+
 		// pair.Field is a pointer to the field, so indirecting the ptr.
 		// go-amino automatically handles it but just for sure,
 		// since SetStruct is meant to be used in InitGenesis

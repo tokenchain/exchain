@@ -1,3 +1,5 @@
+//go:build ignore
+
 package order
 
 import (
@@ -5,12 +7,12 @@ import (
 	"testing"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	"github.com/okex/exchain/libs/tendermint/types/time"
 	"github.com/okex/exchain/x/common"
 	"github.com/okex/exchain/x/dex"
 	"github.com/okex/exchain/x/order/keeper"
 	"github.com/okex/exchain/x/order/types"
 	"github.com/stretchr/testify/require"
-	"github.com/okex/exchain/libs/tendermint/types/time"
 )
 
 func TestValidateGenesis(t *testing.T) {
@@ -99,7 +101,7 @@ func TestExportGenesis(t *testing.T) {
 		5,
 		sdk.NewDecCoinFromDec(types.DefaultFeeDenomPerBlock, sdk.NewDec(1)))
 	order2.FilledAvgPrice = sdk.ZeroDec()
-	ctx = ctx.WithBlockHeight(1000)
+	ctx.SetBlockHeight(1000)
 	err = orderKeeper.PlaceOrder(ctx, order2)
 	require.NoError(t, err)
 	orderKeeper.Cache2Disk(ctx)

@@ -9,69 +9,42 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/okex/exchain/libs/cosmos-sdk/client/flags"
-
-	"github.com/okex/exchain/libs/cosmos-sdk/server/config"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+
+	"github.com/okex/exchain/libs/cosmos-sdk/baseapp"
+	"github.com/okex/exchain/libs/cosmos-sdk/client/flags"
+	"github.com/okex/exchain/libs/cosmos-sdk/store/flatkv"
+	"github.com/okex/exchain/libs/cosmos-sdk/store/iavl"
+	"github.com/okex/exchain/libs/cosmos-sdk/store/mpt"
+	mpttypes "github.com/okex/exchain/libs/cosmos-sdk/store/mpt/types"
+	sdkstoretypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
+	storetypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
+	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
+	tmiavl "github.com/okex/exchain/libs/iavl"
+	"github.com/okex/exchain/libs/system"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	cmn "github.com/okex/exchain/libs/tendermint/libs/os"
+	"github.com/okex/exchain/libs/tendermint/state"
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	evmtypes "github.com/okex/exchain/x/evm/types"
 )
 
 // exchain full-node start flags
 const (
 	FlagListenAddr         = "rest.laddr"
-	FlagExternalListenAddr = "rest.external_laddr"
 	FlagUlockKey           = "rest.unlock_key"
 	FlagUlockKeyHome       = "rest.unlock_key_home"
 	FlagRestPathPrefix     = "rest.path_prefix"
 	FlagCORS               = "cors"
 	FlagMaxOpenConnections = "max-open"
 	FlagHookstartInProcess = "startInProcess"
-	FlagWebsocket          = "wsport"
 	FlagWsMaxConnections   = "ws.max_connections"
 	FlagWsSubChannelLength = "ws.sub_channel_length"
-
-	// plugin flags
-	FlagBackendEnableBackend       = "backend.enable_backend"
-	FlagBackendEnableMktCompute    = "backend.enable_mkt_compute"
-	FlagBackendLogSQL              = "backend.log_sql"
-	FlagBackendCleanUpsTime        = "backend.clean_ups_time"
-	FlagBacekendOrmEngineType      = "backend.orm_engine.engine_type"
-	FlagBackendOrmEngineConnectStr = "backend.orm_engine.connect_str"
-
-	FlagStreamEngine                        = "stream.engine"
-	FlagStreamKlineQueryConnect             = "stream.klines_query_connect"
-	FlagStreamWorkerId                      = "stream.worker_id"
-	FlagStreamRedisScheduler                = "stream.redis_scheduler"
-	FlagStreamRedisLock                     = "stream.redis_lock"
-	FlagStreamLocalLockDir                  = "stream.local_lock_dir"
-	FlagStreamCacheQueueCapacity            = "stream.cache_queue_capacity"
-	FlagStreamMarketTopic                   = "stream.market_topic"
-	FlagStreamMarketPartition               = "stream.market_partition"
-	FlagStreamMarketServiceEnable           = "stream.market_service_enable"
-	FlagStreamMarketNacosUrls               = "stream.market_nacos_urls"
-	FlagStreamMarketNacosNamespaceId        = "stream.market_nacos_namespace_id"
-	FlagStreamMarketNacosClusters           = "stream.market_nacos_clusters"
-	FlagStreamMarketNacosServiceName        = "stream.market_nacos_service_name"
-	FlagStreamMarketNacosGroupName          = "stream.market_nacos_group_name"
-	FlagStreamMarketEurekaName              = "stream.market_eureka_name"
-	FlagStreamEurekaServerUrl               = "stream.eureka_server_url"
-	FlagStreamRestApplicationName           = "stream.rest_application_name"
-	FlagStreamRestNacosUrls                 = "stream.rest_nacos_urls"
-	FlagStreamRestNacosNamespaceId          = "stream.rest_nacos_namespace_id"
-	FlagStreamPushservicePulsarPublicTopic  = "stream.pushservice_pulsar_public_topic"
-	FlagStreamPushservicePulsarPrivateTopic = "stream.pushservice_pulsar_private_topic"
-	FlagStreamPushservicePulsarDepthTopic   = "stream.pushservice_pulsar_depth_topic"
-	FlagStreamRedisRequirePass              = "stream.redis_require_pass"
-)
-
-const (
-	// 3 seconds for default timeout commit
-	defaultTimeoutCommit = 3
 )
 
 var (
-	backendConf = config.DefaultConfig().BackendConfig
-	streamConf  = config.DefaultConfig().StreamConfig
+	ChainID = "exchain-66"
 )
 
 //module hook
@@ -88,7 +61,7 @@ func InstallHookEx(flag string, hooker fnHookstartInProcess) {
 	gSrvHookTable.hookTable[flag] = hooker
 }
 
-//call hooker function
+// call hooker function
 func callHooker(flag string, args ...interface{}) error {
 	params := make([]interface{}, 0)
 	switch flag {
@@ -182,98 +155,167 @@ func Stop() {
 	sem.done <- struct{}{}
 }
 
-// registerRestServerFlags registers the flags required for rest server
-func registerRestServerFlags(cmd *cobra.Command) *cobra.Command {
-	cmd.Flags().String(FlagListenAddr, "tcp://0.0.0.0:26659", "The address for the rest-server to listen on. (0.0.0.0:0 means any interface, any port)")
+// RegisterServerFlags registers the flags required for rest server
+func RegisterServerFlags(cmd *cobra.Command) *cobra.Command {
+	// core flags for the ABCI application
+	cmd.Flags().String(flagAddress, "tcp://0.0.0.0:26658", "Listen address")
+	cmd.Flags().String(flagTraceStore, "", "Enable KVStore tracing to an output file")
+	cmd.Flags().Bool(FlagTrace, false, "Provide full stack traces for errors in ABCI Log")
+	cmd.Flags().String(
+		FlagMinGasPrices, "",
+		"Minimum gas prices to accept for transactions; Any fee in a tx must meet this minimum (e.g. 0.01photino;0.0001stake)",
+	)
+	cmd.Flags().IntSlice(FlagUnsafeSkipUpgrades, []int{}, "Skip a set of upgrade heights to continue the old binary")
+	cmd.Flags().Uint64(FlagHaltHeight, 0, "Block height at which to gracefully halt the chain and shutdown the node")
+	cmd.Flags().Uint64(FlagHaltTime, 0, "Minimum block time (in Unix seconds) at which to gracefully halt the chain and shutdown the node")
+	cmd.Flags().Bool(FlagInterBlockCache, true, "Enable inter-block caching")
+	cmd.Flags().String(flagCPUProfile, "", "Enable CPU profiling and write to the provided file")
+
+	cmd.Flags().String(FlagPruning, storetypes.PruningOptionEverything, "Pruning strategy (default|nothing|everything|custom)")
+	cmd.Flags().Uint64(FlagPruningKeepRecent, 0, "Number of recent heights to keep on disk (ignored if pruning is not 'custom')")
+	cmd.Flags().Uint64(FlagPruningKeepEvery, 0, "Offset heights to keep on disk after 'keep-every' (ignored if pruning is not 'custom')")
+	cmd.Flags().Uint64(FlagPruningInterval, 0, "Height interval at which pruned heights are removed from disk (ignored if pruning is not 'custom')")
+	cmd.Flags().Uint64(FlagPruningMaxWsNum, 0, "Max number of historic states to keep on disk (ignored if pruning is not 'custom')")
+	cmd.Flags().String(FlagLocalRpcPort, "", "Local rpc port for mempool and block monitor on cosmos layer(ignored if mempool/block monitoring is not required)")
+	cmd.Flags().String(FlagPortMonitor, "", "Local target ports for connecting number monitoring(ignored if connecting number monitoring is not required)")
+	cmd.Flags().String(FlagEvmImportMode, "default", "Select import mode for evm state (default|files|db)")
+	cmd.Flags().String(FlagEvmImportPath, "", "Evm contract & storage db or files used for InitGenesis")
+	cmd.Flags().Uint64(FlagGoroutineNum, 0, "Limit on the number of goroutines used to import evm data(ignored if evm-import-mode is 'default')")
+
+	cmd.Flags().Bool(tmtypes.FlagDownloadDDS, false, "Download delta")
+	cmd.Flags().Bool(tmtypes.FlagUploadDDS, false, "Upload delta")
+	cmd.Flags().Bool(tmtypes.FlagAppendPid, false, "Append pid to the identity of delta producer")
+	cmd.Flags().String(tmtypes.FlagRedisUrl, "localhost:6379", "redis url")
+	cmd.Flags().String(tmtypes.FlagRedisAuth, "", "redis auth")
+	cmd.Flags().Int(tmtypes.FlagRedisExpire, 300, "delta expiration time. unit is second")
+	cmd.Flags().Int(tmtypes.FlagRedisDB, 0, "delta db num")
+	cmd.Flags().Int(tmtypes.FlagDDSCompressType, 0, "delta compress type. 0|1|2|3")
+	cmd.Flags().Int(tmtypes.FlagDDSCompressFlag, 0, "delta compress flag. 0|1|2")
+	cmd.Flags().Int(tmtypes.FlagBufferSize, 10, "delta buffer size")
+	cmd.Flags().String(FlagLogServerUrl, "", "log server url")
+	cmd.Flags().Int(tmtypes.FlagDeltaVersion, tmtypes.DeltaVersion, "Specify delta version")
+	cmd.Flags().Int(tmtypes.FlagBlockCompressType, 0, "block compress type. 0|1|2|3")
+	cmd.Flags().Int(tmtypes.FlagBlockCompressFlag, 0, "block compress flag. 0|1|2")
+	cmd.Flags().Int(tmtypes.FlagBlockCompressThreshold, 1024000, "Compress only if block size exceeds the threshold.")
+	cmd.Flags().Bool(FlagActiveViewChange, false, "Enable active view change")
+
+	cmd.Flags().Int(iavl.FlagIavlCacheSize, 10000000, "Max size of iavl cache")
+	cmd.Flags().Float64(tmiavl.FlagIavlCacheInitRatio, 1, "iavl cache init ratio, 0.0~1.0, default is 0, iavl cache map would be init with (cache size * init ratio)")
+	cmd.Flags().Bool(tmiavl.FlagIavlCommitAsyncNoBatch, false, "experimental: iavl commit async without batch")
+	cmd.Flags().StringToInt(tmiavl.FlagOutputModules, map[string]int{"evm": 1, "acc": 1}, "decide which module in iavl to be printed")
+	cmd.Flags().Int64(tmiavl.FlagIavlCommitIntervalHeight, 100, "Max interval to commit node cache into leveldb")
+	cmd.Flags().Int64(tmiavl.FlagIavlMinCommitItemCount, 1000000, "Min nodes num to triggle node cache commit")
+	cmd.Flags().Int(tmiavl.FlagIavlHeightOrphansCacheSize, 8, "Max orphan version to cache in memory")
+	cmd.Flags().Int(tmiavl.FlagIavlMaxCommittedHeightNum, 30, "Max committed version to cache in memory")
+	cmd.Flags().Bool(tmiavl.FlagIavlEnableAsyncCommit, true, "Enable async commit")
+	cmd.Flags().Bool(tmiavl.FlagIavlDiscardFastStorage, false, "Discard fast storage")
+	cmd.Flags().MarkHidden(tmiavl.FlagIavlDiscardFastStorage)
+	cmd.Flags().Bool(tmiavl.FlagIavlEnableFastStorage, false, "Enable fast storage")
+	cmd.Flags().MarkHidden(tmiavl.FlagIavlEnableFastStorage)
+	cmd.Flags().Int(tmiavl.FlagIavlFastStorageCacheSize, tmiavl.DefaultIavlFastStorageCacheSize, "Max size of iavl fast storage cache")
+	cmd.Flags().Bool(abci.FlagDisableABCIQueryMutex, true, "Disable local client query mutex for better concurrency")
+	cmd.Flags().Bool(abci.FlagDisableCheckTx, false, "Disable checkTx for test")
+	cmd.Flags().Bool(sdkstoretypes.FlagLoadVersionAsync, false, "Enable async for each kvstore to load version")
+	cmd.Flags().MarkHidden(abci.FlagDisableCheckTx)
+	cmd.Flags().Bool(abci.FlagCloseMutex, false, fmt.Sprintf("Deprecated in v0.19.13 version, use --%s instead.", abci.FlagDisableABCIQueryMutex))
+	cmd.Flags().MarkHidden(abci.FlagCloseMutex)
+	cmd.Flags().Bool(FlagExportKeystore, false, "export keystore file when call newaccount ")
+	cmd.Flags().Bool(system.FlagEnableGid, false, "Display goroutine id in log")
+	cmd.Flags().Int(FlagBlockPartSizeBytes, 65536, "Size of one block part by byte")
+	cmd.Flags().Int(state.FlagApplyBlockPprofTime, -1, "time(ms) of executing ApplyBlock, if it is higher than this value, save pprof")
+
+	cmd.Flags().Float64Var(&baseapp.GasUsedFactor, baseapp.FlagGasUsedFactor, 0.4, "factor to calculate history gas used")
+
+	cmd.Flags().Bool(sdk.FlagMultiCache, false, "Enable multi cache")
+	cmd.Flags().MarkHidden(sdk.FlagMultiCache)
+	cmd.Flags().Int(sdk.MaxAccInMultiCache, 0, "max acc in multi cache")
+	cmd.Flags().Int(sdk.MaxStorageInMultiCache, 0, "max storage in multi cache")
+	cmd.Flags().Bool(flatkv.FlagEnable, false, "Enable flat kv storage for read performance")
+
+	cmd.Flags().Bool(FlagEventBlockTime, false, "Enable to publish event of latest block time")
+
+	// Don`t use cmd.Flags().*Var functions(such as cmd.Flags.IntVar) here, because it doesn't work with environment variables.
+	// Use setExternalPackageValue function instead.
+	viper.BindPFlag(FlagTrace, cmd.Flags().Lookup(FlagTrace))
+	viper.BindPFlag(FlagPruning, cmd.Flags().Lookup(FlagPruning))
+	viper.BindPFlag(FlagPruningKeepRecent, cmd.Flags().Lookup(FlagPruningKeepRecent))
+	viper.BindPFlag(FlagPruningKeepEvery, cmd.Flags().Lookup(FlagPruningKeepEvery))
+	viper.BindPFlag(FlagPruningInterval, cmd.Flags().Lookup(FlagPruningInterval))
+	viper.BindPFlag(FlagPruningMaxWsNum, cmd.Flags().Lookup(FlagPruningMaxWsNum))
+	viper.BindPFlag(FlagLocalRpcPort, cmd.Flags().Lookup(FlagLocalRpcPort))
+	viper.BindPFlag(FlagPortMonitor, cmd.Flags().Lookup(FlagPortMonitor))
+	viper.BindPFlag(FlagEvmImportMode, cmd.Flags().Lookup(FlagEvmImportMode))
+	viper.BindPFlag(FlagEvmImportPath, cmd.Flags().Lookup(FlagEvmImportPath))
+	viper.BindPFlag(FlagGoroutineNum, cmd.Flags().Lookup(FlagGoroutineNum))
+	viper.BindPFlag(FlagStartFromSnapshot, cmd.Flags().Lookup(FlagStartFromSnapshot))
+
+	cmd.Flags().Int(state.FlagDeliverTxsExecMode, 0, "Execution mode for deliver txs, (0:serial[default], 1:deprecated, 2:parallel)")
+	cmd.Flags().Bool(state.FlagEnableConcurrency, false, "Enable concurrency for deliver txs")
+
+	cmd.Flags().String(FlagListenAddr, "tcp://0.0.0.0:26659", "EVM RPC and cosmos-sdk REST API listen address.")
 	cmd.Flags().String(FlagUlockKey, "", "Select the keys to unlock on the RPC server")
 	cmd.Flags().String(FlagUlockKeyHome, os.ExpandEnv("$HOME/.exchaincli"), "The keybase home path")
 	cmd.Flags().String(FlagRestPathPrefix, "exchain", "Path prefix for registering rest api route.")
 	cmd.Flags().String(flags.FlagKeyringBackend, flags.DefaultKeyringBackend, "Select keyring's backend (os|file|test)")
 	cmd.Flags().String(FlagCORS, "", "Set the rest-server domains that can make CORS requests (* for all)")
 	cmd.Flags().Int(FlagMaxOpenConnections, 1000, "The number of maximum open connections of rest-server")
-	cmd.Flags().String(FlagExternalListenAddr, "127.0.0.1:26659", "Set the rest-server external ip and port, when it is launched by Docker")
-	cmd.Flags().String(FlagWebsocket, "8546", "websocket port to listen to")
+	cmd.Flags().Int64(flags.FlagMaxBodyBytes, flags.DefaultMaxBodyBytes, "The RPC maximum size of request body, in bytes")
 	cmd.Flags().Int(FlagWsMaxConnections, 20000, "the max capacity number of websocket client connections")
 	cmd.Flags().Int(FlagWsSubChannelLength, 100, "the length of subscription channel")
-	cmd.Flags().String(flags.FlagChainID, "", "Chain ID of tendermint node for web3")
+	cmd.Flags().String(flags.FlagChainID, ChainID, "Chain ID of tendermint node for web3")
 	cmd.Flags().StringP(flags.FlagBroadcastMode, "b", flags.BroadcastSync, "Transaction broadcasting mode (sync|async|block) for web3")
+
+	cmd.Flags().UintVar(&mpttypes.TrieRocksdbBatchSize, mpttypes.FlagTrieRocksdbBatchSize, 10, "Concurrent rocksdb batch size for mpt")
+	cmd.Flags().BoolVar(&mpt.TrieWriteAhead, mpt.FlagTrieWriteAhead, false, "Enable double write data (acc & evm) to the MPT tree when using the IAVL tree")
+	cmd.Flags().BoolVar(&mpt.TrieDirtyDisabled, mpt.FlagTrieDirtyDisabled, false, "Disable cache dirty trie nodes")
+	cmd.Flags().UintVar(&mpt.TrieCacheSize, mpt.FlagTrieCacheSize, 2048, "Size (MB) to cache trie nodes")
+	cmd.Flags().UintVar(&mpt.TrieNodesLimit, mpt.FlagTrieNodesLimit, 256, "Max node size (MB) cached in triedb")
+	cmd.Flags().UintVar(&mpt.TrieImgsLimit, mpt.FlagTrieImgsLimit, 4, "Max img size (MB) cached in triedb")
+	cmd.Flags().UintVar(&mpt.TrieAccStoreCache, mpt.FlagTrieAccStoreCache, 32, "Size (MB) to cache account")
+	cmd.Flags().BoolVar(&evmtypes.TrieUseCompositeKey, evmtypes.FlagTrieUseCompositeKey, false, "Use composite key to store contract state in mpt")
+	cmd.Flags().Int64(FlagCommitGapHeight, 100, "Block interval to commit cached data into db, affects iavl & mpt")
+
+	cmd.Flags().Int64(FlagFastSyncGap, 20, "Block height interval to switch fast-sync mode")
+	cmd.Flags().String(FlagStartFromSnapshot, "", "Snapshot URL which uses to start node")
+	cmd.Flags().MarkHidden(FlagStartFromSnapshot)
+
 	return cmd
 }
 
-// registerExChainPluginFlags registers the flags required for rest server
-func registerExChainPluginFlags(cmd *cobra.Command) *cobra.Command {
-	cmd.Flags().Bool(FlagBackendEnableBackend, backendConf.EnableBackend, "Enable the node's backend plugin")
-	cmd.Flags().MarkHidden(FlagBackendEnableBackend)
-	cmd.Flags().Bool(FlagBackendEnableMktCompute, backendConf.EnableMktCompute, "Enable kline and ticker calculating")
-	cmd.Flags().MarkHidden(FlagBackendEnableMktCompute)
-	cmd.Flags().Bool(FlagBackendLogSQL, backendConf.LogSQL, "Enable backend plugin logging sql feature")
-	cmd.Flags().MarkHidden(FlagBackendLogSQL)
-	cmd.Flags().String(FlagBackendCleanUpsTime, backendConf.CleanUpsTime, "Backend plugin`s time of cleaning up kline data")
-	cmd.Flags().MarkHidden(FlagBackendCleanUpsTime)
-	cmd.Flags().String(FlagBacekendOrmEngineType, backendConf.OrmEngine.EngineType, "Backend plugin`s db (mysql or sqlite3)")
-	cmd.Flags().MarkHidden(FlagBacekendOrmEngineType)
-	cmd.Flags().String(FlagBackendOrmEngineConnectStr, backendConf.OrmEngine.ConnectStr, "Backend plugin`s db connect address")
-	cmd.Flags().MarkHidden(FlagBackendOrmEngineConnectStr)
+func nodeModeCmd(ctx *Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "node-mode",
+		Short: "exchaind start --node-mode help info",
+		Long: `There are three node modes that can be set when the exchaind start
+set --node-mode=rpc to manage the following flags:
+	--disable-checktx-mutex=true
+	--disable-query-mutex=true
+	--enable-bloom-filter=true
+	--fast-lru=10000
+	--fast-query=true
+	--iavl-enable-async-commit=true
+	--max-open=20000
+	--mempool.enable_pending_pool=true
+	--cors=*
 
-	cmd.Flags().String(FlagStreamEngine, streamConf.Engine, "Stream plugin`s engine config")
-	cmd.Flags().MarkHidden(FlagStreamEngine)
-	cmd.Flags().String(FlagStreamKlineQueryConnect, streamConf.KlineQueryConnect, "Stream plugin`s kiline query connect url")
-	cmd.Flags().MarkHidden(FlagStreamKlineQueryConnect)
+set --node-mode=validator to manage the following flags:
+	--disable-checktx-mutex=true
+	--disable-query-mutex=true
+	--dynamic-gp-mode=2
+	--iavl-enable-async-commit=true
+	--iavl-cache-size=10000000
+	--pruning=everything
 
-	// distr-lock flags
-	cmd.Flags().String(FlagStreamWorkerId, streamConf.WorkerId, "Stream plugin`s worker id")
-	cmd.Flags().MarkHidden(FlagStreamWorkerId)
-	cmd.Flags().String(FlagStreamRedisScheduler, streamConf.RedisScheduler, "Stream plugin`s redis url for scheduler job")
-	cmd.Flags().MarkHidden(FlagStreamRedisScheduler)
-	cmd.Flags().String(FlagStreamRedisLock, streamConf.RedisLock, "Stream plugin`s redis url for distributed lock")
-	cmd.Flags().MarkHidden(FlagStreamRedisLock)
-	cmd.Flags().String(FlagStreamLocalLockDir, streamConf.LocalLockDir, "Stream plugin`s local lock dir")
-	cmd.Flags().MarkHidden(FlagStreamLocalLockDir)
-	cmd.Flags().Int(FlagStreamCacheQueueCapacity, streamConf.CacheQueueCapacity, "Stream plugin`s cache queue capacity config")
-	cmd.Flags().MarkHidden(FlagStreamCacheQueueCapacity)
-
-	// kafka/pulsar service flags
-	cmd.Flags().String(FlagStreamMarketTopic, streamConf.MarketTopic, "Stream plugin`s pulsar/kafka topic for market quotation")
-	cmd.Flags().MarkHidden(FlagStreamMarketTopic)
-	cmd.Flags().Int(FlagStreamMarketPartition, streamConf.MarketPartition, "Stream plugin`s pulsar/kafka partition for market quotation")
-	cmd.Flags().MarkHidden(FlagStreamMarketPartition)
-
-	// market service flags for nacos config
-	cmd.Flags().Bool(FlagStreamMarketServiceEnable, streamConf.MarketServiceEnable, "Stream plugin`s market service enable config")
-	cmd.Flags().MarkHidden(FlagStreamMarketServiceEnable)
-	cmd.Flags().String(FlagStreamMarketNacosUrls, streamConf.MarketNacosUrls, "Stream plugin`s nacos server urls for getting market service info")
-	cmd.Flags().MarkHidden(FlagStreamMarketNacosUrls)
-	cmd.Flags().String(FlagStreamMarketNacosNamespaceId, streamConf.MarketNacosNamespaceId, "Stream plugin`s nacos name space id for getting market service info")
-	cmd.Flags().MarkHidden(FlagStreamMarketNacosNamespaceId)
-	cmd.Flags().StringArray(FlagStreamMarketNacosClusters, streamConf.MarketNacosClusters, "Stream plugin`s nacos clusters array list for getting market service info")
-	cmd.Flags().MarkHidden(FlagStreamMarketNacosClusters)
-	cmd.Flags().String(FlagStreamMarketNacosServiceName, streamConf.MarketNacosServiceName, "Stream plugin`s nacos service name for getting market service info")
-	cmd.Flags().MarkHidden(FlagStreamMarketNacosServiceName)
-	cmd.Flags().String(FlagStreamMarketNacosGroupName, streamConf.MarketNacosGroupName, "Stream plugin`s nacos group name for getting market service info")
-	cmd.Flags().MarkHidden(FlagStreamMarketNacosGroupName)
-
-	// market service flags for eureka config
-	cmd.Flags().String(FlagStreamMarketEurekaName, streamConf.MarketEurekaName, "Stream plugin`s market service name in eureka")
-	cmd.Flags().MarkHidden(FlagStreamMarketEurekaName)
-	cmd.Flags().String(FlagStreamEurekaServerUrl, streamConf.EurekaServerUrl, "Eureka server url for discovery service of rest api")
-	cmd.Flags().MarkHidden(FlagStreamEurekaServerUrl)
-
-	// restful service flags
-	cmd.Flags().String(FlagStreamRestApplicationName, streamConf.RestApplicationName, "Stream plugin`s rest application name in eureka or nacos")
-	cmd.Flags().MarkHidden(FlagStreamRestApplicationName)
-	cmd.Flags().String(FlagStreamRestNacosUrls, streamConf.RestNacosUrls, "Stream plugin`s nacos server urls for discovery service of rest api")
-	cmd.Flags().MarkHidden(FlagStreamRestNacosUrls)
-	cmd.Flags().String(FlagStreamRestNacosNamespaceId, streamConf.RestNacosNamespaceId, "Stream plugin`s nacos namepace id for discovery service of rest api")
-	cmd.Flags().MarkHidden(FlagStreamRestNacosNamespaceId)
-
-	// push service flags
-	cmd.Flags().String(FlagStreamPushservicePulsarPublicTopic, streamConf.PushservicePulsarPublicTopic, "Stream plugin`s pulsar public topic of push service")
-	cmd.Flags().MarkHidden(FlagStreamPushservicePulsarPublicTopic)
-	cmd.Flags().String(FlagStreamPushservicePulsarPrivateTopic, streamConf.PushservicePulsarPrivateTopic, "Stream plugin`s pulsar private topic of push service")
-	cmd.Flags().MarkHidden(FlagStreamPushservicePulsarPrivateTopic)
-	cmd.Flags().String(FlagStreamPushservicePulsarDepthTopic, streamConf.PushservicePulsarDepthTopic, "Stream plugin`s pulsar depth topic of push service")
-	cmd.Flags().MarkHidden(FlagStreamPushservicePulsarDepthTopic)
-	cmd.Flags().String(FlagStreamRedisRequirePass, streamConf.RedisRequirePass, "Stream plugin`s redis require pass")
-	cmd.Flags().MarkHidden(FlagStreamRedisRequirePass)
+set --node-mode=archive to manage the following flags:
+	--pruning=nothing
+	--disable-checktx-mutex=true
+	--disable-query-mutex=true
+	--enable-bloom-filter=true
+	--iavl-enable-async-commit=true
+	--max-open=20000
+	--cors=*`,
+		Run: func(cmd *cobra.Command, args []string) {
+		},
+	}
 	return cmd
 }

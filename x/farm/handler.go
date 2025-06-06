@@ -13,10 +13,12 @@ import (
 	"github.com/okex/exchain/x/farm/types"
 )
 
+var destroyPoolHandler func(ctx sdk.Context, k keeper.Keeper, msg types.MsgDestroyPool) (*sdk.Result, error) = handleMsgDestroyPool
+
 // NewHandler creates an sdk.Handler for all the farm type messages
 func NewHandler(k keeper.Keeper) sdk.Handler {
 	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
-		ctx = ctx.WithEventManager(sdk.NewEventManager())
+		ctx.SetEventManager(sdk.NewEventManager())
 		var handlerFun func() (*sdk.Result, error)
 		var name string
 		switch msg := msg.(type) {
@@ -28,7 +30,7 @@ func NewHandler(k keeper.Keeper) sdk.Handler {
 		case types.MsgDestroyPool:
 			name = "handleMsgDestroyPool"
 			handlerFun = func() (*sdk.Result, error) {
-				return handleMsgDestroyPool(ctx, k, msg)
+				return destroyPoolHandler(ctx, k, msg)
 			}
 		case types.MsgProvide:
 			name = "handleMsgProvide"

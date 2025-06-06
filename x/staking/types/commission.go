@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tendermint/go-amino"
+
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 )
 
@@ -66,6 +68,60 @@ func (c Commission) String() string {
 	)
 }
 
+func (c *Commission) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+	var timeUpdated bool
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("Commission : all fields type should be 2")
+		}
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("invalid data len")
+		}
+		subData = data[:dataLen]
+
+		switch pos {
+		case 1:
+			if err = c.CommissionRates.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+		case 2:
+			c.UpdateTime, _, err = amino.DecodeTime(subData)
+			if err != nil {
+				return err
+			}
+			timeUpdated = true
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	if !timeUpdated {
+		c.UpdateTime = amino.ZeroTime
+	}
+	return nil
+}
+
 // Validate performs basic sanity validation checks of initial commission parameters
 // If validation fails, an SDK error is returned
 func (c CommissionRates) Validate() sdk.Error {
@@ -114,10 +170,63 @@ func (c Commission) ValidateNewRate(newRate sdk.Dec, blockTime time.Time) sdk.Er
 		// new rate cannot be greater than the max rate
 		return ErrCommissionGTMaxRate()
 
-	case newRate.Sub(c.Rate).GT(c.MaxChangeRate):
-		// new rate % points change cannot be greater than the max change rate
-		return ErrCommissionGTMaxChangeRate()
+		//MaxChangeRate is 0,ignore it
+		//case newRate.Sub(c.Rate).GT(c.MaxChangeRate):
+		//	// new rate % points change cannot be greater than the max change rate
+		//	return ErrCommissionGTMaxChangeRate()
 	}
 
+	return nil
+}
+
+func (c *CommissionRates) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("CommissionRatestype : all fields type should be 2")
+		}
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("invalid data len")
+		}
+		subData = data[:dataLen]
+
+		switch pos {
+		case 1:
+			if err = c.Rate.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+		case 2:
+			if err = c.MaxRate.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+		case 3:
+			if err = c.MaxChangeRate.UnmarshalFromAmino(cdc, subData); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
 	return nil
 }

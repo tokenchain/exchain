@@ -2,6 +2,8 @@ package conn
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"runtime/debug"
 
 	"fmt"
@@ -47,8 +49,26 @@ const (
 	defaultPongTimeout         = 45 * time.Second
 )
 
+type logData struct {
+	Params [6]interface{}
+	Bytes  bytesHexStringer
+	Packet PacketMsg
+}
+
+var logDataPool = &sync.Pool{
+	New: func() interface{} {
+		return &logData{}
+	},
+}
+
 type receiveCbFunc func(chID byte, msgBytes []byte)
 type errorCbFunc func(interface{})
+
+type bytesHexStringer []byte
+
+func (b bytesHexStringer) String() string {
+	return fmt.Sprintf("%X", []byte(b))
+}
 
 /*
 Each peer has one `MConnection` (multiplex connection) instance.
@@ -62,6 +82,7 @@ The byte id and the relative priorities of each `Channel` are configured upon
 initialization of the connection.
 
 There are two methods for sending messages:
+
 	func (m MConnection) Send(chID byte, msgBytes []byte) bool {}
 	func (m MConnection) TrySend(chID byte, msgBytes []byte}) bool {}
 
@@ -344,13 +365,28 @@ func (c *MConnection) stopForError(r interface{}) {
 	}
 }
 
+func (c *MConnection) logSendData(msg string, chID byte, msgBytes []byte) {
+	logParams := logDataPool.Get().(*logData)
+	logParams.Bytes = msgBytes
+	params := &logParams.Params
+	params[0] = "channel"
+	params[1] = chID
+	params[2] = "conn"
+	params[3] = c
+	params[4] = "msgBytes"
+	params[5] = &logParams.Bytes
+
+	c.Logger.Debug(msg, logParams.Params[:]...)
+	logDataPool.Put(logParams)
+}
+
 // Queues a message to be sent to channel.
 func (c *MConnection) Send(chID byte, msgBytes []byte) bool {
 	if !c.IsRunning() {
 		return false
 	}
 
-	c.Logger.Debug("Send", "channel", chID, "conn", c, "msgBytes", fmt.Sprintf("%X", msgBytes))
+	c.logSendData("Send", chID, msgBytes)
 
 	// Send message to channel.
 	channel, ok := c.channelsIdx[chID]
@@ -367,7 +403,7 @@ func (c *MConnection) Send(chID byte, msgBytes []byte) bool {
 		default:
 		}
 	} else {
-		c.Logger.Debug("Send failed", "channel", chID, "conn", c, "msgBytes", fmt.Sprintf("%X", msgBytes))
+		c.logSendData("Send failed", chID, msgBytes)
 	}
 	return success
 }
@@ -435,7 +471,10 @@ FOR_LOOP:
 			}
 		case <-c.pingTimer.C:
 			c.Logger.Debug("Send Ping")
-			_n, err = cdc.MarshalBinaryLengthPrefixedWriter(c.bufConnWriter, PacketPing{})
+			_n, err = cdc.MarshalBinaryLengthPrefixedWriterWithRegiteredMarshaller(c.bufConnWriter, PacketPing{})
+			if err != nil {
+				_n, err = cdc.MarshalBinaryLengthPrefixedWriter(c.bufConnWriter, PacketPing{})
+			}
 			if err != nil {
 				break SELECTION
 			}
@@ -457,7 +496,10 @@ FOR_LOOP:
 			}
 		case <-c.pong:
 			c.Logger.Debug("Send Pong")
-			_n, err = cdc.MarshalBinaryLengthPrefixedWriter(c.bufConnWriter, PacketPong{})
+			_n, err = cdc.MarshalBinaryLengthPrefixedWriterWithRegiteredMarshaller(c.bufConnWriter, PacketPong{})
+			if err != nil {
+				_n, err = cdc.MarshalBinaryLengthPrefixedWriter(c.bufConnWriter, PacketPong{})
+			}
 			if err != nil {
 				break SELECTION
 			}
@@ -553,6 +595,7 @@ func (c *MConnection) sendPacketMsg() bool {
 func (c *MConnection) recvRoutine() {
 	defer c._recover()
 
+	var packetMsg PacketMsg
 FOR_LOOP:
 	for {
 		// Block until .recvMonitor says we can read.
@@ -576,7 +619,8 @@ FOR_LOOP:
 		var packet Packet
 		var _n int64
 		var err error
-		_n, err = cdc.UnmarshalBinaryLengthPrefixedReader(c.bufConnReader, &packet, int64(c._maxPacketMsgSize))
+		// _n, err = cdc.UnmarshalBinaryLengthPrefixedReader(c.bufConnReader, &packet, int64(c._maxPacketMsgSize))
+		packet, _n, err = unmarshalPacketFromAminoReader(c.bufConnReader, int64(c._maxPacketMsgSize), &packetMsg)
 		c.recvMonitor.Update(int(_n))
 
 		if err != nil {
@@ -617,7 +661,7 @@ FOR_LOOP:
 			default:
 				// never block
 			}
-		case PacketMsg:
+		case *PacketMsg:
 			channel, ok := c.channelsIdx[pkt.ChannelID]
 			if !ok || channel == nil {
 				err := fmt.Errorf("unknown channel %X", pkt.ChannelID)
@@ -626,7 +670,7 @@ FOR_LOOP:
 				break FOR_LOOP
 			}
 
-			msgBytes, err := channel.recvPacketMsg(pkt)
+			msgBytes, err := channel.recvPacketMsg(*pkt)
 			if err != nil {
 				if c.IsRunning() {
 					c.Logger.Error("Connection failed @ recvRoutine", "conn", c, "err", err)
@@ -635,7 +679,7 @@ FOR_LOOP:
 				break FOR_LOOP
 			}
 			if msgBytes != nil {
-				c.Logger.Debug("Received bytes", "chID", pkt.ChannelID, "msgBytes", fmt.Sprintf("%X", msgBytes))
+				c.logReceiveMsg(pkt.ChannelID, msgBytes)
 				// NOTE: This means the reactor.Receive runs in the same thread as the p2p recv routine
 				c.onReceive(pkt.ChannelID, msgBytes)
 			}
@@ -652,6 +696,18 @@ FOR_LOOP:
 	for range c.pong {
 		// Drain
 	}
+}
+
+func (c *MConnection) logReceiveMsg(channelID byte, msgBytes []byte) {
+	logParams := logDataPool.Get().(*logData)
+	logParams.Bytes = msgBytes
+	params := &logParams.Params
+	params[0] = "chID"
+	params[1] = channelID
+	params[2] = "msgBytes"
+	params[3] = &logParams.Bytes
+	c.Logger.Debug("Received bytes", logParams.Params[:4]...)
+	logDataPool.Put(logParams)
 }
 
 // not goroutine-safe
@@ -763,15 +819,31 @@ func (ch *Channel) SetLogger(l log.Logger) {
 	ch.Logger = l
 }
 
+var sendTimerPool = &sync.Pool{
+	New: func() interface{} {
+		return time.NewTimer(defaultSendTimeout)
+	},
+}
+
 // Queues message to send to this channel.
 // Goroutine-safe
 // Times out (and returns false) after defaultSendTimeout
 func (ch *Channel) sendBytes(bytes []byte) bool {
+	sendTimer := sendTimerPool.Get().(*time.Timer)
+	if !sendTimer.Stop() {
+		select {
+		case <-sendTimer.C:
+		default:
+		}
+	}
+	sendTimer.Reset(defaultSendTimeout)
 	select {
 	case ch.sendQueue <- bytes:
+		sendTimerPool.Put(sendTimer)
 		atomic.AddInt32(&ch.sendQueueSize, 1)
 		return true
-	case <-time.After(defaultSendTimeout):
+	case <-sendTimer.C:
+		sendTimerPool.Put(sendTimer)
 		return false
 	}
 }
@@ -831,20 +903,66 @@ func (ch *Channel) nextPacketMsg() PacketMsg {
 	return packet
 }
 
+var packetBzSendPool = &sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
 // Writes next PacketMsg to w and updates c.recentlySent.
 // Not goroutine-safe
 func (ch *Channel) writePacketMsgTo(w io.Writer) (n int64, err error) {
 	var packet = ch.nextPacketMsg()
-	n, err = cdc.MarshalBinaryLengthPrefixedWriter(w, packet)
+
+	packetMsgTypePrefix := getPacketMsgAminoTypePrefix()
+	bzSize := len(packetMsgTypePrefix) + packet.AminoSize(cdc)
+	bzSizeWithLenPrefix := amino.UvarintSize(uint64(bzSize)) + bzSize
+
+	// var buf = bytes.NewBuffer(make([]byte, 0, bzSizeWithLenPrefix))
+	buf := packetBzSendPool.Get().(*bytes.Buffer)
+	defer packetBzSendPool.Put(buf)
+	buf.Reset()
+	buf.Grow(bzSizeWithLenPrefix)
+
+	err = amino.EncodeUvarintToBuffer(buf, uint64(bzSize))
+	if err == nil {
+		buf.Write(packetMsgTypePrefix)
+		err = packet.MarshalAminoTo(cdc, buf)
+		if err == nil && buf.Len() == bzSizeWithLenPrefix {
+			bzNum := 0
+			bzNum, err = w.Write(buf.Bytes())
+			n = int64(bzNum)
+			atomic.AddInt64(&ch.recentlySent, n)
+			return
+		}
+	}
+
+	n, err = cdc.MarshalBinaryLengthPrefixedWriterWithRegiteredMarshaller(w, packet)
+	if err != nil {
+		n, err = cdc.MarshalBinaryLengthPrefixedWriter(w, packet)
+	}
 	atomic.AddInt64(&ch.recentlySent, n)
 	return
+}
+
+func (ch *Channel) logRecvPacketMsg(packet PacketMsg) {
+	logParams := logDataPool.Get().(*logData)
+	logParams.Packet = packet
+	params := &logParams.Params
+	params[0] = "conn"
+	params[1] = ch.conn
+	params[2] = "packet"
+	params[3] = &logParams.Packet
+	ch.Logger.Debug("Read PacketMsg", logParams.Params[:4]...)
+	logDataPool.Put(logParams)
 }
 
 // Handles incoming PacketMsgs. It returns a message bytes if message is
 // complete. NOTE message bytes may change on next call to recvPacketMsg.
 // Not goroutine-safe
 func (ch *Channel) recvPacketMsg(packet PacketMsg) ([]byte, error) {
-	ch.Logger.Debug("Read PacketMsg", "conn", ch.conn, "packet", packet)
+	ch.logRecvPacketMsg(packet)
+
 	var recvCap, recvReceived = ch.desc.RecvMessageCapacity, len(ch.recving) + len(packet.Bytes)
 	if recvCap < recvReceived {
 		return nil, fmt.Errorf("received message exceeds available capacity: %v < %v", recvCap, recvReceived)
@@ -878,11 +996,50 @@ type Packet interface {
 	AssertIsPacket()
 }
 
+const (
+	PacketPingName = "tendermint/p2p/PacketPing"
+	PacketPongName = "tendermint/p2p/PacketPong"
+	PacketMsgName  = "tendermint/p2p/PacketMsg"
+)
+
 func RegisterPacket(cdc *amino.Codec) {
 	cdc.RegisterInterface((*Packet)(nil), nil)
-	cdc.RegisterConcrete(PacketPing{}, "tendermint/p2p/PacketPing", nil)
-	cdc.RegisterConcrete(PacketPong{}, "tendermint/p2p/PacketPong", nil)
-	cdc.RegisterConcrete(PacketMsg{}, "tendermint/p2p/PacketMsg", nil)
+	cdc.RegisterConcrete(PacketPing{}, PacketPingName, nil)
+	cdc.RegisterConcrete(PacketPong{}, PacketPongName, nil)
+	cdc.RegisterConcrete(&PacketMsg{}, PacketMsgName, nil)
+
+	cdc.RegisterConcreteMarshaller(PacketPingName, func(_ *amino.Codec, i interface{}) ([]byte, error) {
+		return []byte{}, nil
+	})
+	cdc.RegisterConcreteMarshaller(PacketPongName, func(_ *amino.Codec, i interface{}) ([]byte, error) {
+		return []byte{}, nil
+	})
+	cdc.RegisterConcreteMarshaller(PacketMsgName, func(codec *amino.Codec, i interface{}) ([]byte, error) {
+		if packet, ok := i.(PacketMsg); ok {
+			return packet.MarshalToAmino(codec)
+		} else if ppacket, ok := i.(*PacketMsg); ok {
+			return ppacket.MarshalToAmino(codec)
+		} else {
+			return nil, fmt.Errorf("%v must be of type %v", i, PacketMsg{})
+		}
+	})
+	cdc.RegisterConcreteUnmarshaller(PacketPingName, func(_ *amino.Codec, _ []byte) (interface{}, int, error) {
+		return PacketPing{}, 0, nil
+	})
+	cdc.RegisterConcreteUnmarshaller(PacketPongName, func(_ *amino.Codec, _ []byte) (interface{}, int, error) {
+		return PacketPong{}, 0, nil
+	})
+	cdc.RegisterConcreteUnmarshaller(PacketMsgName, func(codec *amino.Codec, data []byte) (interface{}, int, error) {
+		var msg PacketMsg
+		err := msg.UnmarshalFromAmino(codec, data)
+		if err != nil {
+			return nil, 0, err
+		} else {
+			return &msg, len(data), nil
+		}
+	})
+
+	cdc.EnableBufferMarshaler(PacketMsg{})
 }
 
 func (PacketPing) AssertIsPacket() {}
@@ -892,7 +1049,23 @@ func (PacketMsg) AssertIsPacket()  {}
 type PacketPing struct {
 }
 
+func (p *PacketPing) UnmarshalFromAmino(_ *amino.Codec, _ []byte) error {
+	return nil
+}
+
+func (PacketPing) MarshalToAmino(_ *amino.Codec) ([]byte, error) {
+	return []byte{}, nil
+}
+
 type PacketPong struct {
+}
+
+func (PacketPong) MarshalToAmino(_ *amino.Codec) ([]byte, error) {
+	return []byte{}, nil
+}
+
+func (p *PacketPong) UnmarshalFromAmino(_ *amino.Codec, _ []byte) error {
+	return nil
 }
 
 type PacketMsg struct {
@@ -903,4 +1076,247 @@ type PacketMsg struct {
 
 func (mp PacketMsg) String() string {
 	return fmt.Sprintf("PacketMsg{%X:%X T:%X}", mp.ChannelID, mp.Bytes, mp.EOF)
+}
+
+func (mp *PacketMsg) Reset() {
+	mp.ChannelID = 0
+	mp.EOF = 0
+	mp.Bytes = mp.Bytes[:0]
+}
+
+func (mp PacketMsg) AminoSize(_ *amino.Codec) int {
+	size := 0
+	if mp.ChannelID != 0 {
+		if mp.ChannelID <= 0b0111_1111 {
+			size += 2
+		} else {
+			size += 3
+		}
+	}
+
+	if mp.EOF != 0 {
+		if mp.EOF <= 0b0111_1111 {
+			size += 2
+		} else {
+			size += 3
+		}
+	}
+
+	if len(mp.Bytes) != 0 {
+		size += 1 + amino.ByteSliceSize(mp.Bytes)
+	}
+
+	return size
+}
+
+func (mp PacketMsg) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(mp.AminoSize(cdc))
+	err := mp.MarshalAminoTo(cdc, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (mp PacketMsg) MarshalAminoTo(_ *amino.Codec, buf *bytes.Buffer) error {
+	var err error
+	// field 1
+	if mp.ChannelID != 0 {
+		const pbKey = 1 << 3
+		buf.WriteByte(pbKey)
+		if mp.ChannelID <= 0b0111_1111 {
+			buf.WriteByte(mp.ChannelID)
+		} else {
+			buf.WriteByte(0b1000_0000 | (mp.ChannelID & 0x7F))
+			buf.WriteByte(mp.ChannelID >> 7)
+		}
+	}
+
+	// field 2
+	if mp.EOF != 0 {
+		const pbKey = 2 << 3
+		buf.WriteByte(pbKey)
+		if mp.EOF <= 0b0111_1111 {
+			buf.WriteByte(mp.EOF)
+		} else {
+			buf.WriteByte(0b1000_0000 | (mp.EOF & 0x7F))
+			buf.WriteByte(mp.EOF >> 7)
+		}
+	}
+
+	// field 3
+	if len(mp.Bytes) != 0 {
+		const pbKey = 3<<3 | 2
+		buf.WriteByte(pbKey)
+		err = amino.EncodeUvarintToBuffer(buf, uint64(len(mp.Bytes)))
+		if err != nil {
+			return err
+		}
+		buf.Write(mp.Bytes)
+	}
+
+	return nil
+}
+
+func (mp *PacketMsg) UnmarshalFromAmino(_ *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return errors.New("invalid data len")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			vari, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			mp.ChannelID = byte(vari)
+			dataLen = uint64(n)
+		case 2:
+			vari, n, err := amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			mp.EOF = byte(vari)
+			dataLen = uint64(n)
+		case 3:
+			if cap(mp.Bytes) >= len(subData) {
+				mp.Bytes = mp.Bytes[:len(subData)]
+			} else {
+				mp.Bytes = make([]byte, len(subData))
+			}
+			copy(mp.Bytes, subData)
+		}
+	}
+	return nil
+}
+
+var (
+	PacketPingTypePrefix = []byte{0x15, 0xC3, 0xD2, 0x89}
+	PacketPongTypePrefix = []byte{0x8A, 0x79, 0x7F, 0xE2}
+	PacketMsgTypePrefix  = []byte{0xB0, 0x5B, 0x4F, 0x2C}
+
+	packetPing Packet = PacketPing{}
+	packetPong Packet = PacketPong{}
+
+	packetBzPool = &sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+	packetLengthPrefixBzPool = &sync.Pool{
+		New: func() interface{} {
+			return &[binary.MaxVarintLen64]byte{}
+		},
+	}
+)
+
+func unmarshalPacketFromAminoReader(r io.Reader, maxSize int64, targetMsg *PacketMsg) (packet Packet, n int64, err error) {
+	if maxSize < 0 {
+		panic("maxSize cannot be negative.")
+	}
+
+	// Read byte-length prefix.
+	var l int64
+	var buf = packetLengthPrefixBzPool.Get().(*[binary.MaxVarintLen64]byte)
+	defer packetLengthPrefixBzPool.Put(buf)
+	for i := 0; i < len(buf); i++ {
+		_, err = r.Read(buf[i : i+1])
+		if err != nil {
+			return
+		}
+		n += 1
+		if buf[i]&0x80 == 0 {
+			break
+		}
+		if n >= maxSize {
+			err = fmt.Errorf("Read overflow, maxSize is %v but uvarint(length-prefix) is itself greater than maxSize.", maxSize)
+		}
+	}
+	u64, _ := binary.Uvarint(buf[:])
+	if err != nil {
+		return
+	}
+	if maxSize > 0 {
+		if uint64(maxSize) < u64 {
+			err = fmt.Errorf("Read overflow, maxSize is %v but this amino binary object is %v bytes.", maxSize, u64)
+			return
+		}
+		if (maxSize - n) < int64(u64) {
+			err = fmt.Errorf("Read overflow, maxSize is %v but this length-prefixed amino binary object is %v+%v bytes.", maxSize, n, u64)
+			return
+		}
+	}
+	l = int64(u64)
+	if l < 0 {
+		err = fmt.Errorf("Read overflow, this implementation can't read this because, why would anyone have this much data? Hello from 2018.")
+	}
+
+	bbuf := packetBzPool.Get().(*bytes.Buffer)
+	defer packetBzPool.Put(bbuf)
+	bbuf.Grow(int(l))
+	var bz = bbuf.Bytes()
+	if int64(cap(bz)) >= l {
+		bz = bz[:l]
+	} else {
+		bz = make([]byte, l)
+	}
+
+	// Read that many bytes.
+	_, err = io.ReadFull(r, bz)
+	if err != nil {
+		return
+	}
+	n += l
+
+	if bytes.Equal(PacketPingTypePrefix, bz) {
+		packet = packetPing
+		return
+	} else if bytes.Equal(PacketPongTypePrefix, bz) {
+		packet = packetPong
+		return
+	} else if bytes.Equal(PacketMsgTypePrefix, bz[0:4]) {
+		var msg *PacketMsg
+		if targetMsg != nil {
+			msg = targetMsg
+			msg.Reset()
+		} else {
+			msg = &PacketMsg{}
+		}
+		err = msg.UnmarshalFromAmino(cdc, bz[4:])
+		if err == nil {
+			packet = msg
+			return
+		}
+	}
+	var packet4amino Packet
+	err = cdc.UnmarshalBinaryBare(bz, &packet4amino)
+	packet = packet4amino
+	return
 }

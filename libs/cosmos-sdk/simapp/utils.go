@@ -7,7 +7,7 @@ import (
 
 	tmkv "github.com/okex/exchain/libs/tendermint/libs/kv"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
 
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	"github.com/okex/exchain/libs/cosmos-sdk/simapp/helpers"
@@ -39,7 +39,7 @@ func SetupSimulation(dirPrefix, dbName string) (simulation.Config, dbm.DB, strin
 		return simulation.Config{}, nil, "", nil, false, err
 	}
 
-	db, err := sdk.NewLevelDB(dbName, dir)
+	db, err := sdk.NewDB(dbName, dir)
 	if err != nil {
 		return simulation.Config{}, nil, "", nil, false, err
 	}

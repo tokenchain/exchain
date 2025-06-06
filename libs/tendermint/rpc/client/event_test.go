@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	cfg "github.com/okex/exchain/libs/tendermint/config"
 	tmrand "github.com/okex/exchain/libs/tendermint/libs/rand"
 	"github.com/okex/exchain/libs/tendermint/rpc/client"
 	ctypes "github.com/okex/exchain/libs/tendermint/rpc/core/types"
@@ -27,6 +28,7 @@ func MakeTxKV() ([]byte, []byte, []byte) {
 }
 
 func TestHeaderEvents(t *testing.T) {
+	setMocConfig(100)
 	for i, c := range GetClients() {
 		i, c := i, c // capture params
 		t.Run(reflect.TypeOf(c).String(), func(t *testing.T) {
@@ -49,6 +51,7 @@ func TestHeaderEvents(t *testing.T) {
 }
 
 func TestBlockEvents(t *testing.T) {
+	setMocConfig(100)
 	for i, c := range GetClients() {
 		i, c := i, c // capture params
 		t.Run(reflect.TypeOf(c).String(), func(t *testing.T) {
@@ -62,21 +65,32 @@ func TestBlockEvents(t *testing.T) {
 			}
 
 			// listen for a new block; ensure height increases by 1
-			var firstBlockHeight int64
+			var (
+				firstBlockHeight int64
+				blockEvent       types.CM40EventDataNewBlock
+				ok               bool
+			)
+
 			for j := 0; j < 3; j++ {
 				evtTyp := types.EventNewBlock
 				evt, err := client.WaitForOneEvent(c, evtTyp, waitForEventTimeout)
 				require.Nil(t, err, "%d: %+v", j, err)
-				blockEvent, ok := evt.(types.EventDataNewBlock)
+
+				if ed, oke := evt.(types.EventDataNewBlock); oke {
+					blockEvent = blockEvent.From(ed)
+					ok = true
+				} else {
+					blockEvent, ok = evt.(types.CM40EventDataNewBlock)
+				}
 				require.True(t, ok, "%d: %#v", j, evt)
 
 				block := blockEvent.Block
 				if j == 0 {
-					firstBlockHeight = block.Header.Height
+					firstBlockHeight = block.IBCHeader.Height
 					continue
 				}
 
-				require.Equal(t, block.Header.Height, firstBlockHeight+int64(j))
+				require.Equal(t, block.IBCHeader.Height, firstBlockHeight+int64(j))
 			}
 		})
 	}
@@ -86,6 +100,7 @@ func TestTxEventsSentWithBroadcastTxAsync(t *testing.T) { testTxEventsSent(t, "a
 func TestTxEventsSentWithBroadcastTxSync(t *testing.T)  { testTxEventsSent(t, "sync") }
 
 func testTxEventsSent(t *testing.T, broadcastMethod string) {
+	setMocConfig(100)
 	for i, c := range GetClients() {
 		i, c := i, c // capture params
 		t.Run(reflect.TypeOf(c).String(), func(t *testing.T) {
@@ -139,6 +154,7 @@ func TestClientsResubscribe(t *testing.T) {
 }
 
 func TestHTTPReturnsErrorIfClientIsNotRunning(t *testing.T) {
+	setMocConfig(100)
 	c := getHTTPClient()
 
 	// on Subscribe
@@ -154,4 +170,11 @@ func TestHTTPReturnsErrorIfClientIsNotRunning(t *testing.T) {
 	// on UnsubscribeAll
 	err = c.UnsubscribeAll(context.Background(), "TestHeaderEvents")
 	assert.Error(t, err)
+}
+
+func setMocConfig(clientNum int) {
+	moc := cfg.MockDynamicConfig{}
+	moc.SetMaxSubscriptionClients(100)
+
+	cfg.SetDynamicConfig(moc)
 }

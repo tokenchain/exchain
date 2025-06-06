@@ -39,7 +39,7 @@ func (suite *KeeperTestSuite) TestHandleDoubleSign() {
 	staking.EndBlocker(ctx, suite.app.StakingKeeper)
 	suite.Equal(
 		suite.app.BankKeeper.GetCoins(ctx, sdk.AccAddress(operatorAddr)),
-		sdk.NewCoins(sdk.NewCoin(stakingParams.BondDenom, initAmt.Sub(amt))),
+		sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, initAmt.Sub(amt))),
 	)
 
 	// handle a signature to set signing info
@@ -62,13 +62,13 @@ func (suite *KeeperTestSuite) TestHandleDoubleSign() {
 	suite.keeper.HandleDoubleSign(ctx, evidence)
 
 	// jump to past the unbonding period
-	ctx = ctx.WithBlockTime(time.Unix(1, 0).Add(stakingParams.UnbondingTime))
+	ctx.SetBlockTime(time.Unix(1, 0).Add(stakingParams.UnbondingTime))
 
 	// require we cannot unjail
 	suite.Error(suite.app.SlashingKeeper.Unjail(ctx, operatorAddr))
 
 	// require we be able to unbond now
-	ctx = ctx.WithBlockHeight(ctx.BlockHeight() + 1)
+	ctx.SetBlockHeight(ctx.BlockHeight() + 1)
 	msgDestroy := stakingtypes.NewMsgDestroyValidator(sdk.AccAddress(operatorAddr))
 	res, err = staking.NewHandler(suite.app.StakingKeeper)(ctx, msgDestroy)
 	suite.NoError(err)
@@ -80,7 +80,7 @@ func (suite *KeeperTestSuite) TestHandleDoubleSign_TooOld() {
 	suite.populateValidators(ctx)
 
 	power := sdk.NewIntFromUint64(10000)
-	stakingParams := suite.app.StakingKeeper.GetParams(ctx)
+	//stakingParams := suite.app.StakingKeeper.GetParams(ctx)
 	amt := power
 	operatorAddr, val := valAddresses[0], pubkeys[0]
 
@@ -93,7 +93,7 @@ func (suite *KeeperTestSuite) TestHandleDoubleSign_TooOld() {
 	staking.EndBlocker(ctx, suite.app.StakingKeeper)
 	suite.Equal(
 		suite.app.BankKeeper.GetCoins(ctx, sdk.AccAddress(operatorAddr)),
-		sdk.NewCoins(sdk.NewCoin(stakingParams.BondDenom, initAmt.Sub(amt))),
+		sdk.NewCoins(sdk.NewCoin(sdk.DefaultBondDenom, initAmt.Sub(amt))),
 	)
 
 	evidence := types.Equivocation{
@@ -102,7 +102,7 @@ func (suite *KeeperTestSuite) TestHandleDoubleSign_TooOld() {
 		Power:            power.Int64(),
 		ConsensusAddress: sdk.ConsAddress(val.Address()),
 	}
-	ctx = ctx.WithBlockTime(ctx.BlockTime().Add(suite.app.EvidenceKeeper.MaxEvidenceAge(ctx) + 1))
+	ctx.SetBlockTime(ctx.BlockTime().Add(suite.app.EvidenceKeeper.MaxEvidenceAge(ctx) + 1))
 	suite.keeper.HandleDoubleSign(ctx, evidence)
 
 	suite.False(suite.app.StakingKeeper.Validator(ctx, operatorAddr).IsJailed())

@@ -9,12 +9,12 @@ import (
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/client/utils"
 
+	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"github.com/okex/exchain/x/staking/keeper"
 	"github.com/okex/exchain/x/staking/types"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
 
-	"github.com/stretchr/testify/require"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	"github.com/stretchr/testify/require"
 
 	cliLcd "github.com/okex/exchain/libs/cosmos-sdk/client/lcd"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
@@ -79,12 +79,12 @@ func TestAppSmoke(t *testing.T) {
 	require.True(t, appModule.Name() == ModuleName)
 	require.True(t, appModule.Route() == RouterKey)
 	require.True(t, appModule.QuerierRoute() == QuerierRoute)
-	require.True(t, appModule.GetQueryCmd(mApp.Cdc) != nil)
-	require.True(t, appModule.GetTxCmd(mApp.Cdc) != nil)
+	require.True(t, appModule.GetQueryCmd(mApp.Cdc.GetCdc()) != nil)
+	require.True(t, appModule.GetTxCmd(mApp.Cdc.GetCdc()) != nil)
 
-	appModule.RegisterCodec(mApp.Cdc)
+	appModule.RegisterCodec(mApp.Cdc.GetCdc())
 	appModule.RegisterInvariants(MockInvariantRegistry{})
-	rs := cliLcd.NewRestServer(mApp.Cdc, nil)
+	rs := cliLcd.NewRestServer(mApp.Cdc, nil, nil)
 	appModule.RegisterRESTRoutes(rs.CliCtx, rs.Mux)
 	handler := appModule.NewHandler()
 	require.True(t, handler != nil)
@@ -93,9 +93,9 @@ func TestAppSmoke(t *testing.T) {
 
 	// Extra Helper
 	appModule.CreateValidatorMsgHelpers("0.0.0.0")
-	cliCtx := context.NewCLIContext().WithCodec(mApp.Cdc)
+	cliCtx := context.NewCLIContext().WithCodec(mApp.Cdc.GetCdc())
 	inBuf := bufio.NewReader(os.Stdin)
-	txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(mApp.Cdc))
+	txBldr := auth.NewTxBuilderFromCLI(inBuf).WithTxEncoder(utils.GetTxEncoder(mApp.Cdc.GetCdc()))
 	appModule.BuildCreateValidatorMsg(cliCtx, txBldr)
 
 	// Initialization for genesis

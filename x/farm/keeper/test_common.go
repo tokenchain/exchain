@@ -9,12 +9,20 @@ import (
 
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	"github.com/okex/exchain/libs/cosmos-sdk/store"
+	"github.com/okex/exchain/libs/cosmos-sdk/store/mpt"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/bank"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/staking"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/supply"
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	dbm "github.com/okex/exchain/libs/tm-db"
 	swap "github.com/okex/exchain/x/ammswap"
 	swaptypes "github.com/okex/exchain/x/ammswap/types"
+	evm "github.com/okex/exchain/x/evm/keeper"
+	evmtypes "github.com/okex/exchain/x/evm/types"
 	"github.com/okex/exchain/x/farm/types"
 	"github.com/okex/exchain/x/gov"
 	govkeeper "github.com/okex/exchain/x/gov/keeper"
@@ -22,10 +30,6 @@ import (
 	"github.com/okex/exchain/x/params"
 	"github.com/okex/exchain/x/token"
 	"github.com/stretchr/testify/require"
-	abci "github.com/okex/exchain/libs/tendermint/abci/types"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
-	tmtypes "github.com/okex/exchain/libs/tendermint/types"
-	dbm "github.com/tendermint/tm-db"
 )
 
 const (
@@ -89,13 +93,16 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 	keyFarm := sdk.NewKVStoreKey(types.StoreKey)
 	tkeyFarm := sdk.NewTransientStoreKey(types.TStoreKey)
 	keyAcc := sdk.NewKVStoreKey(auth.StoreKey)
+	keyMpt := sdk.NewKVStoreKey(mpt.StoreKey)
 	keyParams := sdk.NewKVStoreKey(params.StoreKey)
 	tkeyParams := sdk.NewTransientStoreKey(params.TStoreKey)
 	keySupply := sdk.NewKVStoreKey(supply.StoreKey)
 	keyToken := sdk.NewKVStoreKey(token.StoreKey)
 	keyLock := sdk.NewKVStoreKey(token.KeyLock)
 	keySwap := sdk.NewKVStoreKey(swaptypes.StoreKey)
+	keyEvm := sdk.NewKVStoreKey(evmtypes.StoreKey)
 	keyGov := sdk.NewKVStoreKey(govtypes.StoreKey)
+	keyStaking := sdk.NewKVStoreKey(types.StoreKey)
 
 	// 0.2 init db
 	db := dbm.NewMemDB()
@@ -103,6 +110,7 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 	ms.MountStoreWithDB(tkeyFarm, sdk.StoreTypeTransient, nil)
 	ms.MountStoreWithDB(keyFarm, sdk.StoreTypeIAVL, db)
 	ms.MountStoreWithDB(keyAcc, sdk.StoreTypeIAVL, db)
+	ms.MountStoreWithDB(keyMpt, sdk.StoreTypeMPT, db)
 	ms.MountStoreWithDB(keyParams, sdk.StoreTypeIAVL, db)
 	ms.MountStoreWithDB(tkeyParams, sdk.StoreTypeTransient, db)
 	ms.MountStoreWithDB(keySupply, sdk.StoreTypeIAVL, db)
@@ -114,7 +122,7 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 
 	// 0.3 init context
 	ctx := sdk.NewContext(ms, abci.Header{ChainID: TestChainID}, false, log.NewNopLogger())
-	ctx = ctx.WithConsensusParams(
+	ctx.SetConsensusParams(
 		&abci.ConsensusParams{
 			Validator: &abci.ValidatorParams{
 				PubKeyTypes: []string{tmtypes.ABCIPubKeyTypeEd25519},
@@ -134,10 +142,10 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 	codec.RegisterCrypto(cdc)
 
 	// 1.1 init param keeper
-	pk := params.NewKeeper(cdc, keyParams, tkeyParams)
+	pk := params.NewKeeper(cdc, keyParams, tkeyParams, ctx.Logger())
 
 	// 1.2 init account keeper
-	ak := auth.NewAccountKeeper(cdc, keyAcc, pk.Subspace(auth.DefaultParamspace), auth.ProtoBaseAccount)
+	ak := auth.NewAccountKeeper(cdc, keyAcc, keyMpt, pk.Subspace(auth.DefaultParamspace), auth.ProtoBaseAccount)
 
 	// 1.3 init bank keeper
 	feeCollectorAcc := supply.NewEmptyModuleAccount(auth.FeeCollectorName)
@@ -169,7 +177,7 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 		swap.ModuleName:           {supply.Burner, supply.Minter},
 		govtypes.ModuleName:       nil,
 	}
-	sk := supply.NewKeeper(cdc, keySupply, ak, bk, maccPerms)
+	sk := supply.NewKeeper(cdc, keySupply, ak, bank.NewBankKeeperAdapter(bk), maccPerms)
 	sk.SetSupply(ctx, supply.NewSupply(sdk.NewDecCoinsFromDec(sdk.DefaultBondDenom, sdk.NewDec(1000000000))))
 	sk.SetModuleAccount(ctx, feeCollectorAcc)
 	sk.SetModuleAccount(ctx, farmAcc)
@@ -177,14 +185,18 @@ func GetKeeper(t *testing.T) (sdk.Context, MockFarmKeeper) {
 	sk.SetModuleAccount(ctx, mintFarmingAccount)
 	sk.SetModuleAccount(ctx, swapModuleAccount)
 
+	stk := staking.NewKeeper(cdc, keyStaking, sk, pk.Subspace(staking.DefaultParamspace))
+
 	// 1.5 init token keeper
 	tk := token.NewKeeper(bk, pk.Subspace(token.DefaultParamspace), auth.FeeCollectorName, sk, keyToken, keyLock, cdc, false, ak)
 
 	// 1.6 init swap keeper
 	swapKeeper := swap.NewKeeper(sk, tk, cdc, keySwap, pk.Subspace(swaptypes.DefaultParamspace))
+	evmKeeper := evm.NewKeeper(cdc, keyEvm, pk.Subspace(evmtypes.DefaultParamspace), &ak, sk, bk, stk, log.NewNopLogger())
 
 	// 1.7 init farm keeper
-	fk := NewKeeper(auth.FeeCollectorName, sk, tk, swapKeeper, pk.Subspace(types.DefaultParamspace), keyFarm, cdc)
+	fk := NewKeeper(auth.FeeCollectorName, sk, tk, swapKeeper, *evmKeeper, pk.Subspace(types.DefaultParamspace), keyFarm, cdc)
+
 	fk.SetParams(ctx, types.DefaultParams())
 
 	// 1.8 init gov keeper

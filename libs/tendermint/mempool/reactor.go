@@ -1,19 +1,22 @@
 package mempool
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"reflect"
 	"sync"
 	"time"
 
-	amino "github.com/tendermint/go-amino"
+	"github.com/ethereum/go-ethereum/common"
 
+	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/libs/clist"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"github.com/okex/exchain/libs/tendermint/p2p"
 	"github.com/okex/exchain/libs/tendermint/types"
+	"github.com/tendermint/go-amino"
 )
 
 const (
@@ -35,9 +38,16 @@ const (
 // peers you received it from.
 type Reactor struct {
 	p2p.BaseReactor
-	config  *cfg.MempoolConfig
-	mempool *CListMempool
-	ids     *mempoolIDs
+	config           *cfg.MempoolConfig
+	mempool          *CListMempool
+	ids              *mempoolIDs
+	nodeKey          *p2p.NodeKey
+	nodeKeyWhitelist map[string]struct{}
+	enableWtx        bool
+}
+
+func (memR *Reactor) SetNodeKey(key *p2p.NodeKey) {
+	memR.nodeKey = key
 }
 
 type mempoolIDs struct {
@@ -106,11 +116,17 @@ func newMempoolIDs() *mempoolIDs {
 // NewReactor returns a new Reactor with the given config and mempool.
 func NewReactor(config *cfg.MempoolConfig, mempool *CListMempool) *Reactor {
 	memR := &Reactor{
-		config:  config,
-		mempool: mempool,
-		ids:     newMempoolIDs(),
+		config:           config,
+		mempool:          mempool,
+		ids:              newMempoolIDs(),
+		nodeKeyWhitelist: make(map[string]struct{}),
+		enableWtx:        cfg.DynamicConfig.GetEnableWtx(),
+	}
+	for _, nodeKey := range config.GetNodeKeyWhitelist() {
+		memR.nodeKeyWhitelist[nodeKey] = struct{}{}
 	}
 	memR.BaseReactor = *p2p.NewBaseReactor("Mempool", memR)
+	memR.press()
 	return memR
 }
 
@@ -157,6 +173,58 @@ func (memR *Reactor) RemovePeer(peer p2p.Peer, reason interface{}) {
 	// broadcast routine checks if peer is gone and returns
 }
 
+// txMessageDecodePool is a sync.Pool of *TxMessage.
+// memR.decodeMsg will call txMessageDeocdePool.Get, and memR.Receive will reset the Msg after use, then call txMessageDeocdePool.Put.
+var txMessageDeocdePool = &sync.Pool{
+	New: func() interface{} {
+		return &TxMessage{}
+	},
+}
+
+var logParamsPool = &sync.Pool{
+	New: func() interface{} {
+		return &[6]interface{}{}
+	},
+}
+
+func (memR *Reactor) logReceive(peer p2p.Peer, chID byte, msg Message) {
+	logParams := logParamsPool.Get().(*[6]interface{})
+
+	logParams[0] = "src"
+	logParams[1] = peer
+	logParams[2] = "chId"
+	logParams[3] = chID
+	logParams[4] = "msg"
+	logParams[5] = msg
+
+	memR.Logger.Debug("Receive", logParams[:]...)
+
+	logParamsPool.Put(logParams)
+}
+
+var txIDStringerPool = &sync.Pool{
+	New: func() interface{} {
+		return &txIDStringer{}
+	},
+}
+
+func (memR *Reactor) logCheckTxError(tx []byte, height int64, err error) {
+	logParams := logParamsPool.Get().(*[6]interface{})
+	txStr := txIDStringerPool.Get().(*txIDStringer)
+	txStr.tx = tx
+	txStr.height = height
+
+	logParams[0] = "tx"
+	logParams[1] = txStr
+	logParams[2] = "err"
+	logParams[3] = err
+
+	memR.Logger.Info("Could not check tx", logParams[:4]...)
+
+	txIDStringerPool.Put(txStr)
+	logParamsPool.Put(logParams)
+}
+
 // Receive implements Reactor.
 // It adds any received transactions to the mempool.
 func (memR *Reactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) {
@@ -169,21 +237,46 @@ func (memR *Reactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) {
 		memR.Switch.StopPeerForError(src, err)
 		return
 	}
-	memR.Logger.Debug("Receive", "src", src, "chId", chID, "msg", msg)
+	memR.logReceive(src, chID, msg)
+
+	txInfo := TxInfo{SenderID: memR.ids.GetForPeer(src)}
+	if src != nil {
+		txInfo.SenderP2PID = src.ID()
+	}
+	var tx types.Tx
 
 	switch msg := msg.(type) {
 	case *TxMessage:
-		txInfo := TxInfo{SenderID: memR.ids.GetForPeer(src)}
-		if src != nil {
-			txInfo.SenderP2PID = src.ID()
+		tx = msg.Tx
+		if _, isInWhiteList := memR.nodeKeyWhitelist[string(src.ID())]; isInWhiteList && msg.From != "" {
+			txInfo.from = msg.From
 		}
-		err := memR.mempool.CheckTx(msg.Tx, nil, txInfo)
-		if err != nil {
-			memR.Logger.Info("Could not check tx", "tx", txID(msg.Tx), "err", err)
+		*msg = TxMessage{}
+		txMessageDeocdePool.Put(msg)
+	case *WtxMessage:
+		tx = msg.Wtx.Payload
+		if err := msg.Wtx.verify(memR.nodeKeyWhitelist); err != nil {
+			memR.Logger.Error("wtx.verify", "error", err, "txhash",
+				common.BytesToHash(types.Tx(msg.Wtx.Payload).Hash(memR.mempool.Height())),
+			)
+		} else {
+			txInfo.wtx = msg.Wtx
+			txInfo.checkType = abci.CheckTxType_WrappedCheck
 		}
-		// broadcasting happens from go routines per peer
+	case *WrapCMTxMessage:
+		tx = msg.Wtx.GetTx()
+		if _, isInWhiteList := memR.nodeKeyWhitelist[string(src.ID())]; isInWhiteList && msg.From != "" {
+			txInfo.from = msg.From
+		}
+		txInfo.wrapCMTx = msg.Wtx
 	default:
 		memR.Logger.Error(fmt.Sprintf("Unknown message type %v", reflect.TypeOf(msg)))
+		return
+	}
+
+	err = memR.mempool.CheckTx(tx, nil, txInfo)
+	if err != nil {
+		memR.logCheckTxError(tx, memR.mempool.height, err)
 	}
 }
 
@@ -197,6 +290,7 @@ func (memR *Reactor) broadcastTxRoutine(peer p2p.Peer) {
 	if !memR.config.Broadcast {
 		return
 	}
+	_, isInWhiteList := memR.nodeKeyWhitelist[string(peer.ID())]
 
 	peerID := memR.ids.GetForPeer(peer)
 	var next *clist.CElement
@@ -240,10 +334,55 @@ func (memR *Reactor) broadcastTxRoutine(peer p2p.Peer) {
 		}
 
 		// ensure peer hasn't already sent us this tx
-		if _, ok := memTx.senders.Load(peerID); !ok {
+		memTx.senderMtx.RLock()
+		_, ok = memTx.senders[peerID]
+		memTx.senderMtx.RUnlock()
+		if !ok {
+			var getFromPool bool
 			// send memTx
-			msg := &TxMessage{Tx: memTx.tx}
-			success := peer.Send(MempoolChannel, cdc.MustMarshalBinaryBare(msg))
+			var msg Message
+			if memTx.nodeKey != nil && memTx.signature != nil {
+				msg = &WtxMessage{
+					Wtx: &WrappedTx{
+						Payload:   memTx.tx,
+						From:      memTx.from,
+						Signature: memTx.signature,
+						NodeKey:   memTx.nodeKey,
+					},
+				}
+			} else if memR.enableWtx {
+				if wtx, err := memR.wrapTx(memTx.tx, memTx.from); err == nil {
+					msg = &WtxMessage{
+						Wtx: wtx,
+					}
+				}
+			} else if memTx.isWrapCMTx {
+				wmsg := &WrapCMTxMessage{Wtx: &types.WrapCMTx{Tx: memTx.tx, Nonce: memTx.wrapCMNonce}}
+				if isInWhiteList {
+					wmsg.From = memTx.from
+				} else {
+					wmsg.From = ""
+				}
+				msg = wmsg
+			} else {
+				txMsg := txMessageDeocdePool.Get().(*TxMessage)
+				txMsg.Tx = memTx.tx
+				if isInWhiteList {
+					txMsg.From = memTx.from
+				} else {
+					txMsg.From = ""
+				}
+				msg = txMsg
+				getFromPool = true
+			}
+
+			msgBz := memR.encodeMsg(msg)
+			if getFromPool {
+				getFromPool = false
+				txMessageDeocdePool.Put(msg)
+			}
+
+			success := peer.Send(MempoolChannel, msgBz)
 			if !success {
 				time.Sleep(peerCatchupSleepIntervalMS * time.Millisecond)
 				continue
@@ -271,22 +410,180 @@ type Message interface{}
 func RegisterMessages(cdc *amino.Codec) {
 	cdc.RegisterInterface((*Message)(nil), nil)
 	cdc.RegisterConcrete(&TxMessage{}, "tendermint/mempool/TxMessage", nil)
+	cdc.RegisterConcrete(&WtxMessage{}, "tendermint/mempool/WtxMessage", nil)
+	cdc.RegisterConcrete(&WrapCMTxMessage{}, "tendermint/mempool/WrapTxMessage", nil)
+
+	cdc.RegisterConcreteMarshaller("tendermint/mempool/TxMessage", func(codec *amino.Codec, i interface{}) ([]byte, error) {
+		txmp, ok := i.(*TxMessage)
+		if ok {
+			return txmp.MarshalToAmino(codec)
+		}
+		txm, ok := i.(TxMessage)
+		if ok {
+			return txm.MarshalToAmino(codec)
+		}
+		return nil, fmt.Errorf("%T is not a TxMessage", i)
+	})
+	cdc.RegisterConcreteUnmarshaller("tendermint/mempool/TxMessage", func(cdc *amino.Codec, bz []byte) (interface{}, int, error) {
+		m := &TxMessage{}
+		err := m.UnmarshalFromAmino(cdc, bz)
+		if err != nil {
+			return nil, 0, err
+		}
+		return m, len(bz), nil
+	})
 }
 
-func (memR *Reactor) decodeMsg(bz []byte) (msg Message, err error) {
+// decodeMsg decodes the bz bytes into a Message,
+// if err is nil and Message is a TxMessage, you must put Message to txMessageDeocdePool after use.
+func (memR *Reactor) decodeMsg(bz []byte) (Message, error) {
 	maxMsgSize := calcMaxMsgSize(memR.config.MaxTxBytes)
-	if l := len(bz); l > maxMsgSize {
-		return msg, ErrTxTooLarge{maxMsgSize, l}
+	l := len(bz)
+	if l > maxMsgSize {
+		return nil, ErrTxTooLarge{maxMsgSize, l}
 	}
-	err = cdc.UnmarshalBinaryBare(bz, &msg)
-	return
+
+	tp := getTxMessageAminoTypePrefix()
+	if l >= len(tp) && bytes.Equal(bz[:len(tp)], tp) {
+		txmsg := txMessageDeocdePool.Get().(*TxMessage)
+		err := txmsg.UnmarshalFromAmino(cdc, bz[len(tp):])
+		if err == nil {
+			return txmsg, nil
+		}
+		txmsg.Tx = nil
+		txMessageDeocdePool.Put(txmsg)
+	}
+	var msg Message
+	err := cdc.UnmarshalBinaryBare(bz, &msg)
+	return msg, err
+}
+
+func (memR *Reactor) encodeMsg(msg Message) []byte {
+	var ok bool
+	var txmp *TxMessage
+	var txm TxMessage
+	if txmp, ok = msg.(*TxMessage); !ok {
+		txmp = nil
+		if txm, ok = msg.(TxMessage); ok {
+			txmp = &txm
+		}
+	}
+	if txmp != nil {
+		buf := &bytes.Buffer{}
+		tp := getTxMessageAminoTypePrefix()
+		buf.Grow(len(tp) + txmp.AminoSize(cdc))
+		// we manually assemble the encoded bytes for performance
+		buf.Write(tp)
+		err := txmp.MarshalAminoTo(cdc, buf)
+		if err == nil {
+			return buf.Bytes()
+		}
+	}
+	return cdc.MustMarshalBinaryBare(msg)
 }
 
 //-------------------------------------
 
 // TxMessage is a Message containing a transaction.
 type TxMessage struct {
-	Tx types.Tx
+	Tx   types.Tx
+	From string
+}
+
+func (m TxMessage) AminoSize(_ *amino.Codec) int {
+	size := 0
+	if len(m.Tx) > 0 {
+		size += 1 + amino.ByteSliceSize(m.Tx)
+	}
+	if m.From != "" {
+		size += 1 + amino.EncodedStringSize(m.From)
+	}
+	return size
+}
+
+func (m TxMessage) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.Grow(m.AminoSize(cdc))
+	err := m.MarshalAminoTo(cdc, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (m TxMessage) MarshalAminoTo(_ *amino.Codec, buf *bytes.Buffer) error {
+	if len(m.Tx) != 0 {
+		const pbKey = byte(1<<3 | amino.Typ3_ByteLength)
+		err := amino.EncodeByteSliceWithKeyToBuffer(buf, m.Tx, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+	if m.From != "" {
+		const pbKey = byte(2<<3 | amino.Typ3_ByteLength)
+		err := amino.EncodeStringWithKeyToBuffer(buf, m.From, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *TxMessage) UnmarshalFromAmino(_ *amino.Codec, data []byte) error {
+	const fieldCount = 2
+	var currentField int
+	var currentType amino.Typ3
+	var err error
+
+	for cur := 1; cur <= fieldCount; cur++ {
+		if len(data) != 0 && (currentField == 0 || currentField < cur) {
+			var nextField int
+			if nextField, currentType, err = amino.ParseProtoPosAndTypeMustOneByte(data[0]); err != nil {
+				return err
+			}
+			if nextField < currentField {
+				return fmt.Errorf("next field should greater than %d, got %d", currentField, nextField)
+			} else {
+				currentField = nextField
+			}
+		}
+		if len(data) == 0 || currentField != cur {
+			switch cur {
+			case 1:
+				m.Tx = nil
+			case 2:
+				m.From = ""
+			default:
+				return fmt.Errorf("unexpect feild num %d", cur)
+			}
+		} else {
+			pbk := data[0]
+			data = data[1:]
+			var subData []byte
+			if currentType == amino.Typ3_ByteLength {
+				if subData, err = amino.DecodeByteSliceWithoutCopy(&data); err != nil {
+					return err
+				}
+			}
+			switch pbk {
+			case 1<<3 | byte(amino.Typ3_ByteLength):
+				if len(subData) == 0 {
+					m.Tx = nil
+				} else {
+					m.Tx = make([]byte, len(subData))
+					copy(m.Tx, subData)
+				}
+			case 2<<3 | byte(amino.Typ3_ByteLength):
+				m.From = string(subData)
+			default:
+				return fmt.Errorf("unexpect pb key %d", pbk)
+			}
+		}
+	}
+	if len(data) != 0 {
+		return fmt.Errorf("unexpect data remain %X", data)
+	}
+	return nil
 }
 
 // String returns a string representation of the TxMessage.
@@ -298,4 +595,88 @@ func (m *TxMessage) String() string {
 // account for amino overhead of TxMessage
 func calcMaxMsgSize(maxTxSize int) int {
 	return maxTxSize + aminoOverheadForTxMessage
+}
+
+// WtxMessage is a Message containing a transaction.
+type WtxMessage struct {
+	Wtx *WrappedTx
+}
+
+// String returns a string representation of the WtxMessage.
+func (m *WtxMessage) String() string {
+	return fmt.Sprintf("[WtxMessage %v]", m.Wtx)
+}
+
+type WrappedTx struct {
+	Payload   []byte `json:"payload"`   // std tx or evm tx
+	From      string `json:"from"`      // from address of evm tx or ""
+	Signature []byte `json:"signature"` // signature for payload
+	NodeKey   []byte `json:"nodeKey"`   // pub key of the node who signs the tx
+}
+
+func (wtx *WrappedTx) GetPayload() []byte {
+	if wtx != nil {
+		return wtx.Payload
+	}
+	return nil
+}
+
+func (wtx *WrappedTx) GetSignature() []byte {
+	if wtx != nil {
+		return wtx.Signature
+	}
+	return nil
+}
+
+func (wtx *WrappedTx) GetNodeKey() []byte {
+	if wtx != nil {
+		return wtx.NodeKey
+	}
+	return nil
+}
+
+func (wtx *WrappedTx) GetFrom() string {
+	if wtx != nil {
+		return wtx.From
+	}
+	return ""
+}
+
+func (w *WrappedTx) verify(whitelist map[string]struct{}) error {
+	pub := p2p.BytesToPubKey(w.NodeKey)
+	if _, ok := whitelist[string(p2p.PubKeyToID(pub))]; !ok {
+		return fmt.Errorf("node key [%s] not in whitelist", p2p.PubKeyToID(pub))
+	}
+	if !pub.VerifyBytes(append(w.Payload, w.From...), w.Signature) {
+		return fmt.Errorf("invalid signature of wtx")
+	}
+	return nil
+}
+
+func (memR *Reactor) wrapTx(tx types.Tx, from string) (*WrappedTx, error) {
+	wtx := &WrappedTx{
+		Payload: tx,
+		From:    from,
+		NodeKey: memR.nodeKey.PubKey().Bytes(),
+	}
+	sig, err := memR.nodeKey.PrivKey.Sign(append(wtx.Payload, from...))
+	if err != nil {
+		return nil, err
+	}
+	wtx.Signature = sig
+	return wtx, nil
+}
+
+func GetRealTxFromWrapCMTx(data types.Tx) types.Tx {
+	wtx := &types.WrapCMTx{}
+	err := cdc.UnmarshalJSON(data, &wtx)
+	if err == nil {
+		return wtx.Tx
+	}
+	return data
+}
+
+type WrapCMTxMessage struct {
+	Wtx  *types.WrapCMTx `json:"wtx"`
+	From string          `json:"from"`
 }

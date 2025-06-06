@@ -23,14 +23,16 @@ import (
 	"github.com/okex/exchain/libs/cosmos-sdk/x/mint"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/supply"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/upgrade"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/okex/exchain/libs/system"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/node"
 	sm "github.com/okex/exchain/libs/tendermint/state"
 	"github.com/okex/exchain/libs/tendermint/store"
-	dbm "github.com/tendermint/tm-db"
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/okex/exchain/x/ammswap"
 	"github.com/okex/exchain/x/dex"
@@ -47,9 +49,8 @@ import (
 )
 
 const (
-	flagHeight    = "height"
-	flagPruning   = "enable_pruning"
-	flagDBBackend = "db_backend"
+	flagHeight  = "height"
+	flagPruning = "enable_pruning"
 
 	blockDBName = "blockstore"
 	stateDBName = "state"
@@ -82,11 +83,12 @@ func pruningCmd(ctx *server.Context) *cobra.Command {
 	cmd.AddCommand(pruneAllCmd(ctx),
 		pruneAppCmd(ctx),
 		pruneBlockCmd(ctx),
+		clearPruneHeightsCmd(ctx),
 	)
 
 	cmd.PersistentFlags().Int64P(flagHeight, "r", 0, "Removes block or state up to (but not including) a height")
 	cmd.PersistentFlags().BoolP(flagPruning, "p", true, "Enable pruning")
-	cmd.PersistentFlags().String(flagDBBackend, "goleveldb", "Database backend: goleveldb | rocksdb")
+	cmd.PersistentFlags().String(sdk.FlagDBBackend, tmtypes.DBBackend, "Database backend: goleveldb | rocksdb")
 	return cmd
 }
 
@@ -168,6 +170,37 @@ func pruneAppCmd(ctx *server.Context) *cobra.Command {
 	return cmd
 }
 
+func clearPruneHeightsCmd(ctx *server.Context) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "clear-prune-heights",
+		Short: "clear the prune heights",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			config := ctx.Config
+			config.SetRoot(viper.GetString(flags.FlagHome))
+
+			if err := checkBackend(dbm.BackendType(ctx.Config.DBBackend)); err != nil {
+				return err
+			}
+
+			appDB := initDB(config, appDBName)
+
+			heights, err := rootmulti.GetPruningHeights(appDB)
+			if err != nil {
+				log.Fatal(err)
+				return nil
+			}
+			log.Printf("pruning heights %v\n", heights)
+			log.Println("--------- clear start ---------")
+			rootmulti.SetPruningHeights(appDB, nil)
+			log.Println("--------- clear done ---------")
+
+			return nil
+		},
+	}
+
+	return cmd
+}
+
 func pruneBlockCmd(ctx *server.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "block",
@@ -211,7 +244,7 @@ func pruneBlockCmd(ctx *server.Context) *cobra.Command {
 func dbConvertCmd(ctx *server.Context) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "convert",
-		Short: "Convert oec data from goleveldb to rocksdb",
+		Short: "Convert " + system.ChainName + " data from goleveldb to rocksdb",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			config := ctx.Config
 			config.SetRoot(viper.GetString(flags.FlagHome))
@@ -277,6 +310,8 @@ func getPruneBlockParams(blockStoreDB dbm.DB) (baseHeight, retainHeight int64) {
 }
 
 func getPruneAppParams(appDB dbm.DB) (retainHeight int64) {
+	rootmulti.IgPruneHeightsLen = true
+
 	rs := initAppStore(appDB)
 	latestV := rs.GetLatestVersion()
 
@@ -520,6 +555,7 @@ func queryCmd(ctx *server.Context) *cobra.Command {
 	}
 
 	cmd.AddCommand(queryBlockState, queryAppState)
+	cmd.PersistentFlags().String(sdk.FlagDBBackend, tmtypes.DBBackend, "Database backend: goleveldb | rocksdb")
 
 	return cmd
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/okex/exchain/libs/tendermint/abci/example/kvstore"
+	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/crypto/merkle"
 	"github.com/okex/exchain/libs/tendermint/lite"
 	certclient "github.com/okex/exchain/libs/tendermint/lite/client"
@@ -125,6 +126,7 @@ func _TestAppProofs(t *testing.T) {
 }
 
 func TestTxProofs(t *testing.T) {
+	setMocConfig(100)
 	assert, require := assert.New(t), require.New(t)
 
 	cl := rpclocal.New(node)
@@ -142,22 +144,30 @@ func TestTxProofs(t *testing.T) {
 	require.NoError(err, "%#v", err)
 	cert := lite.NewBaseVerifier(chainID, seed.Height(), seed.Validators)
 
+	time.Sleep(1 * time.Second)
 	// First let's make sure a bogus transaction hash returns a valid non-existence proof.
-	key := types.Tx([]byte("bogus")).Hash()
+	key := types.Tx([]byte("bogus")).Hash(brh)
 	_, err = cl.Tx(key, true)
 	require.NotNil(err)
 	require.Contains(err.Error(), "not found")
 
 	// Now let's check with the real tx root hash.
-	key = types.Tx(tx).Hash()
+	key = types.Tx(tx).Hash(brh)
 	res, err := cl.Tx(key, true)
 	require.NoError(err, "%#v", err)
 	require.NotNil(res)
 	keyHash := merkle.SimpleHashFromByteSlices([][]byte{key})
-	err = res.Proof.Validate(keyHash)
+	err = res.Proof.Validate(keyHash, brh)
 	assert.NoError(err, "%#v", err)
 
 	commit, err := GetCertifiedCommit(br.Height, cl, cert)
 	require.Nil(err, "%#v", err)
 	require.Equal(res.Proof.RootHash, commit.Header.DataHash)
+}
+
+func setMocConfig(clientNum int) {
+	moc := cfg.MockDynamicConfig{}
+	moc.SetMaxSubscriptionClients(100)
+
+	cfg.SetDynamicConfig(moc)
 }

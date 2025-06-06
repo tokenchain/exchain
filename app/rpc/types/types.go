@@ -2,11 +2,14 @@ package types
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
+
+	watcher "github.com/okex/exchain/x/evm/watcher"
 )
 
 // Copied the Account and StorageResult types since they are registered under an
@@ -28,24 +31,6 @@ type StorageResult struct {
 	Key   string       `json:"key"`
 	Value *hexutil.Big `json:"value"`
 	Proof []string     `json:"proof"`
-}
-
-// Transaction represents a transaction returned to RPC clients.
-type Transaction struct {
-	BlockHash        *common.Hash    `json:"blockHash"`
-	BlockNumber      *hexutil.Big    `json:"blockNumber"`
-	From             common.Address  `json:"from"`
-	Gas              hexutil.Uint64  `json:"gas"`
-	GasPrice         *hexutil.Big    `json:"gasPrice"`
-	Hash             common.Hash     `json:"hash"`
-	Input            hexutil.Bytes   `json:"input"`
-	Nonce            hexutil.Uint64  `json:"nonce"`
-	To               *common.Address `json:"to"`
-	TransactionIndex *hexutil.Uint64 `json:"transactionIndex"`
-	Value            *hexutil.Big    `json:"value"`
-	V                *hexutil.Big    `json:"v"`
-	R                *hexutil.Big    `json:"r"`
-	S                *hexutil.Big    `json:"s"`
 }
 
 // SendTxArgs represents the arguments to submit a new transaction into the transaction pool.
@@ -126,20 +111,6 @@ func (ca CallArgs) String() string {
 	return strings.TrimRight(arg, ", ")
 }
 
-// Account indicates the overriding fields of account during the execution of
-// a message call.
-// NOTE: state and stateDiff can't be specified at the same time. If state is
-// set, message execution will only use the data in the given state. Otherwise
-// if statDiff is set, all diff will be applied first and then execute the call
-// message.
-type Account struct {
-	Nonce     *hexutil.Uint64              `json:"nonce"`
-	Code      *hexutil.Bytes               `json:"code"`
-	Balance   **hexutil.Big                `json:"balance"`
-	State     *map[common.Hash]common.Hash `json:"state"`
-	StateDiff *map[common.Hash]common.Hash `json:"stateDiff"`
-}
-
 // EthHeaderWithBlockHash represents a block header in the Ethereum blockchain with block hash generated from Tendermint Block
 type EthHeaderWithBlockHash struct {
 	ParentHash  common.Hash         `json:"parentHash"`
@@ -158,4 +129,30 @@ type EthHeaderWithBlockHash struct {
 	MixDigest   common.Hash         `json:"mixHash"`
 	Nonce       ethtypes.BlockNonce `json:"nonce"`
 	Hash        common.Hash         `json:"hash"`
+}
+type FeeHistoryResult struct {
+	OldestBlock  *hexutil.Big     `json:"oldestBlock"`
+	Reward       [][]*hexutil.Big `json:"reward,omitempty"`
+	BaseFee      []*hexutil.Big   `json:"baseFeePerGas,omitempty"`
+	GasUsedRatio []float64        `json:"gasUsedRatio"`
+}
+
+// SignTransactionResult represents a RLP encoded signed transaction.
+type SignTransactionResult struct {
+	Raw hexutil.Bytes        `json:"raw"`
+	Tx  *watcher.Transaction `json:"tx"`
+}
+
+type GPIn3Gears struct {
+	SafeLow *hexutil.Big `json:"safe_low"`
+	Average *hexutil.Big `json:"average"`
+	Fastest *hexutil.Big `json:"fastest"`
+}
+
+func NewGPIn3Gears(safelow, avg, fastest *big.Int) GPIn3Gears {
+	return GPIn3Gears{
+		SafeLow: (*hexutil.Big)(safelow),
+		Average: (*hexutil.Big)(avg),
+		Fastest: (*hexutil.Big)(fastest),
+	}
 }

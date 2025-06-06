@@ -5,11 +5,14 @@ import (
 	"errors"
 	"time"
 
+	"github.com/tendermint/go-amino"
+
 	"github.com/okex/exchain/libs/tendermint/crypto"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
+	cryptoamino "github.com/okex/exchain/libs/tendermint/crypto/encoding/amino"
 )
 
 //-----------------------------------------------------------------------------
@@ -28,6 +31,176 @@ type BaseAccount struct {
 	PubKey        crypto.PubKey  `json:"public_key" yaml:"public_key"`
 	AccountNumber uint64         `json:"account_number" yaml:"account_number"`
 	Sequence      uint64         `json:"sequence" yaml:"sequence"`
+}
+
+func (acc *BaseAccount) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			if dataLen > uint64(len(data)) {
+				return errors.New("not enough data")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			acc.Address = make([]byte, len(subData))
+			copy(acc.Address, subData)
+		case 2:
+			var coin sdk.DecCoin
+			err = coin.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+			acc.Coins = append(acc.Coins, coin)
+		case 3:
+			acc.PubKey, err = cryptoamino.UnmarshalPubKeyFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 4:
+			var n int
+			acc.AccountNumber, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			dataLen = uint64(n)
+		case 5:
+			var n int
+			acc.Sequence, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			dataLen = uint64(n)
+		}
+	}
+	return nil
+}
+
+func (acc BaseAccount) Copy() sdk.Account {
+	return NewBaseAccount(acc.Address, acc.Coins, acc.PubKey, acc.AccountNumber, acc.Sequence)
+}
+
+func (acc *BaseAccount) AminoSize(cdc *amino.Codec) int {
+	size := 0
+	if len(acc.Address) != 0 {
+		size += 1 + amino.ByteSliceSize(acc.Address)
+	}
+	for _, coin := range acc.Coins {
+		coinSize := coin.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(coinSize)) + coinSize
+	}
+	if acc.PubKey != nil {
+		pkSize := cryptoamino.PubKeyAminoSize(acc.PubKey, cdc)
+		size += 1 + amino.UvarintSize(uint64(pkSize)) + pkSize
+	}
+	if acc.AccountNumber != 0 {
+		size += 1 + amino.UvarintSize(acc.AccountNumber)
+	}
+	if acc.Sequence != 0 {
+		size += 1 + amino.UvarintSize(acc.Sequence)
+	}
+	return size
+}
+
+func (acc *BaseAccount) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(acc.AminoSize(cdc))
+	err := acc.MarshalAminoTo(cdc, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (acc *BaseAccount) MarshalAminoTo(cdc *amino.Codec, buf *bytes.Buffer) error {
+	// field 1
+	if len(acc.Address) != 0 {
+		const pbKey = 1<<3 | 2
+		err := amino.EncodeByteSliceWithKeyToBuffer(buf, acc.Address, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	// field 2
+	for _, coin := range acc.Coins {
+		const pbKey = 2<<3 | 2
+		buf.WriteByte(pbKey)
+		coinSize := coin.AminoSize(cdc)
+		err := amino.EncodeUvarintToBuffer(buf, uint64(coinSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = coin.MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != coinSize {
+			return amino.NewSizerError(coin, coinSize, buf.Len()-lenBeforeData)
+		}
+	}
+
+	// field 3
+	if acc.PubKey != nil {
+		const pbKey = 3<<3 | 2
+		buf.WriteByte(pbKey)
+		pubKeySize := cryptoamino.PubKeyAminoSize(acc.PubKey, cdc)
+		err := amino.EncodeUvarintToBuffer(buf, uint64(pubKeySize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = cryptoamino.MarshalPubKeyAminoTo(cdc, acc.PubKey, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != pubKeySize {
+			return amino.NewSizerError(acc.PubKey, pubKeySize, buf.Len()-lenBeforeData)
+		}
+	}
+
+	// field 4
+	if acc.AccountNumber != 0 {
+		const pbKey = 4 << 3
+		err := amino.EncodeUvarintWithKeyToBuffer(buf, acc.AccountNumber, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	// field 5
+	if acc.Sequence != 0 {
+		const pbKey = 5 << 3
+		err := amino.EncodeUvarintWithKeyToBuffer(buf, acc.Sequence, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // NewBaseAccount creates a new BaseAccount object
@@ -166,4 +339,9 @@ func (acc BaseAccount) MarshalYAML() (interface{}, error) {
 	}
 
 	return string(bz), err
+}
+
+// NewModuleAddress creates an AccAddress from the hash of the module's name
+func NewModuleAddress(name string) sdk.AccAddress {
+	return sdk.AccAddress(crypto.AddressHash([]byte(name)))
 }

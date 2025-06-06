@@ -1,7 +1,6 @@
 package abcicli
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/okex/exchain/libs/tendermint/abci/types"
@@ -29,9 +28,11 @@ type Client interface {
 	InfoAsync(types.RequestInfo) *ReqRes
 	SetOptionAsync(types.RequestSetOption) *ReqRes
 	DeliverTxAsync(types.RequestDeliverTx) *ReqRes
+	PreDeliverRealTxAsync([]byte) types.TxEssentials
+	DeliverRealTxAsync(types.TxEssentials) *ReqRes
 	CheckTxAsync(types.RequestCheckTx) *ReqRes
 	QueryAsync(types.RequestQuery) *ReqRes
-	CommitAsync() *ReqRes
+	CommitAsync(types.RequestCommit) *ReqRes
 	InitChainAsync(types.RequestInitChain) *ReqRes
 	BeginBlockAsync(types.RequestBeginBlock) *ReqRes
 	EndBlockAsync(types.RequestEndBlock) *ReqRes
@@ -43,28 +44,14 @@ type Client interface {
 	DeliverTxSync(types.RequestDeliverTx) (*types.ResponseDeliverTx, error)
 	CheckTxSync(types.RequestCheckTx) (*types.ResponseCheckTx, error)
 	QuerySync(types.RequestQuery) (*types.ResponseQuery, error)
-	CommitSync() (*types.ResponseCommit, error)
+	CommitSync(types.RequestCommit) (*types.ResponseCommit, error)
 	InitChainSync(types.RequestInitChain) (*types.ResponseInitChain, error)
 	BeginBlockSync(types.RequestBeginBlock) (*types.ResponseBeginBlock, error)
 	EndBlockSync(types.RequestEndBlock) (*types.ResponseEndBlock, error)
-	ParallelTxs([][]byte) []*types.ResponseDeliverTx
+	ParallelTxs([][]byte, bool) []*types.ResponseDeliverTx
 }
 
 //----------------------------------------
-
-// NewClient returns a new ABCI client of the specified transport type.
-// It returns an error if the transport is not "socket" or "grpc"
-func NewClient(addr, transport string, mustConnect bool) (client Client, err error) {
-	switch transport {
-	case "socket":
-		client = NewSocketClient(addr, mustConnect)
-	case "grpc":
-		client = NewGRPCClient(addr, mustConnect)
-	default:
-		err = fmt.Errorf("unknown abci transport %s", transport)
-	}
-	return
-}
 
 //----------------------------------------
 

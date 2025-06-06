@@ -2,29 +2,36 @@ package refund
 
 import (
 	"math/big"
-
-	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/ante"
-	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/keeper"
-
-	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/refund"
+	"sync"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
+	"github.com/okex/exchain/libs/cosmos-sdk/types/innertx"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/ante"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/keeper"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/refund"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
-	evmtypes "github.com/okex/exchain/x/evm/types"
+	tmtypes "github.com/okex/exchain/libs/tendermint/types"
 )
 
-func NewGasRefundHandler(ak auth.AccountKeeper, sk types.SupplyKeeper) sdk.GasRefundHandler {
+func NewGasRefundHandler(ak auth.AccountKeeper, sk types.SupplyKeeper, ik innertx.InnerTxKeeper) sdk.GasRefundHandler {
+	evmGasRefundHandler := NewGasRefundDecorator(ak, sk, ik)
+
 	return func(
 		ctx sdk.Context, tx sdk.Tx,
 	) (refundFee sdk.Coins, err error) {
 		var gasRefundHandler sdk.GasRefundHandler
-		switch tx.(type) {
-		case evmtypes.MsgEthereumTx:
-			gasRefundHandler = NewGasRefundDecorator(ak, sk)
-		default:
-			return nil, nil
+
+		if tmtypes.HigherThanEarth(ctx.BlockHeight()) {
+			gasRefundHandler = evmGasRefundHandler
+		} else {
+			if tx.GetType() == sdk.EvmTxType {
+				gasRefundHandler = evmGasRefundHandler
+			} else {
+				return nil, nil
+			}
 		}
 		return gasRefundHandler(ctx, tx)
 	}
@@ -33,17 +40,21 @@ func NewGasRefundHandler(ak auth.AccountKeeper, sk types.SupplyKeeper) sdk.GasRe
 type Handler struct {
 	ak           keeper.AccountKeeper
 	supplyKeeper types.SupplyKeeper
+	ik           innertx.InnerTxKeeper
 }
 
-func (handler Handler) GasRefund(ctx sdk.Context, tx sdk.Tx) (refundGasFee sdk.Coins, err error) {
+func (handler Handler) GasRefund(ctx sdk.Context, tx sdk.Tx) (sdk.Coins, error) {
+	return gasRefund(handler.ik, handler.ak, handler.supplyKeeper, ctx, tx)
+}
 
+type accountKeeperInterface interface {
+	SetAccount(ctx sdk.Context, acc exported.Account)
+	GetAccount(ctx sdk.Context, addr sdk.AccAddress) exported.Account
+}
+
+func gasRefund(ik innertx.InnerTxKeeper, ak accountKeeperInterface, sk types.SupplyKeeper, ctx sdk.Context, tx sdk.Tx) (refundGasFee sdk.Coins, err error) {
 	currentGasMeter := ctx.GasMeter()
-	TempGasMeter := sdk.NewInfiniteGasMeter()
-	ctx = ctx.WithGasMeter(TempGasMeter)
-
-	defer func() {
-		ctx = ctx.WithGasMeter(currentGasMeter)
-	}()
+	ctx.SetGasMeter(sdk.NewInfiniteGasMeter())
 
 	gasLimit := currentGasMeter.Limit()
 	gasUsed := currentGasMeter.GasConsumed()
@@ -52,21 +63,35 @@ func (handler Handler) GasRefund(ctx sdk.Context, tx sdk.Tx) (refundGasFee sdk.C
 		return nil, nil
 	}
 
+	if tmtypes.HigherThanVenus6(ctx.BlockHeight()) {
+		if ctx.GetOutOfGas() {
+			ctx.GasMeter().SetGas(ctx.GasMeter().Limit())
+			currentGasMeter.SetGas(gasLimit)
+			return nil, nil
+		}
+	} else {
+		if tx.GetType() == sdk.StdTxType && ctx.GetOutOfGas() {
+			return nil, nil
+		}
+	}
+
 	feeTx, ok := tx.(ante.FeeTx)
 	if !ok {
 		return nil, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "Tx must be a FeeTx")
 	}
 
 	feePayer := feeTx.FeePayer(ctx)
-	feePayerAcc := handler.ak.GetAccount(ctx, feePayer)
+	feePayerAcc := ak.GetAccount(ctx, feePayer)
 	if feePayerAcc == nil {
 		return nil, sdkerrors.Wrapf(sdkerrors.ErrUnknownAddress, "fee payer address: %s does not exist", feePayer)
 	}
 
 	gas := feeTx.GetGas()
 	fees := feeTx.GetFee()
-	gasFees := caculateRefundFees(ctx, gasUsed, gas, fees)
-	err = refund.RefundFees(handler.supplyKeeper, ctx, feePayerAcc.GetAddress(), gasFees)
+	gasFees := calculateRefundFees(gasUsed, gas, fees)
+
+	// set coins and record innertx
+	err = refund.RefundFees(sk, ctx, feePayerAcc.GetAddress(), gasFees)
 	if err != nil {
 		return nil, err
 	}
@@ -74,24 +99,34 @@ func (handler Handler) GasRefund(ctx sdk.Context, tx sdk.Tx) (refundGasFee sdk.C
 	return gasFees, nil
 }
 
-func NewGasRefundDecorator(ak auth.AccountKeeper, sk types.SupplyKeeper) sdk.GasRefundHandler {
+func NewGasRefundDecorator(ak auth.AccountKeeper, sk types.SupplyKeeper, ik innertx.InnerTxKeeper) sdk.GasRefundHandler {
 	chandler := Handler{
 		ak:           ak,
 		supplyKeeper: sk,
+		ik:           ik,
 	}
-
-	return func(ctx sdk.Context, tx sdk.Tx) (refund sdk.Coins, err error) {
-		return chandler.GasRefund(ctx, tx)
-	}
+	return chandler.GasRefund
 }
 
-func caculateRefundFees(ctx sdk.Context, gasUsed uint64, gas uint64, fees sdk.DecCoins) sdk.Coins {
+var bigIntsPool = &sync.Pool{
+	New: func() interface{} {
+		return &[2]big.Int{}
+	},
+}
+
+func calculateRefundFees(gasUsed uint64, gas uint64, fees sdk.DecCoins) sdk.Coins {
+	bitInts := bigIntsPool.Get().(*[2]big.Int)
+	defer bigIntsPool.Put(bitInts)
 
 	refundFees := make(sdk.Coins, len(fees))
 	for i, fee := range fees {
-		gasPrice := new(big.Int).Div(fee.Amount.BigInt(), new(big.Int).SetUint64(gas))
-		gasConsumed := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(gasUsed))
-		gasCost := sdk.NewCoin(fee.Denom, sdk.NewDecFromBigIntWithPrec(gasConsumed, sdk.Precision))
+		gasPrice := bitInts[0].SetUint64(gas)
+		gasPrice = gasPrice.Div(fee.Amount.Int, gasPrice)
+
+		gasConsumed := bitInts[1].SetUint64(gasUsed)
+		gasConsumed = gasConsumed.Mul(gasPrice, gasConsumed)
+
+		gasCost := sdk.NewDecCoinFromDec(fee.Denom, sdk.NewDecWithBigIntAndPrec(gasConsumed, sdk.Precision))
 		gasRefund := fee.Sub(gasCost)
 
 		refundFees[i] = gasRefund
@@ -99,9 +134,9 @@ func caculateRefundFees(ctx sdk.Context, gasUsed uint64, gas uint64, fees sdk.De
 	return refundFees
 }
 
-// CaculateRefundFees provides the way to calculate the refunded gas with gasUsed, fees and gasPrice,
+// CalculateRefundFees provides the way to calculate the refunded gas with gasUsed, fees and gasPrice,
 // as refunded gas = fees - gasPrice * gasUsed
-func CaculateRefundFees(ctx sdk.Context, gasUsed uint64, fees sdk.DecCoins, gasPrice *big.Int) sdk.Coins {
+func CalculateRefundFees(gasUsed uint64, fees sdk.DecCoins, gasPrice *big.Int) sdk.Coins {
 	gas := new(big.Int).Div(fees[0].Amount.BigInt(), gasPrice).Uint64()
-	return caculateRefundFees(ctx, gasUsed, gas, fees)
+	return calculateRefundFees(gasUsed, gas, fees)
 }

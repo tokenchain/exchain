@@ -62,6 +62,7 @@ const (
 	FlagMaxOpenConnections = "max-open"
 	FlagRPCReadTimeout     = "read-timeout"
 	FlagRPCWriteTimeout    = "write-timeout"
+	FlagMaxBodyBytes       = "max-body-bytes"
 	FlagOutputDocument     = "output-document" // inspired by wget -O
 	FlagSkipConfirmation   = "yes"
 	FlagProve              = "prove"
@@ -69,6 +70,19 @@ const (
 	FlagPage               = "page"
 	FlagLimit              = "limit"
 	FlagUnsafeCORS         = "unsafe-cors"
+	FlagNodeIndex          = "node-index"
+
+	TrustNodeUsage = `Using true doesn't verify results, quickly(300~400ms). True is recommended to connect familiar or self-built nodes. 
+Using false verifies the proof of results, safely but slowly(2~3s). False is recommended to connect to unfamiliar nodes.`
+)
+
+const (
+	FlagPageKey       = "page-key"
+	FlagOffset        = "offset"
+	FlagTimeoutHeight = "timeout-height"
+	FlagCountTotal    = "count-total"
+
+	DefaultMaxBodyBytes = 1000 * 1000
 )
 
 // LineBreak can be included in a command list to provide a blank line
@@ -82,7 +96,7 @@ var (
 func GetCommands(cmds ...*cobra.Command) []*cobra.Command {
 	for _, c := range cmds {
 		c.Flags().Bool(FlagIndentResponse, false, "Add indent to JSON response")
-		c.Flags().Bool(FlagTrustNode, false, "Trust connected full node (don't verify proofs for responses)")
+		c.Flags().Bool(FlagTrustNode, false, TrustNodeUsage)
 		c.Flags().Bool(FlagUseLedger, false, "Use a connected Ledger device")
 		c.Flags().String(FlagNode, "tcp://localhost:26657", "<host>:<port> to Tendermint RPC interface for this chain")
 		c.Flags().Int64(FlagHeight, 0, "Use a specific height to query state at (this can error if the node is pruning state)")
@@ -106,13 +120,13 @@ func PostCommands(cmds ...*cobra.Command) []*cobra.Command {
 		c.Flags().Uint64P(FlagAccountNumber, "a", 0, "The account number of the signing account (offline mode only)")
 		c.Flags().Uint64(FlagSequence, 0, "The sequence number of the signing account (offline mode only)")
 		c.Flags().String(FlagMemo, "", "Memo to send along with transaction")
-		c.Flags().String(FlagFees, "", "Fees to pay along with transaction; eg: 10uatom")
-		c.Flags().String(FlagGasPrices, "", "Gas prices to determine the transaction fee (e.g. 10uatom)")
+		c.Flags().String(FlagFees, "", "Fees to pay along with transaction; eg: 0.1okt")
+		c.Flags().String(FlagGasPrices, "", "Gas prices to determine the transaction fee (e.g. 0.1okt)")
 		c.Flags().String(FlagNode, "tcp://localhost:26657", "<host>:<port> to tendermint rpc interface for this chain")
 		c.Flags().Bool(FlagUseLedger, false, "Use a connected Ledger device")
 		c.Flags().Float64(FlagGasAdjustment, DefaultGasAdjustment, "adjustment factor to be multiplied against the estimate returned by the tx simulation; if the gas limit is set manually this flag is ignored ")
 		c.Flags().StringP(FlagBroadcastMode, "b", BroadcastSync, "Transaction broadcasting mode (sync|async|block)")
-		c.Flags().Bool(FlagTrustNode, true, "Trust connected full node (don't verify proofs for responses)")
+		c.Flags().Bool(FlagTrustNode, true, TrustNodeUsage)
 		c.Flags().Bool(FlagDryRun, false, "ignore the --gas flag and perform a simulation of a transaction, but don't broadcast it")
 		c.Flags().Bool(FlagGenerateOnly, false, "Build an unsigned transaction and write it to STDOUT (when enabled, the local Keybase is not accessible and the node operates offline)")
 		c.Flags().BoolP(FlagSkipConfirmation, "y", false, "Skip tx broadcasting prompt confirmation")
@@ -140,6 +154,7 @@ func RegisterRestServerFlags(cmd *cobra.Command) *cobra.Command {
 	cmd = GetCommands(cmd)[0]
 	cmd.Flags().String(FlagListenAddr, "tcp://localhost:1317", "The address for the server to listen on")
 	cmd.Flags().Uint(FlagMaxOpenConnections, 1000, "The number of maximum open connections")
+	cmd.Flags().Int64(FlagMaxBodyBytes, DefaultMaxBodyBytes, "The RPC maximum size of request body, in bytes")
 	cmd.Flags().Uint(FlagRPCReadTimeout, 10, "The RPC read timeout (in seconds)")
 	cmd.Flags().Uint(FlagRPCWriteTimeout, 10, "The RPC write timeout (in seconds)")
 	cmd.Flags().Bool(FlagUnsafeCORS, false, "Allows CORS requests from all domains. For development purposes only, use it at your own risk.")
@@ -218,4 +233,56 @@ To configure your bash shell to load completions for each session add to your ba
 	cmd.Flags().Bool(flagZsh, false, "Generate Zsh completion script")
 
 	return cmd
+}
+
+// AddQueryFlagsToCmd adds common flags to a module query command.
+func AddQueryFlagsToCmd(cmd *cobra.Command) {
+	cmd.Flags().String(FlagNode, "tcp://localhost:26657", "<host>:<port> to Tendermint RPC interface for this chain")
+	cmd.Flags().Int64(FlagHeight, 0, "Use a specific height to query state at (this can error if the node is pruning state)")
+	cmd.Flags().StringP(tmcli.OutputFlag, "o", "text", "Output format (text|json)")
+
+	cmd.MarkFlagRequired(FlagChainID)
+
+	cmd.SetErr(cmd.ErrOrStderr())
+	cmd.SetOut(cmd.OutOrStdout())
+}
+
+// AddTxFlagsToCmd adds common flags to a module tx command.
+func AddTxFlagsToCmd(cmd *cobra.Command) {
+	cmd.Flags().String(FlagFrom, "", "Name or address of private key with which to sign")
+	cmd.Flags().Uint64P(FlagAccountNumber, "a", 0, "The account number of the signing account (offline mode only)")
+	cmd.Flags().Uint64P(FlagSequence, "s", 0, "The sequence number of the signing account (offline mode only)")
+	cmd.Flags().String(FlagMemo, "", "Memo to send along with transaction")
+	cmd.Flags().String(FlagFees, "", "Fees to pay along with transaction; eg: 0.1okt")
+	cmd.Flags().String(FlagGasPrices, "", "Gas prices in decimal format to determine the transaction fee (e.g. 0.1uatom)")
+	cmd.Flags().String(FlagNode, "tcp://localhost:26657", "<host>:<port> to tendermint rpc interface for this chain")
+	cmd.Flags().Bool(FlagUseLedger, false, "Use a connected Ledger device")
+	cmd.Flags().Float64(FlagGasAdjustment, DefaultGasAdjustment, "adjustment factor to be multiplied against the estimate returned by the tx simulation; if the gas limit is set manually this flag is ignored ")
+	cmd.Flags().StringP(FlagBroadcastMode, "b", BroadcastSync, "Transaction broadcasting mode (sync|async|block)")
+	cmd.Flags().Bool(FlagDryRun, false, "ignore the --gas flag and perform a simulation of a transaction, but don't broadcast it")
+	cmd.Flags().Bool(FlagGenerateOnly, false, "Build an unsigned transaction and write it to STDOUT (when enabled, the local Keybase is not accessible)")
+	cmd.Flags().BoolP(FlagSkipConfirmation, "y", false, "Skip tx broadcasting prompt confirmation")
+	cmd.Flags().String(FlagKeyringBackend, DefaultKeyringBackend, "Select keyring's backend (os|file|kwallet|pass|test|memory)")
+	cmd.Flags().Uint64(FlagTimeoutHeight, 0, "Set a block timeout height to prevent the tx from being committed past a certain height")
+
+	// --gas can accept integers and "auto"
+
+	cmd.MarkFlagRequired(FlagChainID)
+
+	cmd.Flags().Var(&GasFlagVar, "gas", fmt.Sprintf(
+		"gas limit to set per-transaction; set to %q to calculate required gas automatically (default %d)",
+		GasFlagAuto, DefaultGasLimit,
+	))
+
+	cmd.SetErr(cmd.ErrOrStderr())
+	cmd.SetOut(cmd.OutOrStdout())
+}
+
+// AddPaginationFlagsToCmd adds common pagination flags to cmd
+func AddPaginationFlagsToCmd(cmd *cobra.Command, query string) {
+	cmd.Flags().Uint64(FlagPage, 1, fmt.Sprintf("pagination page of %s to query for. This sets offset to a multiple of limit", query))
+	cmd.Flags().String(FlagPageKey, "", fmt.Sprintf("pagination page-key of %s to query for", query))
+	cmd.Flags().Uint64(FlagOffset, 0, fmt.Sprintf("pagination offset of %s to query for", query))
+	cmd.Flags().Uint64(FlagLimit, 100, fmt.Sprintf("pagination limit of %s to query for", query))
+	cmd.Flags().Bool(FlagCountTotal, false, fmt.Sprintf("count total number of records in %s to query for", query))
 }

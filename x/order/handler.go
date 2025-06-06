@@ -8,12 +8,12 @@ import (
 	storetypes "github.com/okex/exchain/libs/cosmos-sdk/store/types"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
+	types2 "github.com/okex/exchain/libs/tendermint/types"
 	"github.com/okex/exchain/x/common"
 	"github.com/okex/exchain/x/common/perf"
 	"github.com/okex/exchain/x/order/keeper"
 	"github.com/okex/exchain/x/order/types"
-	"github.com/okex/exchain/libs/tendermint/crypto/tmhash"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"github.com/willf/bitset"
 )
 
@@ -46,11 +46,11 @@ func NewOrderHandler(keeper keeper.Keeper) sdk.Handler {
 		} else {
 			// set an infinite gas meter and recovery it when return
 			gasMeter := ctx.GasMeter()
-			ctx = ctx.WithGasMeter(sdk.NewInfiniteGasMeter())
-			defer func() { ctx = ctx.WithGasMeter(gasMeter) }()
+			ctx.SetGasMeter(sdk.NewInfiniteGasMeter())
+			defer func() { ctx.SetGasMeter(gasMeter) }()
 		}
 
-		ctx = ctx.WithEventManager(sdk.NewEventManager())
+		ctx.SetEventManager(sdk.NewEventManager())
 		var handlerFun func() (*sdk.Result, error)
 		var name string
 		logger := ctx.Logger().With("module", "order")
@@ -116,7 +116,7 @@ func getOrderFromMsg(ctx sdk.Context, k keeper.Keeper, msg types.MsgNewOrder, ra
 	feePerBlockAmount := feeParams.FeePerBlock.Amount.Mul(sdk.MustNewDecFromStr(ratio))
 	feePerBlock := sdk.NewDecCoinFromDec(feeParams.FeePerBlock.Denom, feePerBlockAmount)
 	return types.NewOrder(
-		fmt.Sprintf("%X", tmhash.Sum(ctx.TxBytes())),
+		fmt.Sprintf("%X", types2.Tx(ctx.TxBytes()).Hash(ctx.BlockHeight())),
 		msg.Sender,
 		msg.Product,
 		msg.Side,
@@ -132,7 +132,8 @@ func handleNewOrder(ctx sdk.Context, k Keeper, sender sdk.AccAddress,
 	item types.OrderItem, ratio string, logger log.Logger) (types.OrderResult, sdk.CacheMultiStore, error) {
 
 	cacheItem := ctx.MultiStore().CacheMultiStore()
-	ctxItem := ctx.WithMultiStore(cacheItem)
+	ctxItem := ctx
+	ctxItem.SetMultiStore(cacheItem)
 	msg := MsgNewOrder{
 		Sender:   sender,
 		Product:  item.Product,
@@ -246,7 +247,8 @@ func handleCancelOrder(context sdk.Context, k Keeper, sender sdk.AccAddress, ord
 	types.OrderResult, sdk.CacheMultiStore) {
 
 	cacheItem := context.MultiStore().CacheMultiStore()
-	ctx := context.WithMultiStore(cacheItem)
+	ctx := context
+	ctx.SetMultiStore(cacheItem)
 
 	// Check order
 	msg := MsgCancelOrder{

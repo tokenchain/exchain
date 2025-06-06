@@ -72,6 +72,10 @@ func Status(ctx *rpctypes.Context) (*ctypes.ResultStatus, error) {
 			VotingPower: votingPower,
 		},
 	}
+	result.NodeInfo.ListenAddr = ""
+	result.NodeInfo.Other.RPCAddress = ""
+	// update Network to the ChainID in state
+	result.NodeInfo.Network = env.ConsensusState.GetState().ChainID
 
 	return result, nil
 }

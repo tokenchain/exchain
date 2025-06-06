@@ -61,7 +61,7 @@ func (w Wrapper) Tx(hash []byte, prove bool) (*ctypes.ResultTx, error) {
 	if err != nil {
 		return res, err
 	}
-	err = res.Proof.Validate(sh.DataHash)
+	err = res.Proof.Validate(sh.DataHash, res.Height)
 	return res, err
 }
 
@@ -90,6 +90,14 @@ func (w Wrapper) BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlock
 	}
 
 	return r, nil
+}
+
+func (w Wrapper) LatestBlockNumber() (int64, error) {
+	info, err := w.BlockchainInfo(0, 0)
+	if err != nil {
+		return 0, err
+	}
+	return info.LastHeight, nil
 }
 
 // Block returns an entire block and verifies all signatures

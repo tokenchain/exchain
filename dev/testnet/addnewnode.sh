@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-source exchain.profile
+source okc.profile
 
 set -e
 set -o errexit
@@ -9,12 +9,25 @@ set -m
 
 set -x # activate debugging
 
-
-while getopts "i:n:p:r:s:b:" opt; do
+PRERUN=false
+while getopts "i:n:p:r:s:b:dux" opt; do
   case $opt in
     i)
       echo "IP=$OPTARG"
       IP=$OPTARG
+      ;;
+    x)
+      echo "PRERUN=$OPTARG"
+      PRERUN=true
+      ;;
+    d)
+      echo "DOWNLOAD_DELTA=$OPTARG"
+      DOWNLOAD_DELTA="--download-delta=true"
+      MULTI_CACHE="--multi-cache=false"
+      ;;
+    u)
+      echo "DOWNLOAD_DELTA=$OPTARG"
+      UPLOAD_DELTA="--upload-delta=true"
       ;;
     n)
       echo "INPUT_INDEX=$OPTARG"
@@ -103,7 +116,7 @@ init() {
         exit
     fi
 
-    ${BIN_NAME} init ${NAME} -o --chain-id ${CHAIN_ID} --home ${OKCHAIN_NET_CACHE}/${NAME}/exchaind
+    ${BIN_NAME} init ${NAME} -o --chain-id ${CHAIN_ID} --home ${OKCHAIN_NET_CACHE}/${NAME}/exchaind --node-index ${INPUT_INDEX}
 }
 
 
@@ -122,21 +135,34 @@ start() {
     p2pport=$1
     rpcport=$2
     seednode=$3
+    ((restport = INPUT_INDEX * 100 + REST_PORT)) # for evm tx
 
 #     echo "${BIN_NAME} --home ${OKCHAIN_NET_CACHE}/${NAME}/exchaind  start --p2p.laddr tcp://${IP}:${p2pport} --p2p.seeds ${seednode} --rpc.laddr tcp://${IP}:${rpcport}"
 
-    LOG_LEVEL=main:info,*:error
+#    LOG_LEVEL=main:info,*:error
+    LOG_LEVEL=main:info,*:error,state:info
+#    LOG_LEVEL=main:info,*:error,state:debug,consensus:debug
 
     ${BIN_NAME} start \
     --chain-id ${CHAIN_ID} \
     --home ${OKCHAIN_NET_CACHE}/${NAME}/exchaind \
     --p2p.laddr tcp://${IP}:${p2pport} \
     --p2p.seeds ${seednode} \
+    --rest.laddr tcp://${IP}:${restport} \
     --log_level ${LOG_LEVEL} \
+    --enable-gid \
+    --append-pid \
+    ${UPLOAD_DELTA} \
+    ${DOWNLOAD_DELTA} \
+    ${MULTI_CACHE} \
     --p2p.addr_book_strict=false \
-    --rpc.laddr tcp://${IP}:${rpcport} > ${OKCHAIN_NET_CACHE}/${BIN_NAME}.${NAME}.log 2>&1 &
+    --enable-preruntx=${PRERUN} \
+    --rpc.laddr tcp://${IP}:${rpcport} > ${OKCHAIN_NET_CACHE}/rpc${INPUT_INDEX}.log 2>&1 &
 
 #     echo "start new node done"
+#     --download-delta \
+#     --enable-preruntx \
+
 }
 
 

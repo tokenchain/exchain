@@ -2,21 +2,42 @@ package state
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
+	"github.com/okex/exchain/libs/system/trace"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
+	"github.com/okex/exchain/libs/tendermint/global"
+	"github.com/okex/exchain/libs/tendermint/libs/automation"
 	"github.com/okex/exchain/libs/tendermint/libs/fail"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
 	mempl "github.com/okex/exchain/libs/tendermint/mempool"
 	"github.com/okex/exchain/libs/tendermint/proxy"
-	"github.com/okex/exchain/libs/tendermint/trace"
 	"github.com/okex/exchain/libs/tendermint/types"
-	"github.com/spf13/viper"
-	dbm "github.com/tendermint/tm-db"
+	tmtime "github.com/okex/exchain/libs/tendermint/types/time"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/tendermint/go-amino"
 )
 
-//-----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+type (
+	// Enum mode for executing [deliverTx, ...]
+	DeliverTxsExecMode int
+)
+
+const (
+	DeliverTxsExecModeSerial   DeliverTxsExecMode = iota // execute [deliverTx,...] sequentially
+	DeliverTxsExecModeParallel                    = 2    // execute [deliverTx,...] parallel
+
+	// There are two modes.
+	// 0: execute [deliverTx,...] sequentially (default)
+	// 1: execute [deliverTx,...] deprecated
+	// 2: execute [deliverTx,...] parallel
+	FlagDeliverTxsExecMode = "deliver-txs-mode"
+	FlagEnableConcurrency  = "enable-concurrency"
+)
+
 // BlockExecutor handles block execution and state updates.
 // It exposes ApplyBlock(), which validates & executes the block, updates state w/ ABCI responses,
 // then commits and updates the mempool atomically, then saves state.
@@ -37,11 +58,28 @@ type BlockExecutor struct {
 	mempool mempl.Mempool
 	evpool  EvidencePool
 
-	logger log.Logger
-
+	logger  log.Logger
 	metrics *Metrics
 
-	isAsync bool
+	// download or upload data to dds
+	deltaContext *DeltaContext
+
+	prerunCtx *prerunContext
+
+	isFastSync bool
+
+	// async save state, validators, consensus params, abci responses here
+	asyncDBContext
+
+	// the owner is validator
+	isNullIndexer bool
+	eventsChan    chan event
+}
+
+type event struct {
+	block   *types.Block
+	abciRsp *ABCIResponses
+	vals    []*types.Validator
 }
 
 type BlockExecutorOption func(executor *BlockExecutor)
@@ -63,29 +101,53 @@ func NewBlockExecutor(
 	options ...BlockExecutorOption,
 ) *BlockExecutor {
 	res := &BlockExecutor{
-		db:       db,
-		proxyApp: proxyApp,
-		eventBus: types.NopEventBus{},
-		mempool:  mempool,
-		evpool:   evpool,
-		logger:   logger,
-		metrics:  NopMetrics(),
-		isAsync:  viper.GetBool(FlagParalleledTx),
+		db:           db,
+		proxyApp:     proxyApp,
+		eventBus:     types.NopEventBus{},
+		mempool:      mempool,
+		evpool:       evpool,
+		logger:       logger,
+		metrics:      NopMetrics(),
+		prerunCtx:    newPrerunContex(logger),
+		deltaContext: newDeltaContext(logger),
+		eventsChan:   make(chan event, 5),
 	}
 
 	for _, option := range options {
 		option(res)
 	}
+	automation.LoadTestCase(logger)
+	res.deltaContext.init()
+
+	res.initAsyncDBContext()
 
 	return res
 }
 
-func (blockExec *BlockExecutor) SetIsAsyncDeliverTx(sw bool) {
-	blockExec.isAsync = sw
-
+func (blockExec *BlockExecutor) fireEventsRountine() {
+	for et := range blockExec.eventsChan {
+		if et.block == nil {
+			break
+		}
+		fireEvents(blockExec.logger, blockExec.eventBus, et.block, et.abciRsp, et.vals)
+	}
+	blockExec.wg.Done()
 }
+
 func (blockExec *BlockExecutor) DB() dbm.DB {
 	return blockExec.db
+}
+
+func (blockExec *BlockExecutor) SetIsFastSyncing(isSyncing bool) {
+	blockExec.isFastSync = isSyncing
+}
+
+func (blockExec *BlockExecutor) SetIsNullIndexer(isNullIndexer bool) {
+	blockExec.isNullIndexer = isNullIndexer
+}
+
+func (blockExec *BlockExecutor) Stop() {
+	blockExec.stopAsyncDBContext()
 }
 
 // SetEventBus - sets the event bus for publishing block related events.
@@ -114,8 +176,8 @@ func (blockExec *BlockExecutor) CreateProposalBlock(
 
 	// Fetch a limited amount of valid txs
 	maxDataBytes := types.MaxDataBytes(maxBytes, state.Validators.Size(), len(evidence))
-	if blockExec.mempool.GetConfig().MaxGasUsedPerBlock > -1 {
-		maxGas = blockExec.mempool.GetConfig().MaxGasUsedPerBlock
+	if cfg.DynamicConfig.GetMaxGasUsedPerBlock() > -1 {
+		maxGas = cfg.DynamicConfig.GetMaxGasUsedPerBlock()
 	}
 	txs := blockExec.mempool.ReapMaxBytesMaxGas(maxDataBytes, maxGas)
 
@@ -141,38 +203,63 @@ func (blockExec *BlockExecutor) ValidateBlock(state State, block *types.Block) e
 // from outside this package to process and commit an entire block.
 // It takes a blockID to avoid recomputing the parts hash.
 func (blockExec *BlockExecutor) ApplyBlock(
-	state State, blockID types.BlockID, block *types.Block,
-) (State, int64, error) {
+	state State, blockID types.BlockID, block *types.Block) (State, int64, error) {
 	if ApplyBlockPprofTime >= 0 {
 		f, t := PprofStart()
 		defer PprofEnd(int(block.Height), f, t)
 	}
+
 	trc := trace.NewTracer(trace.ApplyBlock)
+	trc.EnableSummary()
+	trc.SetWorkloadStatistic(trace.GetApplyBlockWorkloadSttistic())
+	dc := blockExec.deltaContext
 
 	defer func() {
-		trace.GetElapsedInfo().AddInfo(trace.Height, fmt.Sprintf("%d", block.Height))
-		trace.GetElapsedInfo().AddInfo(trace.Tx, fmt.Sprintf("%d", len(block.Data.Txs)))
-		trace.GetElapsedInfo().AddInfo(trace.RunTx, trc.Format())
+		trace.GetElapsedInfo().AddInfo(trace.Height, strconv.FormatInt(block.Height, 10))
+		trace.GetElapsedInfo().AddInfo(trace.Tx, strconv.Itoa(len(block.Data.Txs)))
+		trace.GetElapsedInfo().AddInfo(trace.BlockSize, strconv.Itoa(block.FastSize()))
+		trace.GetElapsedInfo().AddInfo(trace.ApplyBlock, trc.Format())
+		trace.GetElapsedInfo().AddInfo(trace.Workload, trace.GetApplyBlockWorkloadSttistic().Format())
 		trace.GetElapsedInfo().SetElapsedTime(trc.GetElapsedTime())
 
 		now := time.Now().UnixNano()
 		blockExec.metrics.IntervalTime.Set(float64(now-blockExec.metrics.lastBlockTime) / 1e6)
 		blockExec.metrics.lastBlockTime = now
+		blockExec.metrics.CommittedHeight.Set(float64(block.Height))
 	}()
 
-	trc.Pin(trace.Abci)
 	if err := blockExec.ValidateBlock(state, block); err != nil {
 		return state, 0, ErrInvalidBlock(err)
 	}
 
-	startTime := time.Now().UnixNano()
-	var abciResponses *ABCIResponses
-	var err error
-	if blockExec.isAsync {
-		abciResponses, err = execBlockOnProxyAppAsync(blockExec.logger, blockExec.proxyApp, block, blockExec.db)
-	} else {
-		abciResponses, err = execBlockOnProxyApp(blockExec.logger, blockExec.proxyApp, block, blockExec.db)
+	deltaInfo := dc.prepareStateDelta(block.Height)
+
+	trc.Pin(trace.Abci)
+	if cfg.DynamicConfig.GetEnablePGU() {
+		global.CommitLock()
+		defer global.CommitUnlock()
 	}
+
+	startTime := time.Now().UnixNano()
+
+	//wait till the last block async write be saved
+	blockExec.tryWaitLastBlockSave(block.Height - 1)
+
+	abciResponses, duration, err := blockExec.runAbci(block, deltaInfo)
+
+	// publish event
+	if types.EnableEventBlockTime {
+		blockExec.FireBlockTimeEvents(block.Height, len(block.Txs), true)
+		if !blockExec.isNullIndexer {
+			blockExec.eventsChan <- event{
+				block:   block,
+				abciRsp: abciResponses,
+			}
+		}
+	}
+
+	trace.GetElapsedInfo().AddInfo(trace.LastRun, fmt.Sprintf("%dms", duration.Milliseconds()))
+	trace.GetApplyBlockWorkloadSttistic().Add(trace.LastRun, time.Now(), duration)
 
 	if err != nil {
 		return state, 0, ErrProxyAppConn(err)
@@ -180,10 +267,8 @@ func (blockExec *BlockExecutor) ApplyBlock(
 
 	fail.Fail() // XXX
 
-	trc.Pin(trace.SaveResp)
-
 	// Save the results before we commit.
-	SaveABCIResponses(blockExec.db, block.Height, abciResponses)
+	blockExec.trySaveABCIResponsesAsync(block.Height, abciResponses)
 
 	fail.Fail() // XXX
 	endTime := time.Now().UnixNano()
@@ -214,31 +299,89 @@ func (blockExec *BlockExecutor) ApplyBlock(
 	startTime = time.Now().UnixNano()
 
 	// Lock mempool, commit app state, update mempoool.
-	appHash, retainHeight, err := blockExec.Commit(state, block, abciResponses.DeliverTxs)
+	commitResp, retainHeight, err := blockExec.commit(state, block, deltaInfo, abciResponses.DeliverTxs, trc)
 	endTime = time.Now().UnixNano()
 	blockExec.metrics.CommitTime.Set(float64(endTime-startTime) / 1e6)
 	if err != nil {
 		return state, 0, fmt.Errorf("commit failed for application: %v", err)
 	}
+	global.SetGlobalHeight(block.Height)
 
 	// Update evpool with the block and state.
 	blockExec.evpool.Update(block, state)
 
 	fail.Fail() // XXX
 
-	trc.Pin(trace.SaveState)
-
+	trc.Pin("SaveState")
 	// Update the app hash and save the state.
-	state.AppHash = appHash
-	SaveState(blockExec.db, state)
+	state.AppHash = commitResp.Data
+	blockExec.trySaveStateAsync(state)
 
+	blockExec.logger.Debug("SaveState", "state", &state)
 	fail.Fail() // XXX
+
+	dc.postApplyBlock(block.Height, deltaInfo, abciResponses, commitResp.DeltaMap, blockExec.isFastSync)
 
 	// Events are fired after everything else.
 	// NOTE: if we crash between Commit and Save, events wont be fired during replay
-	fireEvents(blockExec.logger, blockExec.eventBus, block, abciResponses, validatorUpdates)
+	if !types.EnableEventBlockTime {
+		if !blockExec.isNullIndexer {
+			blockExec.eventsChan <- event{
+				block:   block,
+				abciRsp: abciResponses,
+			}
+		}
+	}
 
 	return state, retainHeight, nil
+}
+
+func (blockExec *BlockExecutor) ApplyBlockWithTrace(
+	state State, blockID types.BlockID, block *types.Block) (State, int64, error) {
+	s, id, err := blockExec.ApplyBlock(state, blockID, block)
+	trace.GetElapsedInfo().Dump(blockExec.logger.With("module", "main"))
+	return s, id, err
+}
+
+func (blockExec *BlockExecutor) runAbci(block *types.Block, deltaInfo *DeltaInfo) (*ABCIResponses, time.Duration, error) {
+	var abciResponses *ABCIResponses
+	var err error
+	var duration time.Duration
+
+	if deltaInfo != nil {
+		blockExec.logger.Info("Apply delta", "height", block.Height, "deltas-length", deltaInfo.deltaLen)
+		t0 := time.Now()
+		execBlockOnProxyAppWithDeltas(blockExec.proxyApp, block, blockExec.db)
+		abciResponses = deltaInfo.abciResponses
+		duration = time.Now().Sub(t0)
+	} else {
+		pc := blockExec.prerunCtx
+		if pc.prerunTx {
+			abciResponses, duration, err = pc.getPrerunResult(block)
+		}
+
+		if abciResponses == nil {
+			t0 := time.Now()
+			ctx := &executionTask{
+				logger:   blockExec.logger,
+				block:    block,
+				db:       blockExec.db,
+				proxyApp: blockExec.proxyApp,
+			}
+			mode := DeliverTxsExecMode(cfg.DynamicConfig.GetDeliverTxsExecuteMode())
+			switch mode {
+			case DeliverTxsExecModeSerial:
+				abciResponses, err = execBlockOnProxyApp(ctx)
+			case DeliverTxsExecModeParallel:
+				abciResponses, err = execBlockOnProxyAppAsync(blockExec.logger, blockExec.proxyApp, block, blockExec.db)
+			default:
+				abciResponses, err = execBlockOnProxyApp(ctx)
+			}
+			duration = time.Now().Sub(t0)
+		}
+	}
+
+	return abciResponses, duration, err
 }
 
 // Commit locks the mempool, runs the ABCI Commit message, and updates the
@@ -247,13 +390,21 @@ func (blockExec *BlockExecutor) ApplyBlock(
 // The Mempool must be locked during commit and update because state is
 // typically reset on Commit and old txs must be replayed against committed
 // state before new txs are run in the mempool, lest they be invalid.
-func (blockExec *BlockExecutor) Commit(
+func (blockExec *BlockExecutor) commit(
 	state State,
 	block *types.Block,
+	deltaInfo *DeltaInfo,
 	deliverTxResponses []*abci.ResponseDeliverTx,
-) ([]byte, int64, error) {
+	trc *trace.Tracer,
+) (*abci.ResponseCommit, int64, error) {
 	blockExec.mempool.Lock()
-	defer blockExec.mempool.Unlock()
+	defer func() {
+		blockExec.mempool.Unlock()
+		// Forced flushing mempool
+		if cfg.DynamicConfig.GetMempoolFlush() {
+			blockExec.mempool.Flush()
+		}
+	}()
 
 	// while mempool is Locked, flush to ensure all async requests have completed
 	// in the ABCI app before Commit.
@@ -264,7 +415,11 @@ func (blockExec *BlockExecutor) Commit(
 	}
 
 	// Commit block, get hash back
-	res, err := blockExec.proxyApp.CommitSync()
+	var treeDeltaMap interface{}
+	if deltaInfo != nil {
+		treeDeltaMap = deltaInfo.treeDeltaMap
+	}
+	res, err := blockExec.proxyApp.CommitSync(abci.RequestCommit{DeltaMap: treeDeltaMap})
 	if err != nil {
 		blockExec.logger.Error(
 			"Client error during proxyAppConn.CommitSync",
@@ -272,15 +427,17 @@ func (blockExec *BlockExecutor) Commit(
 		)
 		return nil, 0, err
 	}
-	// ResponseCommit has no error code - just data
 
-	blockExec.logger.Info(
+	// ResponseCommit has no error code - just data
+	blockExec.logger.Debug(
 		"Committed state",
 		"height", block.Height,
 		"txs", len(block.Txs),
-		"appHash", fmt.Sprintf("%X", res.Data),
+		"appHash", amino.BytesHexStringer(res.Data),
+		"blockLen", amino.FuncStringer(func() string { return strconv.Itoa(block.FastSize()) }),
 	)
 
+	trc.Pin("mpUpdate")
 	// Update mempool.
 	err = blockExec.mempool.Update(
 		block.Height,
@@ -291,13 +448,17 @@ func (blockExec *BlockExecutor) Commit(
 	)
 
 	if !cfg.DynamicConfig.GetMempoolRecheck() && block.Height%cfg.DynamicConfig.GetMempoolForceRecheckGap() == 0 {
+		proxyCb := func(req *abci.Request, res *abci.Response) {
+
+		}
+		blockExec.proxyApp.SetResponseCallback(proxyCb)
 		// reset checkState
 		blockExec.proxyApp.SetOptionAsync(abci.RequestSetOption{
 			Key: "ResetCheckState",
 		})
 	}
 
-	return res.Data, res.RetainHeight, err
+	return res, res.RetainHeight, err
 }
 
 func transTxsToBytes(txs types.Txs) [][]byte {
@@ -313,12 +474,12 @@ func transTxsToBytes(txs types.Txs) [][]byte {
 
 // Executes block's transactions on proxyAppConn.
 // Returns a list of transaction results and updates to the validator set
-func execBlockOnProxyApp(
-	logger log.Logger,
-	proxyAppConn proxy.AppConnConsensus,
-	block *types.Block,
-	stateDB dbm.DB,
-) (*ABCIResponses, error) {
+func execBlockOnProxyApp(context *executionTask) (*ABCIResponses, error) {
+	block := context.block
+	proxyAppConn := context.proxyApp
+	stateDB := context.db
+	logger := context.logger
+
 	var validTxs, invalidTxs = 0, 0
 
 	txIndex := 0
@@ -334,7 +495,7 @@ func execBlockOnProxyApp(
 			if txRes.Code == abci.CodeTypeOK {
 				validTxs++
 			} else {
-				logger.Debug("Invalid tx", "code", txRes.Code, "log", txRes.Log)
+				logger.Debug("Invalid tx", "code", txRes.Code, "log", txRes.Log, "index", txIndex)
 				invalidTxs++
 			}
 			abciResponses.DeliverTxs[txIndex] = txRes
@@ -343,6 +504,7 @@ func execBlockOnProxyApp(
 	}
 	proxyAppConn.SetResponseCallback(proxyCb)
 
+	// proxyAppConn.ParallelTxs(transTxsToBytes(block.Txs), true)
 	commitInfo, byzVals := getBeginBlockValidatorInfo(block, stateDB)
 
 	// Begin block
@@ -358,13 +520,31 @@ func execBlockOnProxyApp(
 		return nil, err
 	}
 
-	// Run txs of block.
-	for _, tx := range block.Txs {
-		proxyAppConn.DeliverTxAsync(abci.RequestDeliverTx{Tx: tx})
-		if err := proxyAppConn.Error(); err != nil {
+	realTxCh := make(chan abci.TxEssentials, len(block.Txs))
+	stopedCh := make(chan struct{}, 1)
+
+	go preDeliverRoutine(proxyAppConn, block.Txs, realTxCh, stopedCh)
+
+	count := 0
+	for realTx := range realTxCh {
+		if realTx != nil {
+			proxyAppConn.DeliverRealTxAsync(realTx)
+		} else {
+			proxyAppConn.DeliverTxAsync(abci.RequestDeliverTx{Tx: block.Txs[count]})
+		}
+
+		if err = proxyAppConn.Error(); err != nil {
 			return nil, err
 		}
+		if context != nil && context.stopped {
+			stopedCh <- struct{}{}
+			close(stopedCh)
+			context.dump(fmt.Sprintf("Prerun stopped, %d/%d tx executed", count+1, len(block.Txs)))
+			return nil, fmt.Errorf("Prerun stopped")
+		}
+		count += 1
 	}
+	close(stopedCh)
 
 	// End block.
 	abciResponses.EndBlock, err = proxyAppConn.EndBlockSync(abci.RequestEndBlock{Height: block.Height})
@@ -373,10 +553,40 @@ func execBlockOnProxyApp(
 		return nil, err
 	}
 
-	logger.Info("Executed block", "height", block.Height, "validTxs", validTxs, "invalidTxs", invalidTxs)
 	trace.GetElapsedInfo().AddInfo(trace.InvalidTxs, fmt.Sprintf("%d", invalidTxs))
 
 	return abciResponses, nil
+}
+
+func preDeliverRoutine(proxyAppConn proxy.AppConnConsensus, txs types.Txs, realTxCh chan<- abci.TxEssentials, stopedCh <-chan struct{}) {
+	for _, tx := range txs {
+		realTx := proxyAppConn.PreDeliverRealTxAsync(tx)
+		select {
+		case realTxCh <- realTx:
+		case <-stopedCh:
+			close(realTxCh)
+			return
+		}
+	}
+	close(realTxCh)
+}
+
+func execBlockOnProxyAppWithDeltas(
+	proxyAppConn proxy.AppConnConsensus,
+	block *types.Block,
+	stateDB dbm.DB,
+) {
+	proxyCb := func(req *abci.Request, res *abci.Response) {
+	}
+	proxyAppConn.SetResponseCallback(proxyCb)
+
+	commitInfo, byzVals := getBeginBlockValidatorInfo(block, stateDB)
+	_, _ = proxyAppConn.BeginBlockSync(abci.RequestBeginBlock{
+		Hash:                block.Hash(),
+		Header:              types.TM2PB.Header(&block.Header),
+		LastCommitInfo:      commitInfo,
+		ByzantineValidators: byzVals,
+	})
 }
 
 func getBeginBlockValidatorInfo(block *types.Block, stateDB dbm.DB) (abci.LastCommitInfo, []abci.Evidence) {
@@ -492,6 +702,9 @@ func updateState(
 
 	// TODO: allow app to upgrade version
 	nextVersion := state.Version
+	if types.HigherThanVenus1(header.Height) && !state.Version.IsUpgraded() {
+		nextVersion = state.Version.UpgradeToIBCVersion()
+	}
 
 	// NOTE: the AppHash has not been populated.
 	// It will be filled on state.Save.
@@ -534,6 +747,7 @@ func fireEvents(
 		ResultEndBlock:   *abciResponses.EndBlock,
 	})
 
+	//publish tx event 1by1
 	for i, tx := range block.Data.Txs {
 		eventBus.PublishEventTx(types.EventDataTx{TxResult: types.TxResult{
 			Height: block.Height,
@@ -543,34 +757,21 @@ func fireEvents(
 		}})
 	}
 
-	if len(validatorUpdates) > 0 {
-		eventBus.PublishEventValidatorSetUpdates(
-			types.EventDataValidatorSetUpdates{ValidatorUpdates: validatorUpdates})
+	//publish batch txs event
+	if len(block.Data.Txs) > 0 {
+		eventBus.PublishEventTxs(types.EventDataTxs{
+			Height:  block.Height,
+			Results: abciResponses.DeliverTxs,
+		})
 	}
+
+	//if len(validatorUpdates) > 0 {
+	//	eventBus.PublishEventValidatorSetUpdates(
+	//		types.EventDataValidatorSetUpdates{ValidatorUpdates: validatorUpdates})
+	//}
 }
 
-//----------------------------------------------------------------------------------------------------
-// Execute block without state. TODO: eliminate
-
-// ExecCommitBlock executes and commits a block on the proxyApp without validating or mutating the state.
-// It returns the application root hash (result of abci.Commit).
-func ExecCommitBlock(
-	appConnConsensus proxy.AppConnConsensus,
-	block *types.Block,
-	logger log.Logger,
-	stateDB dbm.DB,
-) ([]byte, error) {
-	_, err := execBlockOnProxyApp(logger, appConnConsensus, block, stateDB)
-	if err != nil {
-		logger.Error("Error executing block on proxy app", "height", block.Height, "err", err)
-		return nil, err
-	}
-	// Commit block, get hash back
-	res, err := appConnConsensus.CommitSync()
-	if err != nil {
-		logger.Error("Client error during proxyAppConn.CommitSync", "err", res)
-		return nil, err
-	}
-	// ResponseCommit has no error or log, just data
-	return res.Data, nil
+func (blockExec *BlockExecutor) FireBlockTimeEvents(height int64, txNum int, available bool) {
+	blockExec.eventBus.PublishEventLatestBlockTime(
+		types.EventDataBlockTime{Height: height, TimeNow: tmtime.Now().UnixMilli(), TxNum: txNum, Available: available})
 }

@@ -1,6 +1,8 @@
 package types
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -40,6 +42,11 @@ func (em EventManager) ABCIEvents() []abci.Event {
 	return em.events.ToABCIEvents()
 }
 
+func (em *EventManager) PopEvent() (result *Event) {
+	em.events, result = em.events.PopEvent()
+	return result
+}
+
 // ----------------------------------------------------------------------------
 // Events
 // ----------------------------------------------------------------------------
@@ -59,13 +66,57 @@ type (
 	Events []Event
 )
 
+func (a Attribute) MarshalJsonToBuffer(buf *bytes.Buffer) error {
+	var err error
+
+	err = buf.WriteByte('{')
+	if err != nil {
+		return err
+	}
+
+	_, err = buf.WriteString(`"key":`)
+	if err != nil {
+		return err
+	}
+	blob, err := json.Marshal(a.Key)
+	if err != nil {
+		return err
+	}
+	_, err = buf.Write(blob)
+	if err != nil {
+		return err
+	}
+
+	if a.Value != "" {
+		err = buf.WriteByte(',')
+		if err != nil {
+			return err
+		}
+		buf.WriteString(`"value":`)
+		blob, err = json.Marshal(a.Value)
+		if err != nil {
+			return err
+		}
+		_, err = buf.Write(blob)
+		if err != nil {
+			return err
+		}
+	}
+
+	return buf.WriteByte('}')
+}
+
 // NewEvent creates a new Event object with a given type and slice of one or more
 // attributes.
 func NewEvent(ty string, attrs ...Attribute) Event {
 	e := Event{Type: ty}
+	if len(attrs) > 0 {
+		e.Attributes = make([]tmkv.Pair, len(attrs))
+	}
 
-	for _, attr := range attrs {
-		e.Attributes = append(e.Attributes, attr.ToKVPair())
+	for i, attr := range attrs {
+		e.Attributes[i].Key = []byte(attr.Key)
+		e.Attributes[i].Value = []byte(attr.Value)
 	}
 
 	return e
@@ -87,7 +138,7 @@ func (a Attribute) String() string {
 
 // ToKVPair converts an Attribute object into a Tendermint key/value pair.
 func (a Attribute) ToKVPair() tmkv.Pair {
-	return tmkv.Pair{Key: toBytes(a.Key), Value: toBytes(a.Value)}
+	return tmkv.Pair{Key: []byte(a.Key), Value: []byte(a.Value)}
 }
 
 // AppendAttributes adds one or more attributes to an Event.
@@ -106,6 +157,14 @@ func (e Events) AppendEvent(event Event) Events {
 // AppendEvents adds a slice of Event objects to an exist slice of Event objects.
 func (e Events) AppendEvents(events Events) Events {
 	return append(e, events...)
+}
+
+func (e Events) PopEvent() (Events, *Event) {
+	size := len(e)
+	if size < 1 {
+		return e, nil
+	}
+	return e[:size-1], &e[size-1]
 }
 
 // ToABCIEvents converts a slice of Event objects to a slice of abci.Event
@@ -153,6 +212,90 @@ type (
 	StringEvents []StringEvent
 )
 
+func (e StringEvent) MarshalJsonToBuffer(buf *bytes.Buffer) error {
+	var err error
+
+	err = buf.WriteByte('{')
+	if err != nil {
+		return err
+	}
+
+	var writeComma = false
+
+	if e.Type != "" {
+		_, err = buf.WriteString(`"type":`)
+		if err != nil {
+			return err
+		}
+		blob, err := json.Marshal(e.Type)
+		if err != nil {
+			return err
+		}
+		_, err = buf.Write(blob)
+		if err != nil {
+			return err
+		}
+		writeComma = true
+	}
+
+	if len(e.Attributes) != 0 {
+		if writeComma {
+			_, err = buf.WriteString(`,`)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = buf.WriteString(`"attributes":[`)
+		if err != nil {
+			return err
+		}
+		for i, attr := range e.Attributes {
+			if i != 0 {
+				err = buf.WriteByte(',')
+				if err != nil {
+					return err
+				}
+			}
+			err = attr.MarshalJsonToBuffer(buf)
+			if err != nil {
+				return err
+			}
+		}
+		err = buf.WriteByte(']')
+		if err != nil {
+			return err
+		}
+	}
+
+	return buf.WriteByte('}')
+}
+
+func (se StringEvents) MarshalJsonToBuffer(buf *bytes.Buffer) error {
+	var err error
+	if se == nil {
+		_, err = buf.WriteString("null")
+		return err
+	}
+
+	err = buf.WriteByte('[')
+	if err != nil {
+		return err
+	}
+	for i, event := range se {
+		if i != 0 {
+			err = buf.WriteByte(',')
+			if err != nil {
+				return err
+			}
+		}
+		err = event.MarshalJsonToBuffer(buf)
+		if err != nil {
+			return err
+		}
+	}
+	return buf.WriteByte(']')
+}
+
 func (se StringEvents) String() string {
 	var sb strings.Builder
 
@@ -191,7 +334,7 @@ func (se StringEvents) Flatten() StringEvents {
 }
 
 // StringifyEvent converts an Event object to a StringEvent object.
-func StringifyEvent(e abci.Event) StringEvent {
+func StringifyEvent(e Event) StringEvent {
 	res := StringEvent{Type: e.Type}
 
 	for _, attr := range e.Attributes {
@@ -206,7 +349,7 @@ func StringifyEvent(e abci.Event) StringEvent {
 
 // StringifyEvents converts a slice of Event objects into a slice of StringEvent
 // objects.
-func StringifyEvents(events []abci.Event) StringEvents {
+func StringifyEvents(events []Event) StringEvents {
 	res := make(StringEvents, 0, len(events))
 
 	for _, e := range events {

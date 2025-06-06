@@ -6,23 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"reflect"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
+
+	"github.com/okex/exchain/app/crypto/ethsecp256k1"
 	clientcontext "github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
-	authtypes "github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/okex/exchain/app/crypto/ethsecp256k1"
-	evmtypes "github.com/okex/exchain/x/evm/types"
+	"github.com/okex/exchain/libs/tendermint/crypto/merkle"
 	tmbytes "github.com/okex/exchain/libs/tendermint/libs/bytes"
+	ctypes "github.com/okex/exchain/libs/tendermint/rpc/core/types"
 	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	evmtypes "github.com/okex/exchain/x/evm/types"
+	"github.com/okex/exchain/x/evm/watcher"
 )
 
 var (
+	ErrServerBusy = errors.New("server is too busy, please try again later")
 	// static gas limit for all blocks
 	defaultGasLimit   = hexutil.Uint64(int64(^uint32(0)))
 	defaultGasUsed    = hexutil.Uint64(0)
@@ -30,34 +33,24 @@ var (
 )
 
 // RawTxToEthTx returns a evm MsgEthereum transaction from raw tx bytes.
-func RawTxToEthTx(clientCtx clientcontext.CLIContext, bz []byte) (*evmtypes.MsgEthereumTx, error) {
-	tx, err := evmtypes.TxDecoder(clientCtx.Codec)(bz)
+func RawTxToEthTx(clientCtx clientcontext.CLIContext, bz []byte, height int64) (*evmtypes.MsgEthereumTx, error) {
+	tx, err := evmtypes.TxDecoder(clientCtx.Codec)(bz, height)
 	if err != nil {
 		return nil, sdkerrors.Wrap(sdkerrors.ErrJSONUnmarshal, err.Error())
 	}
 
-	ethTx, ok := tx.(evmtypes.MsgEthereumTx)
+	ethTx, ok := tx.(*evmtypes.MsgEthereumTx)
 	if !ok {
 		return nil, fmt.Errorf("invalid transaction type %T, expected %T", tx, evmtypes.MsgEthereumTx{})
 	}
-	return &ethTx, nil
+	return ethTx, nil
 }
 
-// NewTransaction returns a transaction that will serialize to the RPC
-// representation, with the given location metadata set (if available).
-func NewTransaction(tx *evmtypes.MsgEthereumTx, txHash, blockHash common.Hash, blockNumber, index uint64) (*Transaction, error) {
-	// Verify signature and retrieve sender address
-	fromSigCache, err := tx.VerifySig(tx.ChainID(), int64(blockNumber), sdk.EmptyContext().SigCache())
-	if err != nil {
-		return nil, err
-	}
-
-	from := fromSigCache.GetFrom()
-	rpcTx := &Transaction{
-		From:     from,
+func ToTransaction(tx *evmtypes.MsgEthereumTx, from *common.Address) *watcher.Transaction {
+	rpcTx := &watcher.Transaction{
+		From:     *from,
 		Gas:      hexutil.Uint64(tx.Data.GasLimit),
 		GasPrice: (*hexutil.Big)(tx.Data.Price),
-		Hash:     txHash,
 		Input:    hexutil.Bytes(tx.Data.Payload),
 		Nonce:    hexutil.Uint64(tx.Data.AccountNonce),
 		To:       tx.To(),
@@ -66,45 +59,34 @@ func NewTransaction(tx *evmtypes.MsgEthereumTx, txHash, blockHash common.Hash, b
 		R:        (*hexutil.Big)(tx.Data.R),
 		S:        (*hexutil.Big)(tx.Data.S),
 	}
-
-	if blockHash != (common.Hash{}) {
-		rpcTx.BlockHash = &blockHash
-		rpcTx.BlockNumber = (*hexutil.Big)(new(big.Int).SetUint64(blockNumber))
-		rpcTx.TransactionIndex = (*hexutil.Uint64)(&index)
-	}
-
-	return rpcTx, nil
+	return rpcTx
 }
 
-// EthBlockFromTendermint returns a JSON-RPC compatible Ethereum blockfrom a given Tendermint block.
-func EthBlockFromTendermint(clientCtx clientcontext.CLIContext, block *tmtypes.Block, fullTx bool) (map[string]interface{}, error) {
-	var blockTxs interface{}
+// RpcBlockFromTendermint returns a JSON-RPC compatible Ethereum blockfrom a given Tendermint block.
+func RpcBlockFromTendermint(clientCtx clientcontext.CLIContext, block *tmtypes.Block, fullTx bool, txsLimit int) (*watcher.Block, error) {
 	gasLimit, err := BlockMaxGasFromConsensusParams(context.Background(), clientCtx)
 	if err != nil {
 		return nil, err
 	}
-
-	transactions, gasUsed, ethTxs, err := EthTransactionsFromTendermint(clientCtx, block.Txs, common.BytesToHash(block.Hash()), uint64(block.Height))
-	if err != nil {
-		return nil, err
+	var ethTxs []*watcher.Transaction
+	gasUsed := big.NewInt(0)
+	if txsLimit == 0 || len(block.Txs) <= txsLimit {
+		gasUsed, ethTxs, err = EthTransactionsFromTendermint(clientCtx, block.Txs, common.BytesToHash(block.Hash()), uint64(block.Height))
+		if err != nil {
+			return nil, err
+		}
 	}
 
+	var bloom ethtypes.Bloom
+	clientCtx = clientCtx.WithHeight(block.Height)
 	res, _, err := clientCtx.Query(fmt.Sprintf("custom/%s/%s/%d", evmtypes.ModuleName, evmtypes.QueryBloom, block.Height))
-	if err != nil {
-		return nil, err
+	if err == nil {
+		var bloomRes evmtypes.QueryBloomFilter
+		clientCtx.Codec.MustUnmarshalJSON(res, &bloomRes)
+		bloom = bloomRes.Bloom
 	}
 
-	var bloomRes evmtypes.QueryBloomFilter
-	clientCtx.Codec.MustUnmarshalJSON(res, &bloomRes)
-
-	bloom := bloomRes.Bloom
-	if fullTx {
-		blockTxs = ethTxs
-	} else {
-		blockTxs = transactions
-	}
-
-	return FormatBlock(block.Header, block.Size(), block.Hash(), gasLimit, gasUsed, blockTxs, bloom), nil
+	return FormatBlock(block.Header, block.Size(), block.Hash(), gasLimit, gasUsed, ethTxs, bloom, fullTx), nil
 }
 
 // EthHeaderFromTendermint is an util function that returns an Ethereum Header
@@ -128,29 +110,27 @@ func EthHeaderFromTendermint(header tmtypes.Header) *ethtypes.Header {
 
 // EthTransactionsFromTendermint returns a slice of ethereum transaction hashes and the total gas usage from a set of
 // tendermint block transactions.
-func EthTransactionsFromTendermint(clientCtx clientcontext.CLIContext, txs []tmtypes.Tx, blockHash common.Hash, blockNumber uint64) ([]common.Hash, *big.Int, []*Transaction, error) {
-	var transactionHashes []common.Hash
-	var transactions []*Transaction
+func EthTransactionsFromTendermint(clientCtx clientcontext.CLIContext, txs []tmtypes.Tx, blockHash common.Hash, blockNumber uint64) (*big.Int, []*watcher.Transaction, error) {
+	var transactions []*watcher.Transaction
 	gasUsed := big.NewInt(0)
 	index := uint64(0)
 
 	for _, tx := range txs {
-		ethTx, err := RawTxToEthTx(clientCtx, tx)
+		ethTx, err := RawTxToEthTx(clientCtx, tx, int64(blockNumber))
 		if err != nil {
 			// continue to next transaction in case it's not a MsgEthereumTx
 			continue
 		}
 		// TODO: Remove gas usage calculation if saving gasUsed per block
 		gasUsed.Add(gasUsed, big.NewInt(int64(ethTx.GetGas())))
-		transactionHashes = append(transactionHashes, common.BytesToHash(tx.Hash()))
-		tx, err := NewTransaction(ethTx, common.BytesToHash(tx.Hash()), blockHash, blockNumber, index)
+		tx, err := watcher.NewTransaction(ethTx, common.BytesToHash(ethTx.Hash), blockHash, blockNumber, index)
 		if err == nil {
 			transactions = append(transactions, tx)
 			index++
 		}
 	}
 
-	return transactionHashes, gasUsed, transactions, nil
+	return gasUsed, transactions, nil
 }
 
 // BlockMaxGasFromConsensusParams returns the gas limit for the latest block from the chain consensus params.
@@ -177,45 +157,56 @@ func BlockMaxGasFromConsensusParams(_ context.Context, clientCtx clientcontext.C
 // transactions.
 func FormatBlock(
 	header tmtypes.Header, size int, curBlockHash tmbytes.HexBytes, gasLimit int64,
-	gasUsed *big.Int, transactions interface{}, bloom ethtypes.Bloom,
-) map[string]interface{} {
-	if len(header.DataHash) == 0 {
-		header.DataHash = tmbytes.HexBytes(common.Hash{}.Bytes())
+	gasUsed *big.Int, transactions []*watcher.Transaction, bloom ethtypes.Bloom, fullTx bool,
+) *watcher.Block {
+	transactionsRoot := ethtypes.EmptyRootHash
+	if len(transactions) > 0 {
+		txBzs := make([][]byte, len(transactions))
+		for i := 0; i < len(transactions); i++ {
+			txBzs[i] = transactions[i].Hash.Bytes()
+		}
+		transactionsRoot = common.BytesToHash(merkle.SimpleHashFromByteSlices(txBzs))
 	}
+
 	parentHash := header.LastBlockID.Hash
 	if parentHash == nil {
 		parentHash = ethtypes.EmptyRootHash.Bytes()
 	}
-	ret := map[string]interface{}{
-		"number":           hexutil.Uint64(header.Height),
-		"hash":             hexutil.Bytes(curBlockHash),
-		"parentHash":       hexutil.Bytes(parentHash),
-		"nonce":            ethtypes.BlockNonce{},   // PoW specific
-		"sha3Uncles":       ethtypes.EmptyUncleHash, // No uncles in Tendermint
-		"logsBloom":        bloom,
-		"transactionsRoot": hexutil.Bytes(header.DataHash),
-		"stateRoot":        hexutil.Bytes(header.AppHash),
-		"miner":            common.BytesToAddress(header.ProposerAddress),
-		"mixHash":          common.Hash{},
-		"difficulty":       hexutil.Uint64(0),
-		"totalDifficulty":  hexutil.Uint64(0),
-		"extraData":        hexutil.Bytes{},
-		"size":             hexutil.Uint64(size),
-		"gasLimit":         hexutil.Uint64(gasLimit), // Static gas limit
-		"gasUsed":          (*hexutil.Big)(gasUsed),
-		"timestamp":        hexutil.Uint64(header.Time.Unix()),
-		"uncles":           []common.Hash{},
-		"receiptsRoot":     ethtypes.EmptyRootHash,
+	ret := &watcher.Block{
+		Number:           hexutil.Uint64(header.Height),
+		Hash:             common.BytesToHash(curBlockHash),
+		ParentHash:       common.BytesToHash(parentHash),
+		Nonce:            watcher.BlockNonce{},    // PoW specific
+		UncleHash:        ethtypes.EmptyUncleHash, // No uncles in Tendermint
+		LogsBloom:        bloom,
+		TransactionsRoot: transactionsRoot,
+		StateRoot:        common.BytesToHash(header.AppHash),
+		Miner:            common.BytesToAddress(header.ProposerAddress),
+		MixHash:          common.Hash{},
+		Difficulty:       hexutil.Uint64(0),
+		TotalDifficulty:  hexutil.Uint64(0),
+		ExtraData:        hexutil.Bytes{},
+		Size:             hexutil.Uint64(size),
+		GasLimit:         hexutil.Uint64(gasLimit), // Static gas limit
+		GasUsed:          (*hexutil.Big)(gasUsed),
+		Timestamp:        hexutil.Uint64(header.Time.Unix()),
+		Uncles:           []common.Hash{},
+		ReceiptsRoot:     ethtypes.EmptyRootHash,
 	}
-	if !reflect.ValueOf(transactions).IsNil() {
-		switch transactions.(type) {
-		case []common.Hash:
-			ret["transactions"] = transactions.([]common.Hash)
-		case []*Transaction:
-			ret["transactions"] = transactions.([]*Transaction)
+
+	if fullTx {
+		// return empty slice instead of nil for compatibility with Ethereum
+		if len(transactions) == 0 {
+			ret.Transactions = []*watcher.Transaction{}
+		} else {
+			ret.Transactions = transactions
 		}
 	} else {
-		ret["transactions"] = []common.Hash{}
+		txHashes := make([]common.Hash, len(transactions))
+		for i, tx := range transactions {
+			txHashes[i] = tx.Hash
+		}
+		ret.Transactions = txHashes
 	}
 	return ret
 }
@@ -238,17 +229,12 @@ func GetBlockCumulativeGas(cdc *codec.Codec, block *tmtypes.Block, idx int) uint
 	txDecoder := evmtypes.TxDecoder(cdc)
 
 	for i := 0; i < idx && i < len(block.Txs); i++ {
-		txi, err := txDecoder(block.Txs[i])
+		txi, err := txDecoder(block.Txs[i], block.Height)
 		if err != nil {
 			continue
 		}
 
-		switch tx := txi.(type) {
-		case authtypes.StdTx:
-			gasUsed += tx.GetGas()
-		case evmtypes.MsgEthereumTx:
-			gasUsed += tx.GetGas()
-		}
+		gasUsed += txi.GetGas()
 	}
 	return gasUsed
 }
@@ -276,4 +262,107 @@ func EthHeaderWithBlockHashFromTendermint(tmHeader *tmtypes.Header) (header *Eth
 	}
 
 	return
+}
+
+func RawTxToRealTx(clientCtx clientcontext.CLIContext, bz tmtypes.Tx,
+	blockHash common.Hash, blockNumber, index uint64) (sdk.Tx, error) {
+	realTx, err := evmtypes.TxDecoder(clientCtx.CodecProy)(bz, int64(blockNumber))
+	if err != nil {
+		return nil, sdkerrors.Wrap(sdkerrors.ErrJSONUnmarshal, err.Error())
+	}
+
+	return realTx, nil
+}
+
+func RawTxResultToEthReceipt(chainID *big.Int, tr *ctypes.ResultTx, realTx sdk.Tx,
+	blockHash common.Hash) (*watcher.TransactionResult, error) {
+	// Convert tx bytes to eth transaction
+	ethTx, ok := realTx.(*evmtypes.MsgEthereumTx)
+	if !ok {
+		return nil, fmt.Errorf("invalid transaction type %T, expected %T", realTx, evmtypes.MsgEthereumTx{})
+	}
+
+	// try to get from event
+	if from, err := GetEthSender(tr); err == nil {
+		ethTx.BaseTx.From = from
+	} else {
+		// try to get from sig
+		err := ethTx.VerifySig(chainID, tr.Height)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Set status codes based on tx result
+	var status = hexutil.Uint64(0)
+	if tr.TxResult.IsOK() {
+		status = hexutil.Uint64(1)
+	}
+
+	txData := tr.TxResult.GetData()
+	data, err := evmtypes.DecodeResultData(txData)
+	if err != nil {
+		status = 0 // transaction failed
+	}
+
+	if len(data.Logs) == 0 {
+		data.Logs = []*ethtypes.Log{}
+	}
+	contractAddr := &data.ContractAddress
+	if data.ContractAddress == common.HexToAddress("0x00000000000000000000") {
+		contractAddr = nil
+	}
+
+	// fix gasUsed when deliverTx ante handler check sequence invalid
+	gasUsed := tr.TxResult.GasUsed
+	if tr.TxResult.Code == sdkerrors.ErrInvalidSequence.ABCICode() {
+		gasUsed = 0
+	}
+
+	receipt := watcher.TransactionReceipt{
+		Status: status,
+		//CumulativeGasUsed: hexutil.Uint64(cumulativeGasUsed),
+		LogsBloom:        data.Bloom,
+		Logs:             data.Logs,
+		TransactionHash:  common.BytesToHash(tr.Hash.Bytes()).String(),
+		ContractAddress:  contractAddr,
+		GasUsed:          hexutil.Uint64(gasUsed),
+		BlockHash:        blockHash.String(),
+		BlockNumber:      hexutil.Uint64(tr.Height),
+		TransactionIndex: hexutil.Uint64(tr.Index),
+		From:             ethTx.GetFrom(),
+		To:               ethTx.To(),
+	}
+
+	rpcTx, err := watcher.NewTransaction(ethTx, common.BytesToHash(tr.Hash),
+		blockHash, uint64(tr.Height), uint64(tr.Index))
+	if err != nil {
+		return nil, err
+	}
+
+	return &watcher.TransactionResult{TxType: hexutil.Uint64(watcher.EthReceipt),
+		Receipt: &receipt, EthTx: rpcTx, EthTxLog: tr.TxResult.Log}, nil
+}
+
+func GetEthSender(tr *ctypes.ResultTx) (string, error) {
+	for _, ev := range tr.TxResult.Events {
+		if ev.Type == sdk.EventTypeMessage {
+			fromAddr := ""
+			realEvmTx := false
+			for _, attr := range ev.Attributes {
+				if string(attr.Key) == sdk.AttributeKeySender {
+					fromAddr = string(attr.Value)
+				}
+				if string(attr.Key) == sdk.AttributeKeyModule &&
+					string(attr.Value) == evmtypes.AttributeValueCategory { // to avoid the evm to cm tx enter
+					realEvmTx = true
+				}
+				// find the sender
+				if fromAddr != "" && realEvmTx {
+					return fromAddr, nil
+				}
+			}
+		}
+	}
+	return "", errors.New("No sender in Event")
 }

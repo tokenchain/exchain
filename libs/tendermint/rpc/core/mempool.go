@@ -8,7 +8,9 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/okex/exchain/libs/cosmos-sdk/baseapp"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
+	"github.com/okex/exchain/libs/tendermint/config"
 	mempl "github.com/okex/exchain/libs/tendermint/mempool"
 	ctypes "github.com/okex/exchain/libs/tendermint/rpc/core/types"
 	rpctypes "github.com/okex/exchain/libs/tendermint/rpc/jsonrpc/types"
@@ -22,12 +24,13 @@ import (
 // CheckTx nor DeliverTx results.
 // More: https://docs.tendermint.com/master/rpc/#/Tx/broadcast_tx_async
 func BroadcastTxAsync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
+	rtx := mempl.GetRealTxFromWrapCMTx(tx)
 	err := env.Mempool.CheckTx(tx, nil, mempl.TxInfo{})
 
 	if err != nil {
 		return nil, err
 	}
-	return &ctypes.ResultBroadcastTx{Hash: tx.Hash()}, nil
+	return &ctypes.ResultBroadcastTx{Hash: rtx.Hash(env.BlockStore.Height())}, nil
 }
 
 // BroadcastTxSync returns with the response from CheckTx. Does not wait for
@@ -35,6 +38,7 @@ func BroadcastTxAsync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadca
 // More: https://docs.tendermint.com/master/rpc/#/Tx/broadcast_tx_sync
 func BroadcastTxSync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
 	resCh := make(chan *abci.Response, 1)
+	rtx := mempl.GetRealTxFromWrapCMTx(tx)
 	err := env.Mempool.CheckTx(tx, func(res *abci.Response) {
 		resCh <- res
 	}, mempl.TxInfo{})
@@ -43,12 +47,14 @@ func BroadcastTxSync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcas
 	}
 	res := <-resCh
 	r := res.GetCheckTx()
+	// reset r.Data for compatibility with cosmwasmJS
+	r.Data = nil
 	return &ctypes.ResultBroadcastTx{
 		Code:      r.Code,
 		Data:      r.Data,
 		Log:       r.Log,
 		Codespace: r.Codespace,
-		Hash:      tx.Hash(),
+		Hash:      rtx.Hash(env.BlockStore.Height()),
 	}, nil
 }
 
@@ -57,8 +63,8 @@ func BroadcastTxSync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcas
 func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
 	subscriber := ctx.RemoteAddr()
 
-	if env.EventBus.NumClients() >= env.Config.MaxSubscriptionClients {
-		return nil, fmt.Errorf("max_subscription_clients %d reached", env.Config.MaxSubscriptionClients)
+	if env.EventBus.NumClients() >= config.DynamicConfig.GetMaxSubscriptionClients() {
+		return nil, fmt.Errorf("max_subscription_clients %d reached", config.DynamicConfig.GetMaxSubscriptionClients())
 	} else if env.EventBus.NumClientSubscriptions(subscriber) >= env.Config.MaxSubscriptionsPerClient {
 		return nil, fmt.Errorf("max_subscriptions_per_client %d reached", env.Config.MaxSubscriptionsPerClient)
 	}
@@ -66,7 +72,9 @@ func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadc
 	// Subscribe to tx being committed in block.
 	subCtx, cancel := context.WithTimeout(ctx.Context(), SubscribeTimeout)
 	defer cancel()
-	q := types.EventQueryTxFor(tx)
+
+	rtx := mempl.GetRealTxFromWrapCMTx(tx)
+	q := types.EventQueryTxFor(rtx, env.BlockStore.Height())
 	deliverTxSub, err := env.EventBus.Subscribe(subCtx, subscriber, q)
 	if err != nil {
 		err = fmt.Errorf("failed to subscribe to tx: %w", err)
@@ -90,7 +98,7 @@ func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadc
 		return &ctypes.ResultBroadcastTxCommit{
 			CheckTx:   *checkTxRes,
 			DeliverTx: abci.ResponseDeliverTx{},
-			Hash:      tx.Hash(),
+			Hash:      rtx.Hash(env.BlockStore.Height()),
 		}, nil
 	}
 
@@ -101,7 +109,7 @@ func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadc
 		return &ctypes.ResultBroadcastTxCommit{
 			CheckTx:   *checkTxRes,
 			DeliverTx: deliverTxRes.Result,
-			Hash:      tx.Hash(),
+			Hash:      rtx.Hash(env.BlockStore.Height()),
 			Height:    deliverTxRes.Height,
 		}, nil
 	case <-deliverTxSub.Cancelled():
@@ -116,7 +124,7 @@ func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadc
 		return &ctypes.ResultBroadcastTxCommit{
 			CheckTx:   *checkTxRes,
 			DeliverTx: abci.ResponseDeliverTx{},
-			Hash:      tx.Hash(),
+			Hash:      rtx.Hash(env.BlockStore.Height()),
 		}, err
 	case <-time.After(env.Config.TimeoutBroadcastTxCommit):
 		err = errors.New("timed out waiting for tx to be included in a block")
@@ -124,7 +132,7 @@ func BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadc
 		return &ctypes.ResultBroadcastTxCommit{
 			CheckTx:   *checkTxRes,
 			DeliverTx: abci.ResponseDeliverTx{},
-			Hash:      tx.Hash(),
+			Hash:      rtx.Hash(env.BlockStore.Height()),
 		}, err
 	}
 }
@@ -151,6 +159,12 @@ func NumUnconfirmedTxs(ctx *rpctypes.Context) (*ctypes.ResultUnconfirmedTxs, err
 		TotalBytes: env.Mempool.TxsBytes()}, nil
 }
 
+func TxSimulateGasCost(ctx *rpctypes.Context, hash string) (*ctypes.ResponseTxSimulateGas, error) {
+	return &ctypes.ResponseTxSimulateGas{
+		GasCost: env.Mempool.GetTxSimulateGas(hash),
+	}, nil
+}
+
 func UserUnconfirmedTxs(address string, limit int) (*ctypes.ResultUserUnconfirmedTxs, error) {
 	txs := env.Mempool.ReapUserTxs(address, limit)
 	return &ctypes.ResultUserUnconfirmedTxs{
@@ -158,10 +172,18 @@ func UserUnconfirmedTxs(address string, limit int) (*ctypes.ResultUserUnconfirme
 		Txs:   txs}, nil
 }
 
+func TmUserUnconfirmedTxs(ctx *rpctypes.Context, address string, limit int) (*ctypes.ResultUserUnconfirmedTxs, error) {
+	return UserUnconfirmedTxs(address, limit)
+}
+
 func UserNumUnconfirmedTxs(address string) (*ctypes.ResultUserUnconfirmedTxs, error) {
 	nums := env.Mempool.ReapUserTxsCnt(address)
 	return &ctypes.ResultUserUnconfirmedTxs{
 		Count: nums}, nil
+}
+
+func TmUserNumUnconfirmedTxs(ctx *rpctypes.Context, address string) (*ctypes.ResultUserUnconfirmedTxs, error) {
+	return UserNumUnconfirmedTxs(address)
 }
 
 func GetUnconfirmedTxByHash(hash [sha256.Size]byte) (types.Tx, error) {
@@ -173,4 +195,31 @@ func GetAddressList() (*ctypes.ResultUnconfirmedAddresses, error) {
 	return &ctypes.ResultUnconfirmedAddresses{
 		Addresses: addressList,
 	}, nil
+}
+
+func TmGetAddressList(ctx *rpctypes.Context) (*ctypes.ResultUnconfirmedAddresses, error) {
+	return GetAddressList()
+}
+
+func GetPendingNonce(address string) (*ctypes.ResultPendingNonce, bool) {
+	nonce, ok := env.Mempool.GetPendingNonce(address)
+	if !ok {
+		return nil, false
+	}
+	return &ctypes.ResultPendingNonce{
+		Nonce: nonce,
+	}, true
+}
+
+func GetEnableDeleteMinGPTx(ctx *rpctypes.Context) (*ctypes.ResultEnableDeleteMinGPTx, error) {
+	status := env.Mempool.GetEnableDeleteMinGPTx()
+	return &ctypes.ResultEnableDeleteMinGPTx{Enable: status}, nil
+}
+
+func GetPendingTxs(ctx *rpctypes.Context) (*ctypes.ResultPendingTxs, error) {
+	pendingTx := make(map[string]map[string]types.WrappedMempoolTx)
+	if baseapp.IsMempoolEnablePendingPool() {
+		pendingTx = env.Mempool.GetPendingPoolTxsBytes()
+	}
+	return &ctypes.ResultPendingTxs{Txs: pendingTx}, nil
 }

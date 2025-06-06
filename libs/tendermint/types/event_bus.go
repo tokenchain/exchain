@@ -175,10 +175,14 @@ func (b *EventBus) PublishEventTx(data EventDataTx) error {
 
 	// add predefined compositeKeys
 	events[EventTypeKey] = append(events[EventTypeKey], EventTx)
-	events[TxHashKey] = append(events[TxHashKey], fmt.Sprintf("%X", data.Tx.Hash()))
+	events[TxHashKey] = append(events[TxHashKey], fmt.Sprintf("%X", data.Tx.Hash(data.Height)))
 	events[TxHeightKey] = append(events[TxHeightKey], fmt.Sprintf("%d", data.Height))
 
 	return b.pubsub.PublishWithEvents(ctx, data, events)
+}
+
+func (b *EventBus) PublishEventTxs(data EventDataTxs) error {
+	return b.Publish(EventTxs, data)
 }
 
 func (b *EventBus) PublishEventPendingTx(data EventDataTx) error {
@@ -187,6 +191,21 @@ func (b *EventBus) PublishEventPendingTx(data EventDataTx) error {
 	events := make(map[string][]string)
 	// add predefined compositeKeys
 	events[EventTypeKey] = append(events[EventTypeKey], EventPendingTx)
+	return b.pubsub.PublishWithEvents(ctx, data, events)
+}
+
+func (b *EventBus) PublishEventRmPendingTx(data EventDataRmPendingTx) error {
+	ctx := context.Background()
+
+	events := make(map[string][]string)
+	events[EventTypeKey] = append(events[EventTypeKey], EventRmPendingTx)
+	return b.pubsub.PublishWithEvents(ctx, data, events)
+}
+
+func (b *EventBus) PublishEventLatestBlockTime(data EventDataBlockTime) error {
+	ctx := context.Background()
+	events := make(map[string][]string)
+	events[EventTypeKey] = append(events[EventTypeKey], EventBlockTime)
 	return b.pubsub.PublishWithEvents(ctx, data, events)
 }
 
@@ -266,7 +285,15 @@ func (NopEventBus) PublishEventTx(data EventDataTx) error {
 	return nil
 }
 
+func (NopEventBus) PublishEventTxs(data EventDataTxs) error {
+	return nil
+}
+
 func (NopEventBus) PublishEventPendingTx(data EventDataTx) error {
+	return nil
+}
+
+func (NopEventBus) PublishEventRmPendingTx(EventDataRmPendingTx) error {
 	return nil
 }
 
@@ -307,5 +334,9 @@ func (NopEventBus) PublishEventLock(data EventDataRoundState) error {
 }
 
 func (NopEventBus) PublishEventValidatorSetUpdates(data EventDataValidatorSetUpdates) error {
+	return nil
+}
+
+func (NopEventBus) PublishEventLatestBlockTime(data EventDataBlockTime) error {
 	return nil
 }

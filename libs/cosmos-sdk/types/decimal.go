@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/tendermint/go-amino"
 )
 
 // NOTE: never use new(Dec) or else we will panic unmarshalling into the
@@ -107,6 +109,16 @@ func NewDecFromBigIntWithPrec(i *big.Int, prec int64) Dec {
 	}
 }
 
+// NewDecWithBigIntAndPrec create a new Dec from big integer assuming whole numbers
+// CONTRACT: prec <= Precision
+// The new Dec takes ownership of i, and the
+// caller should not use i after this call
+func NewDecWithBigIntAndPrec(i *big.Int, prec int64) Dec {
+	return Dec{
+		i.Mul(i, precisionMultiplier(prec)),
+	}
+}
+
 // create a new Dec from big integer assuming whole numbers
 // CONTRACT: prec <= Precision
 func NewDecFromInt(i Int) Dec {
@@ -177,6 +189,9 @@ func NewDecFromStr(str string) (Dec, error) {
 	combined, ok := new(big.Int).SetString(combinedStr, 10) // base 10
 	if !ok {
 		return Dec{}, fmt.Errorf("failed to set decimal string: %s", combinedStr)
+	}
+	if combined.BitLen() > maxBitLen {
+		return Dec{}, fmt.Errorf("decimal out of range; bitLen: got %d, max %d", combined.BitLen(), maxBitLen)
 	}
 	if neg {
 		combined = new(big.Int).Neg(combined)
@@ -272,12 +287,29 @@ func (d Dec) MulInt(i Int) Dec {
 
 // MulInt64 - multiplication with int64
 func (d Dec) MulInt64(i int64) Dec {
-	mul := new(big.Int).Mul(d.Int, big.NewInt(i))
+	mul := big.NewInt(i)
+	mul = mul.Mul(d.Int, mul)
 
 	if mul.BitLen() > 255+DecimalPrecisionBits {
 		panic("Int overflow")
 	}
 	return Dec{mul}
+}
+
+// MulInt64To - multiplication with int64 and store result in d2
+func (d Dec) MulInt64To(i int64, d2 *Dec) {
+	if d2.Int == nil {
+		d2.Int = big.NewInt(i)
+	} else {
+		d2.Int.SetInt64(i)
+	}
+
+	d2.Int.Mul(d.Int, d2.Int)
+
+	if d2.Int.BitLen() > 255+DecimalPrecisionBits {
+		panic("Int overflow")
+	}
+	return
 }
 
 // quotient
@@ -417,7 +449,7 @@ func (d Dec) IsInteger() bool {
 
 // format decimal state
 func (d Dec) Format(s fmt.State, verb rune) {
-	_, err := s.Write([]byte(d.String()))
+	_, err := s.Write(amino.StrToBytes(d.String()))
 	if err != nil {
 		panic(err)
 	}
@@ -473,7 +505,7 @@ func (d Dec) String() string {
 		return "-" + string(bzStr)
 	}
 
-	return string(bzStr)
+	return amino.BytesToStr(bzStr)
 }
 
 //     ____
@@ -590,6 +622,12 @@ func (d Dec) TruncateInt() Int {
 	return NewIntFromBigInt(chopPrecisionAndTruncateNonMutative(d.Int))
 }
 
+// TruncateWithPrec truncates an integer based on precision
+func (d Dec) TruncateWithPrec(prec int64) Int {
+	tmp := new(big.Int).Set(d.Int)
+	return NewIntFromBigInt(tmp.Quo(tmp, NewDecWithPrec(1, prec).Int))
+}
+
 // TruncateDec truncates the decimals from the number and returns a Dec
 func (d Dec) TruncateDec() Dec {
 	return NewDecFromBigInt(chopPrecisionAndTruncateNonMutative(d.Int))
@@ -693,6 +731,31 @@ func (d *Dec) UnmarshalAmino(text string) (err error) {
 	return nil
 }
 
+func (d *Dec) UnmarshalFromAmino(_ *amino.Codec, data []byte) error {
+	tempInt := new(big.Int)
+	err := tempInt.UnmarshalText(data)
+	if err != nil {
+		return err
+	}
+	d.Int = tempInt
+	return nil
+}
+
+func (d Dec) MarshalToAmino(_ *amino.Codec) ([]byte, error) {
+	if d.Int == nil {
+		return []byte(nilAmino), nil
+	}
+	bz, err := d.Int.MarshalText()
+	return bz, err
+}
+
+func (d Dec) AminoSize(_ *amino.Codec) int {
+	if d.Int == nil {
+		return len(nilAmino)
+	}
+	return amino.CalcBigIntTextSize(d.Int)
+}
+
 // MarshalJSON marshals the decimal
 func (d Dec) MarshalJSON() ([]byte, error) {
 	if d.Int == nil {
@@ -761,4 +824,59 @@ func MaxDec(d1, d2 Dec) Dec {
 // intended to be used with require/assert:  require.True(DecEq(...))
 func DecEq(t *testing.T, exp, got Dec) (*testing.T, bool, string, string, string) {
 	return t, exp.Equal(got), "expected:\t%v\ngot:\t\t%v", exp.String(), got.String()
+}
+
+// Size implements the gogo proto custom type interface.
+func (d *Dec) Size() int {
+	bz, _ := d.Marshal()
+	return len(bz)
+}
+
+func (d Dec) Marshal() ([]byte, error) {
+	if d.Int == nil {
+		d.Int = new(big.Int)
+	}
+	return d.Int.MarshalText()
+}
+
+// MarshalTo implements the gogo proto custom type interface.
+func (d *Dec) MarshalTo(data []byte) (n int, err error) {
+	if d.Int == nil {
+		d.Int = new(big.Int)
+	}
+
+	if d.Int.Cmp(zeroInt) == 0 {
+		copy(data, []byte{0x30})
+		return 1, nil
+	}
+
+	bz, err := d.Marshal()
+	if err != nil {
+		return 0, err
+	}
+
+	copy(data, bz)
+	return len(bz), nil
+}
+
+// Unmarshal implements the gogo proto custom type interface.
+func (d *Dec) Unmarshal(data []byte) error {
+	if len(data) == 0 {
+		d = nil
+		return nil
+	}
+
+	if d.Int == nil {
+		d.Int = new(big.Int)
+	}
+
+	if err := d.Int.UnmarshalText(data); err != nil {
+		return err
+	}
+
+	if d.Int.BitLen() > maxBitLen {
+		return fmt.Errorf("decimal out of range; got: %d, max: %d", d.Int.BitLen(), maxBitLen)
+	}
+
+	return nil
 }

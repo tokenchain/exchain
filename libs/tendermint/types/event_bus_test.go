@@ -32,7 +32,7 @@ func TestEventBusPublishEventTx(t *testing.T) {
 	}
 
 	// PublishEventTx adds 3 composite keys, so the query below should work
-	query := fmt.Sprintf("tm.event='Tx' AND tx.height=1 AND tx.hash='%X' AND testType.baz=1", tx.Hash())
+	query := fmt.Sprintf("tm.event='Tx' AND tx.height=1 AND tx.hash='%X' AND testType.baz=1", tx.Hash(0))
 	txsSub, err := eventBus.Subscribe(context.Background(), "test", tmquery.MustParse(query))
 	require.NoError(t, err)
 
@@ -47,7 +47,7 @@ func TestEventBusPublishEventTx(t *testing.T) {
 		close(done)
 	}()
 
-	err = eventBus.PublishEventTx(EventDataTx{TxResult{
+	err = eventBus.PublishEventTx(EventDataTx{TxResult: TxResult{
 		Height: 1,
 		Index:  0,
 		Tx:     tx,
@@ -188,7 +188,7 @@ func TestEventBusPublishEventTxDuplicateKeys(t *testing.T) {
 			close(done)
 		}()
 
-		err = eventBus.PublishEventTx(EventDataTx{TxResult{
+		err = eventBus.PublishEventTx(EventDataTx{TxResult: TxResult{
 			Height: 1,
 			Index:  0,
 			Tx:     tx,

@@ -2,9 +2,13 @@ package simulation
 
 import (
 	"encoding/binary"
-	"github.com/okex/exchain/x/evm"
 	"sync"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+
+	"github.com/okex/exchain/app/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	store "github.com/okex/exchain/libs/cosmos-sdk/store/types"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
@@ -13,14 +17,10 @@ import (
 	"github.com/okex/exchain/libs/cosmos-sdk/x/mint"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/params"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/supply"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	ethcrypto "github.com/ethereum/go-ethereum/crypto"
-	"github.com/okex/exchain/app/types"
 	"github.com/okex/exchain/x/ammswap"
-	"github.com/okex/exchain/x/backend"
 	"github.com/okex/exchain/x/dex"
 	distr "github.com/okex/exchain/x/distribution"
+	"github.com/okex/exchain/x/evm"
 	evmtypes "github.com/okex/exchain/x/evm/types"
 	"github.com/okex/exchain/x/evm/watcher"
 	"github.com/okex/exchain/x/farm"
@@ -34,6 +34,7 @@ type QueryOnChainProxy interface {
 	GetAccount(address common.Address) (*types.EthAccount, error)
 	GetStorageAtInternal(address common.Address, key []byte) (hexutil.Bytes, error)
 	GetCodeByHash(hash common.Hash) (hexutil.Bytes, error)
+	GetCodec() *codec.Codec
 }
 
 // AccountKeeper defines the expected account keeper interface
@@ -109,6 +110,10 @@ type SubspaceProxy struct {
 	q *watcher.Querier
 }
 
+func (p SubspaceProxy) CustomKVStore(ctx sdk.Context) sdk.KVStore {
+	panic("implement me")
+}
+
 func NewSubspaceProxy() SubspaceProxy {
 	return SubspaceProxy{
 		q: watcher.NewQuerier(),
@@ -128,6 +133,11 @@ func (p SubspaceProxy) GetParamSet(ctx sdk.Context, ps params.ParamSet) {
 	}
 
 }
+
+func (p SubspaceProxy) RegisterSignal(handler func()) {
+
+}
+
 func (p SubspaceProxy) SetParamSet(ctx sdk.Context, ps params.ParamSet) {
 
 }
@@ -148,7 +158,6 @@ func NewBankKeeperProxy() BankKeeperProxy {
 		token.ModuleName:          {supply.Minter, supply.Burner},
 		dex.ModuleName:            nil,
 		order.ModuleName:          nil,
-		backend.ModuleName:        nil,
 		ammswap.ModuleName:        {supply.Minter, supply.Burner},
 		farm.ModuleName:           nil,
 		farm.YieldFarmingAccount:  nil,
@@ -163,6 +172,13 @@ func NewBankKeeperProxy() BankKeeperProxy {
 
 func (b BankKeeperProxy) BlacklistedAddr(addr sdk.AccAddress) bool {
 	return b.blacklistedAddrs[addr.String()]
+}
+
+type StakingKeeperProxy struct {
+}
+
+func (s StakingKeeperProxy) IsValidator(ctx sdk.Context, addr sdk.AccAddress) bool {
+	return true
 }
 
 type InternalDba struct {
@@ -372,7 +388,11 @@ func (s ContractBlockedListStore) Set(key, value []byte) {
 
 func (s ContractBlockedListStore) Get(key []byte) []byte {
 	//include code and state
-	return nil
+	value, err := s.q.GetContractMethodBlockedList(key)
+	if err != nil {
+		return nil
+	}
+	return value
 }
 
 func (s ContractBlockedListStore) Delete(key []byte) {

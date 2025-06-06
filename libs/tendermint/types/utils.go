@@ -1,6 +1,11 @@
 package types
 
-import "reflect"
+import (
+	jsoniter "github.com/json-iterator/go"
+	"reflect"
+)
+
+var Json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 // Go lacks a simple and safe way to see if something is a typed nil.
 // See:

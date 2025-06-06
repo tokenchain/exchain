@@ -1,31 +1,36 @@
 package eth
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 
-	sdkerror "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
-
 	"github.com/ethereum/go-ethereum/common"
-
-	"github.com/okex/exchain/x/evm/types"
-
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/vm"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/spf13/viper"
 
+	ethermint "github.com/okex/exchain/app/types"
+	clientCtx "github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	"github.com/okex/exchain/libs/cosmos-sdk/server"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	ethermint "github.com/okex/exchain/app/types"
-	"github.com/spf13/viper"
+	sdkerror "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
+	authexported "github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/supply"
+	"github.com/okex/exchain/x/evm/types"
+	"github.com/okex/exchain/x/token"
+	wasmkeeper "github.com/okex/exchain/x/wasm/keeper"
+	wasmtypes "github.com/okex/exchain/x/wasm/types"
 )
 
 const (
 	DefaultEVMErrorCode          = -32000
 	VMExecuteException           = -32015
 	VMExecuteExceptionInEstimate = 3
+	AccountNotExistsCode         = 9
 
 	RPCEthCall           = "eth_call"
 	RPCEthEstimateGas    = "eth_estimateGas"
@@ -41,9 +46,9 @@ func ParseGasPrice() *hexutil.Big {
 	if err == nil && gasPrices != nil && len(gasPrices) > 0 {
 		return (*hexutil.Big)(gasPrices[0].Amount.BigInt())
 	}
-
 	//return the default gas price : DefaultGasPrice
-	return (*hexutil.Big)(sdk.NewDecFromBigIntWithPrec(big.NewInt(ethermint.DefaultGasPrice), sdk.Precision/2+1).BigInt())
+	defaultGP := sdk.NewDecFromBigIntWithPrec(big.NewInt(ethermint.DefaultGasPrice), sdk.Precision/2+1).BigInt()
+	return (*hexutil.Big)(defaultGP)
 }
 
 type cosmosError struct {
@@ -69,6 +74,18 @@ func newWrappedCosmosError(code int, log, codeSpace string) cosmosError {
 	b, _ := json.Marshal(e)
 	e.Log = string(b)
 	return e
+}
+
+func parseCosmosError(err error) (*cosmosError, bool) {
+	msg := err.Error()
+	var realErr cosmosError
+	if len(msg) == 0 {
+		return nil, false
+	}
+	if err := json.Unmarshal([]byte(msg), &realErr); err != nil {
+		return nil, false
+	}
+	return &realErr, true
 }
 
 type wrappedEthError struct {
@@ -111,70 +128,61 @@ func newDataError(revert string, data string) *wrappedEthError {
 }
 
 func TransformDataError(err error, method string) error {
-	msg := err.Error()
-	var realErr cosmosError
-	if len(msg) > 0 {
-		e := json.Unmarshal([]byte(msg), &realErr)
-		if e != nil {
-			return DataError{
-				code: DefaultEVMErrorCode,
-				Msg:  err.Error(),
-				data: RPCNullData,
-			}
+	realErr, ok := parseCosmosError(err)
+	if !ok {
+		return DataError{
+			code: DefaultEVMErrorCode,
+			Msg:  err.Error(),
+			data: RPCNullData,
 		}
-		if method == RPCEthGetBlockByHash {
-			return DataError{
-				code: DefaultEVMErrorCode,
-				Msg:  realErr.Error(),
-				data: RPCNullData,
-			}
-		}
-		m, retErr := preProcessError(realErr, err.Error())
-		if retErr != nil {
-			return realErr
-		}
-		//if there have multi error type of EVM, this need a reactor mode to process error
-		revert, f := m[vm.ErrExecutionReverted.Error()]
-		if !f {
-			revert = RPCUnknowErr
-		}
-		data, f := m[types.ErrorHexData]
-		if !f {
-			data = RPCNullData
-		}
-		switch method {
-		case RPCEthEstimateGas:
-			return DataError{
-				code: VMExecuteExceptionInEstimate,
-				Msg:  revert,
-				data: data,
-			}
-		case RPCEthCall:
-			return DataError{
-				code: VMExecuteException,
-				Msg:  revert,
-				data: newDataError(revert, data),
-			}
-		default:
-			return DataError{
-				code: DefaultEVMErrorCode,
-				Msg:  revert,
-				data: newDataError(revert, data),
-			}
-		}
-
 	}
-	return DataError{
-		code: DefaultEVMErrorCode,
-		Msg:  err.Error(),
-		data: RPCNullData,
+
+	if method == RPCEthGetBlockByHash {
+		return DataError{
+			code: DefaultEVMErrorCode,
+			Msg:  realErr.Error(),
+			data: RPCNullData,
+		}
+	}
+	m, retErr := preProcessError(realErr, err.Error())
+	if retErr != nil {
+		return realErr
+	}
+	//if there have multi error type of EVM, this need a reactor mode to process error
+	revert, f := m[vm.ErrExecutionReverted.Error()]
+	if !f {
+		revert = RPCUnknowErr
+	}
+	data, f := m[types.ErrorHexData]
+	if !f {
+		data = RPCNullData
+	}
+	switch method {
+	case RPCEthEstimateGas:
+		return DataError{
+			code: VMExecuteExceptionInEstimate,
+			Msg:  revert,
+			data: data,
+		}
+	case RPCEthCall:
+		return DataError{
+			code: VMExecuteException,
+			Msg:  revert,
+			data: newDataError(revert, data),
+		}
+	default:
+		return DataError{
+			code: DefaultEVMErrorCode,
+			Msg:  revert,
+			data: newDataError(revert, data),
+		}
 	}
 }
 
 //Preprocess error string, the string of realErr.Log is most like:
 //`["execution reverted","message","HexData","0x00000000000"];some failed information`
 //we need marshalled json slice from realErr.Log and using segment tag `[` and `]` to cut it
-func preProcessError(realErr cosmosError, origErrorMsg string) (map[string]string, error) {
+func preProcessError(realErr *cosmosError, origErrorMsg string) (map[string]string, error) {
 	var logs []string
 	lastSeg := strings.LastIndexAny(realErr.Log, "]")
 	if lastSeg < 0 {
@@ -235,4 +243,34 @@ func getStorageByAddressKey(addr common.Address, key []byte) common.Hash {
 	copy(compositeKey[len(prefix):], key)
 
 	return ethcrypto.Keccak256Hash(compositeKey)
+}
+
+func accountType(account authexported.Account, cliCtx clientCtx.CLIContext, wasmAddr sdk.WasmAddress) token.AccType {
+	switch account.(type) {
+	case *ethermint.EthAccount:
+		ethAcc, _ := account.(*ethermint.EthAccount)
+		if !bytes.Equal(ethAcc.CodeHash, ethcrypto.Keccak256(nil)) {
+			return token.ContractAccount
+		}
+		// Determine whether it is a wasm contract
+		route := fmt.Sprintf("custom/%s/%s/%s", wasmtypes.QuerierRoute, wasmkeeper.QueryGetContract, wasmAddr.String())
+		_, _, err := cliCtx.Query(route)
+		// Here, the address format must be valid, and only wasmtypes.ErrNotFound error may occur.
+		if err == nil {
+			return token.WasmAccount
+		}
+		return token.UserAccount
+	case *supply.ModuleAccount:
+		return token.ModuleAccount
+	default:
+		return token.OtherAccount
+	}
+}
+
+func isAccountNotExistErr(err error) bool {
+	cosmosErr, ok := parseCosmosError(err)
+	if !ok {
+		return false
+	}
+	return cosmosErr.Code == AccountNotExistsCode
 }

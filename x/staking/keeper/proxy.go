@@ -57,9 +57,12 @@ func (k Keeper) UpdateShares(ctx sdk.Context, delAddr sdk.AccAddress, tokens sdk
 		// if the delegator never adds shares, just pass
 		return nil
 	}
+	delegatorValAddresses := vals.ToValAddresses()
+	// withdraw delegation rewards, increments period, remove delegator starting info
+	k.BeforeDelegationSharesModified(ctx, delAddr, delegatorValAddresses)
 
 	lenVals := len(vals)
-	shares, sdkErr := calculateWeight(ctx.BlockTime().Unix(), tokens)
+	shares, sdkErr := calculateWeight(ctx.BlockTime().Unix(), tokens, ctx.BlockHeight())
 	if sdkErr != nil {
 		return sdkErr
 	}
@@ -90,6 +93,9 @@ func (k Keeper) UpdateShares(ctx sdk.Context, delAddr sdk.AccAddress, tokens sdk
 	delegator.Shares = shares
 	k.SetDelegator(ctx, delegator)
 
+	// initialize starting info for a new delegation
+	k.AfterDelegationModified(ctx, delegator.DelegatorAddress, delegatorValAddresses)
+
 	return nil
 }
 
@@ -97,7 +103,8 @@ func (k Keeper) UpdateShares(ctx sdk.Context, delAddr sdk.AccAddress, tokens sdk
 func (k Keeper) AddSharesToValidators(ctx sdk.Context, delAddr sdk.AccAddress, vals types.Validators, tokens sdk.Dec) (
 	shares types.Shares, sdkErr error) {
 	lenVals := len(vals)
-	shares, sdkErr = calculateWeight(ctx.BlockTime().Unix(), tokens)
+
+	shares, sdkErr = calculateWeight(ctx.BlockTime().Unix(), tokens, ctx.BlockHeight())
 	if sdkErr != nil {
 		return
 	}
@@ -111,6 +118,11 @@ func (k Keeper) AddSharesToValidators(ctx sdk.Context, delAddr sdk.AccAddress, v
 func (k Keeper) WithdrawLastShares(ctx sdk.Context, delAddr sdk.AccAddress, lastValsAddedSharesTo types.Validators,
 	lastShares types.Shares) {
 	lenLastVals := len(lastValsAddedSharesTo)
+	if lenLastVals > 0 {
+		// withdraw delegation rewards, remove delegator starting info
+		k.BeforeDelegationSharesModified(ctx, delAddr, lastValsAddedSharesTo.ToValAddresses())
+	}
+
 	for i := 0; i < lenLastVals; i++ {
 		k.withdrawShares(ctx, delAddr, lastValsAddedSharesTo[i], lastShares)
 	}

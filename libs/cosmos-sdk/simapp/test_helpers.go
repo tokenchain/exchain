@@ -4,12 +4,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/libs/tendermint/crypto"
 	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
+	"github.com/stretchr/testify/require"
 
 	bam "github.com/okex/exchain/libs/cosmos-sdk/baseapp"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
@@ -70,7 +70,7 @@ func SetupWithGenesisAccounts(genAccs []authexported.GenesisAccount) *SimApp {
 		},
 	)
 
-	app.Commit()
+	app.Commit(abci.RequestCommit{})
 	app.BeginBlock(abci.RequestBeginBlock{Header: abci.Header{Height: app.LastBlockHeight() + 1}})
 
 	return app
@@ -131,7 +131,7 @@ func SignCheckDeliver(
 	require.Nil(t, err)
 
 	// Must simulate now as CheckTx doesn't run Msgs anymore
-	_, res, err := app.Simulate(txBytes, tx, 0)
+	_, res, err := app.Simulate(txBytes, tx, 0, nil)
 
 	if expSimPass {
 		require.NoError(t, err)
@@ -154,7 +154,7 @@ func SignCheckDeliver(
 	}
 
 	app.EndBlock(abci.RequestEndBlock{})
-	app.Commit()
+	app.Commit(abci.RequestCommit{})
 
 	return gInfo, res, err
 }
@@ -162,8 +162,8 @@ func SignCheckDeliver(
 // GenSequenceOfTxs generates a set of signed transactions of messages, such
 // that they differ only by having the sequence numbers incremented between
 // every transaction.
-func GenSequenceOfTxs(msgs []sdk.Msg, accNums []uint64, initSeqNums []uint64, numToGenerate int, priv ...crypto.PrivKey) []auth.StdTx {
-	txs := make([]auth.StdTx, numToGenerate)
+func GenSequenceOfTxs(msgs []sdk.Msg, accNums []uint64, initSeqNums []uint64, numToGenerate int, priv ...crypto.PrivKey) []*auth.StdTx {
+	txs := make([]*auth.StdTx, numToGenerate)
 	for i := 0; i < numToGenerate; i++ {
 		txs[i] = helpers.GenTx(
 			msgs,

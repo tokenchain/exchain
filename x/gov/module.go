@@ -3,22 +3,21 @@ package gov
 import (
 	"encoding/json"
 	"math/rand"
-	sim "github.com/okex/exchain/libs/cosmos-sdk/x/simulation"
 
+	"github.com/gorilla/mux"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/types/module"
-	"github.com/gorilla/mux"
-	"github.com/spf13/cobra"
+	sim "github.com/okex/exchain/libs/cosmos-sdk/x/simulation"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
-
 	"github.com/okex/exchain/x/gov/client"
 	"github.com/okex/exchain/x/gov/client/cli"
-	GovCli "github.com/okex/exchain/x/gov/client/cli"
 	"github.com/okex/exchain/x/gov/client/rest"
 	"github.com/okex/exchain/x/gov/keeper"
 	"github.com/okex/exchain/x/gov/types"
+	"github.com/okex/exchain/x/wasm/watcher"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -77,12 +76,7 @@ func (a AppModuleBasic) RegisterRESTRoutes(ctx context.CLIContext, rtr *mux.Rout
 
 // GetTxCmd gets the root tx command of this module
 func (a AppModuleBasic) GetTxCmd(cdc *codec.Codec) *cobra.Command {
-	proposalCLIHandlers := make([]*cobra.Command, len(a.proposalHandlers))
-	for i, proposalHandler := range a.proposalHandlers {
-		proposalCLIHandlers[i] = proposalHandler.CLIHandler(cdc)
-	}
-
-	return GovCli.GetTxCmd(types.StoreKey, cdc, proposalCLIHandlers)
+	return nil
 }
 
 // GetQueryCmd gets the root query command of this module
@@ -156,6 +150,10 @@ func (AppModule) BeginBlock(_ sdk.Context, _ abci.RequestBeginBlock) {}
 // EndBlock implements module end-block
 func (am AppModule) EndBlock(ctx sdk.Context, _ abci.RequestEndBlock) []abci.ValidatorUpdate {
 	EndBlocker(ctx, am.keeper)
+	if watcher.Enable() {
+		watcher.Save(nil)
+	}
+
 	return []abci.ValidatorUpdate{}
 }
 

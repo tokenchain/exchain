@@ -7,21 +7,20 @@
 package distribution
 
 import (
-	"github.com/okex/exchain/x/distribution/client"
 	"github.com/okex/exchain/x/distribution/keeper"
 	"github.com/okex/exchain/x/distribution/types"
 )
 
 const (
-	ModuleName                  = types.ModuleName
-	StoreKey                    = types.StoreKey
-	RouterKey                   = types.RouterKey
-	QuerierRoute                = types.QuerierRoute
-	QueryParams                 = types.QueryParams
-	QueryValidatorCommission    = types.QueryValidatorCommission
-	QueryWithdrawAddr           = types.QueryWithdrawAddr
-	ParamWithdrawAddrEnabled    = types.ParamWithdrawAddrEnabled
-	DefaultParamspace           = types.DefaultParamspace
+	ModuleName               = types.ModuleName
+	StoreKey                 = types.StoreKey
+	RouterKey                = types.RouterKey
+	QuerierRoute             = types.QuerierRoute
+	QueryParams              = types.QueryParams
+	QueryValidatorCommission = types.QueryValidatorCommission
+	QueryWithdrawAddr        = types.QueryWithdrawAddr
+	ParamWithdrawAddrEnabled = types.ParamWithdrawAddrEnabled
+	DefaultParamspace        = types.DefaultParamspace
 )
 
 var (
@@ -60,7 +59,6 @@ var (
 	AttributeKeyWithdrawAddress          = types.AttributeKeyWithdrawAddress
 	AttributeKeyValidator                = types.AttributeKeyValidator
 	AttributeValueCategory               = types.AttributeValueCategory
-	ProposalHandler                      = client.ProposalHandler
 )
 
 type (

@@ -3,8 +3,6 @@ package types
 import (
 	"encoding/json"
 	"math/big"
-
-	"github.com/okex/exchain/libs/tendermint/mempool"
 )
 
 // Transactions messages must fulfill the Msg
@@ -42,17 +40,85 @@ type Tx interface {
 	// require access to any other information.
 	ValidateBasic() error
 
-	// Return tx sender and gas price
-	GetTxInfo(ctx Context) mempool.ExTxInfo
-
 	// Return tx gas price
 	GetGasPrice() *big.Int
+
+	// Return tx call function signature
+	GetTxFnSignatureInfo() ([]byte, int)
+
+	GetType() TransactionType
+
+	GetSigners() []AccAddress
+
+	GetGas() uint64
+
+	GetRaw() []byte
+	GetFrom() string
+	GetEthAddr() string
+	GetSender(ctx Context) string
+	GetNonce() uint64
+	TxHash() []byte
+	SetRaw([]byte)
+	SetTxHash([]byte)
 }
+
+type HeightSensitive interface {
+	ValidWithHeight(h int64) error
+}
+
+type TxAdapter interface {
+	Tx
+	HeightSensitive
+}
+
+type BaseTx struct {
+	Raw   []byte
+	Hash  []byte
+	From  string
+	Nonce uint64
+}
+
+func (tx *BaseTx) GetMsgs() []Msg                      { return nil }
+func (tx *BaseTx) ValidateBasic() error                { return nil }
+func (tx *BaseTx) GetGasPrice() *big.Int               { return big.NewInt(0) }
+func (tx *BaseTx) GetTxFnSignatureInfo() ([]byte, int) { return nil, 0 }
+func (tx *BaseTx) GetType() TransactionType            { return UnknownType }
+func (tx *BaseTx) GetSigners() []AccAddress            { return nil }
+func (tx *BaseTx) GetGas() uint64                      { return 0 }
+func (tx *BaseTx) GetNonce() uint64                    { return tx.Nonce }
+func (tx *BaseTx) GetFrom() string                     { return tx.From }
+func (tx *BaseTx) GetEthAddr() string                  { return tx.GetFrom() }
+func (tx *BaseTx) GetRaw() []byte                      { return tx.Raw }
+func (tx *BaseTx) TxHash() []byte                      { return tx.Hash }
+func (tx *BaseTx) SetRaw(raw []byte)                   { tx.Raw = raw }
+func (tx *BaseTx) SetTxHash(hash []byte)               { tx.Hash = hash }
+func (tx *BaseTx) GetSender(_ Context) string          { return tx.From }
 
 //__________________________________________________________
 
+type TransactionType int
+
+const (
+	UnknownType TransactionType = iota
+	StdTxType
+	EvmTxType
+)
+
+func (t TransactionType) String() (res string) {
+	switch t {
+	case StdTxType:
+		res = "StdTx"
+	case EvmTxType:
+		res = "EvmTx"
+	default:
+		res = "Unknown"
+	}
+	return res
+}
+
+// __________________________________________________________
 // TxDecoder unmarshals transaction bytes
-type TxDecoder func(txBytes []byte) (Tx, error)
+type TxDecoder func(txBytes []byte, height ...int64) (Tx, error)
 
 // TxEncoder marshals transaction to bytes
 type TxEncoder func(tx Tx) ([]byte, error)
@@ -61,7 +127,7 @@ type TxEncoder func(tx Tx) ([]byte, error)
 
 var _ Msg = (*TestMsg)(nil)
 
-// msg type for testing
+// TestMsg is msg type for testing
 type TestMsg struct {
 	signers []AccAddress
 }
@@ -72,7 +138,7 @@ func NewTestMsg(addrs ...AccAddress) *TestMsg {
 	}
 }
 
-//nolint
+// nolint
 func (msg *TestMsg) Route() string { return "TestMsg" }
 func (msg *TestMsg) Type() string  { return "Test message" }
 func (msg *TestMsg) GetSignBytes() []byte {
@@ -85,4 +151,29 @@ func (msg *TestMsg) GetSignBytes() []byte {
 func (msg *TestMsg) ValidateBasic() error { return nil }
 func (msg *TestMsg) GetSigners() []AccAddress {
 	return msg.signers
+}
+
+type TestMsg2 struct {
+	Signers []AccAddress
+}
+
+func NewTestMsg2(addrs ...AccAddress) *TestMsg2 {
+	return &TestMsg2{
+		Signers: addrs,
+	}
+}
+
+// nolint
+func (msg TestMsg2) Route() string { return "TestMsg" }
+func (msg TestMsg2) Type() string  { return "Test message" }
+func (msg TestMsg2) GetSignBytes() []byte {
+	bz, err := json.Marshal(msg.Signers)
+	if err != nil {
+		panic(err)
+	}
+	return MustSortJSON(bz)
+}
+func (msg TestMsg2) ValidateBasic() error { return nil }
+func (msg TestMsg2) GetSigners() []AccAddress {
+	return msg.Signers
 }

@@ -3,8 +3,8 @@ package types
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
+	"github.com/stretchr/testify/require"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	authtypes "github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
@@ -28,7 +28,7 @@ func TestValidateGenesisMultipleMessages(t *testing.T) {
 		sdk.NewInt64Coin(sdk.DefaultBondDenom, 50), desc, comm, sdk.OneInt())
 
 	genTxs := authtypes.NewStdTx([]sdk.Msg{msg1, msg2}, authtypes.StdFee{}, nil, "")
-	genesisState := NewGenesisStateFromStdTx([]authtypes.StdTx{genTxs})
+	genesisState := NewGenesisStateFromStdTx(genTxs)
 
 	err := ValidateGenesis(genesisState)
 	require.Error(t, err)
@@ -40,7 +40,7 @@ func TestValidateGenesisBadMessage(t *testing.T) {
 	msg1 := stakingtypes.NewMsgEditValidator(sdk.ValAddress(pk1.Address()), desc, nil, nil)
 
 	genTxs := authtypes.NewStdTx([]sdk.Msg{msg1}, authtypes.StdFee{}, nil, "")
-	genesisState := NewGenesisStateFromStdTx([]authtypes.StdTx{genTxs})
+	genesisState := NewGenesisStateFromStdTx(genTxs)
 
 	err := ValidateGenesis(genesisState)
 	require.Error(t, err)

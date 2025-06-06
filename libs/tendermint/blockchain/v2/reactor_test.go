@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	dbm "github.com/okex/exchain/libs/tm-db"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	dbm "github.com/tendermint/tm-db"
 
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	"github.com/okex/exchain/libs/tendermint/behaviour"
@@ -78,8 +78,7 @@ type mockBlockApplier struct {
 
 // XXX: Add whitelist/blacklist?
 func (mba *mockBlockApplier) ApplyBlock(
-	state sm.State, blockID types.BlockID, block *types.Block,
-) (sm.State, int64, error) {
+	state sm.State, blockID types.BlockID, block *types.Block) (sm.State, int64, error) {
 	state.LastBlockHeight++
 	return state, 0, nil
 }
@@ -529,5 +528,6 @@ func newReactorStore(
 
 		blockStore.SaveBlock(thisBlock, thisParts, lastCommit)
 	}
+
 	return blockStore, state, blockExec
 }

@@ -204,9 +204,18 @@ type ResultUserUnconfirmedTxs struct {
 	Txs   []types.Tx `json:"txs"`
 }
 
+type ResponseTxSimulateGas struct {
+	GasCost int64 `json:"gas_cost"`
+}
+
 // List of mempool addresses
 type ResultUnconfirmedAddresses struct {
 	Addresses []string `json:"addresses"`
+}
+
+// max nonce in mempool txs
+type ResultPendingNonce struct {
+	Nonce uint64 `json:"nonce"`
 }
 
 // Info abci msg
@@ -224,6 +233,14 @@ type ResultBroadcastEvidence struct {
 	Hash []byte `json:"hash"`
 }
 
+type ResultEnableDeleteMinGPTx struct {
+	Enable bool `json:"enable"`
+}
+
+type ResultPendingTxs struct {
+	Txs map[string]map[string]types.WrappedMempoolTx `json:"pending_txs"`
+}
+
 // empty results
 type (
 	ResultUnsafeFlushMempool struct{}
@@ -238,4 +255,17 @@ type ResultEvent struct {
 	Query  string              `json:"query"`
 	Data   types.TMEventData   `json:"data"`
 	Events map[string][]string `json:"events"`
+}
+
+func (r ResultEvent) Upgrade() interface{} {
+	if v, ok := r.Data.(types.UpgradeAble); ok {
+		r.Data = v.Upgrade()
+	}
+	return r
+}
+
+// ResultBlockSearch defines the RPC response type for a block search by events.
+type ResultBlockSearch struct {
+	Blocks     []*ResultBlock `json:"blocks"`
+	TotalCount int            `json:"total_count"`
 }

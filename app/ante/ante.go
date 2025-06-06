@@ -1,17 +1,20 @@
 package ante
 
 import (
+	"github.com/okex/exchain/app/crypto/ethsecp256k1"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
 	authante "github.com/okex/exchain/libs/cosmos-sdk/x/auth/ante"
-	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/keeper"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
-
-	"github.com/okex/exchain/app/crypto/ethsecp256k1"
-	evmtypes "github.com/okex/exchain/x/evm/types"
-
+	ibc "github.com/okex/exchain/libs/ibc-go/modules/core"
+	ibcante "github.com/okex/exchain/libs/ibc-go/modules/core/ante"
+	"github.com/okex/exchain/libs/system/trace"
 	tmcrypto "github.com/okex/exchain/libs/tendermint/crypto"
+	govante "github.com/okex/exchain/x/gov/ante"
+	"github.com/okex/exchain/x/params"
+	"github.com/okex/exchain/x/staking"
+	wasmkeeper "github.com/okex/exchain/x/wasm/keeper"
 )
 
 func init() {
@@ -29,43 +32,58 @@ const (
 // Ethereum or SDK transaction to an internal ante handler for performing
 // transaction-level processing (e.g. fee payment, signature verification) before
 // being passed onto it's respective handler.
-func NewAnteHandler(ak auth.AccountKeeper, evmKeeper EVMKeeper, sk types.SupplyKeeper, validateMsgHandler ValidateMsgHandler) sdk.AnteHandler {
+func NewAnteHandler(ak auth.AccountKeeper, evmKeeper EVMKeeper, sk types.SupplyKeeper, validateMsgHandler ValidateMsgHandler, option wasmkeeper.HandlerOption, ibcChannelKeepr *ibc.Keeper, s staking.Keeper, pk params.Keeper) sdk.AnteHandler {
+	var stdTxAnteHandler, evmTxAnteHandler sdk.AnteHandler
+
+	stdTxAnteHandler = sdk.ChainAnteDecorators(
+		authante.NewSetUpContextDecorator(), // outermost AnteDecorator. SetUpContext must be called first
+		NewWasmGasLimitDecorator(evmKeeper), // gas limit should not be greater than max gas limit
+		wasmkeeper.NewCountTXDecorator(option.TXCounterStoreKey),
+		NewAccountBlockedVerificationDecorator(evmKeeper), //account blocked check AnteDecorator
+		authante.NewMempoolFeeDecorator(),
+		authante.NewValidateBasicDecorator(),
+		authante.NewValidateMemoDecorator(ak),
+		authante.NewConsumeGasForTxSizeDecorator(ak),
+		authante.NewSetPubKeyDecorator(ak), // SetPubKeyDecorator must be called before all signature verification decorators
+		authante.NewValidateSigCountDecorator(ak),
+		authante.NewDeductFeeDecorator(ak, sk),
+		authante.NewSigGasConsumeDecorator(ak, sigGasConsumer),
+		authante.NewSigVerificationDecorator(ak),
+		authante.NewIncrementSequenceDecorator(ak), // innermost AnteDecorator
+		NewValidateMsgHandlerDecorator(validateMsgHandler),
+		ibcante.NewAnteDecorator(ibcChannelKeepr),
+		govante.NewAnteDecorator(s, ak, pk),
+	)
+
+	evmTxAnteHandler = sdk.ChainAnteDecorators(
+		NewEthSetupContextDecorator(), // outermost AnteDecorator. EthSetUpContext must be called first
+		NewGasLimitDecorator(evmKeeper),
+		NewEthMempoolFeeDecorator(evmKeeper),
+		authante.NewValidateBasicDecorator(),
+		NewEthSigVerificationDecorator(),
+		NewAccountBlockedVerificationDecorator(evmKeeper), //account blocked check AnteDecorator
+		NewAccountAnteDecorator(ak, evmKeeper, sk),
+		NewWrapWasmCountTXDecorator(wasmkeeper.NewCountTXDecorator(option.TXCounterStoreKey), evmKeeper),
+	)
+
 	return func(
 		ctx sdk.Context, tx sdk.Tx, sim bool,
 	) (newCtx sdk.Context, err error) {
 		var anteHandler sdk.AnteHandler
-		switch tx.(type) {
-		case auth.StdTx:
-			anteHandler = sdk.ChainAnteDecorators(
-				authante.NewSetUpContextDecorator(), // outermost AnteDecorator. SetUpContext must be called first
-				NewAccountSetupDecorator(ak),
-				NewAccountBlockedVerificationDecorator(evmKeeper), //account blocked check AnteDecorator
-				authante.NewMempoolFeeDecorator(),
-				authante.NewValidateBasicDecorator(),
-				authante.NewValidateMemoDecorator(ak),
-				authante.NewConsumeGasForTxSizeDecorator(ak),
-				authante.NewSetPubKeyDecorator(ak), // SetPubKeyDecorator must be called before all signature verification decorators
-				authante.NewValidateSigCountDecorator(ak),
-				authante.NewDeductFeeDecorator(ak, sk),
-				authante.NewSigGasConsumeDecorator(ak, sigGasConsumer),
-				authante.NewSigVerificationDecorator(ak),
-				authante.NewIncrementSequenceDecorator(ak), // innermost AnteDecorator
-				NewValidateMsgHandlerDecorator(validateMsgHandler),
-			)
+		switch tx.GetType() {
+		case sdk.StdTxType:
+			anteHandler = stdTxAnteHandler
 
-		case evmtypes.MsgEthereumTx:
-			anteHandler = sdk.ChainAnteDecorators(
-				NewEthSetupContextDecorator(), // outermost AnteDecorator. EthSetUpContext must be called first
-				NewGasLimitDecorator(evmKeeper),
-				NewEthMempoolFeeDecorator(evmKeeper),
-				authante.NewValidateBasicDecorator(),
-				NewEthSigVerificationDecorator(),
-				NewAccountBlockedVerificationDecorator(evmKeeper), //account blocked check AnteDecorator
-				NewAccountVerificationDecorator(ak, evmKeeper),
-				NewNonceVerificationDecorator(ak),
-				NewEthGasConsumeDecorator(ak, sk, evmKeeper),
-				NewIncrementSenderSequenceDecorator(ak), // innermost AnteDecorator.
-			)
+		case sdk.EvmTxType:
+			if ctx.IsWrappedCheckTx() {
+				anteHandler = sdk.ChainAnteDecorators(
+					NewNonceVerificationDecorator(ak),
+					NewIncrementSenderSequenceDecorator(ak),
+				)
+			} else {
+				anteHandler = evmTxAnteHandler
+			}
+
 		default:
 			return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "invalid transaction type: %T", tx)
 		}
@@ -91,97 +109,8 @@ func sigGasConsumer(
 	}
 }
 
-// AccountSetupDecorator sets an account to state if it's not stored already. This only applies for MsgEthermint.
-type AccountSetupDecorator struct {
-	ak auth.AccountKeeper
-}
-
-// NewAccountSetupDecorator creates a new AccountSetupDecorator instance
-func NewAccountSetupDecorator(ak auth.AccountKeeper) AccountSetupDecorator {
-	return AccountSetupDecorator{
-		ak: ak,
+func pinAnte(trc *trace.Tracer, tag string) {
+	if trc != nil {
+		trc.RepeatingPin(tag)
 	}
-}
-
-// AnteHandle sets an account for MsgEthermint (evm) if the sender is registered.
-// NOTE: Since the account is set without any funds, the message execution will
-// fail if the validator requires a minimum fee > 0.
-func (asd AccountSetupDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	msgs := tx.GetMsgs()
-	if len(msgs) == 0 {
-		return ctx, sdkerrors.Wrap(sdkerrors.ErrUnknownRequest, "no messages included in transaction")
-	}
-
-	for _, msg := range msgs {
-		if msgEthermint, ok := msg.(evmtypes.MsgEthermint); ok {
-			setupAccount(asd.ak, ctx, msgEthermint.From)
-		}
-	}
-
-	return next(ctx, tx, simulate)
-}
-
-func setupAccount(ak keeper.AccountKeeper, ctx sdk.Context, addr sdk.AccAddress) {
-	acc := ak.GetAccount(ctx, addr)
-	if acc != nil {
-		return
-	}
-
-	acc = ak.NewAccountWithAddress(ctx, addr)
-	ak.SetAccount(ctx, acc)
-}
-
-// AccountBlockedVerificationDecorator check whether signer is blocked.
-type AccountBlockedVerificationDecorator struct {
-	evmKeeper EVMKeeper
-}
-
-// NewAccountBlockedVerificationDecorator creates a new AccountBlockedVerificationDecorator instance
-func NewAccountBlockedVerificationDecorator(evmKeeper EVMKeeper) AccountBlockedVerificationDecorator {
-	return AccountBlockedVerificationDecorator{
-		evmKeeper: evmKeeper,
-	}
-}
-
-// AnteHandle check wether signer of tx(contains cosmos-tx and eth-tx) is blocked.
-func (abvd AccountBlockedVerificationDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
-	signers, err := getSigners(tx)
-	if err != nil {
-		return ctx, err
-	}
-	currentGasMeter := ctx.GasMeter()
-	ctx = ctx.WithGasMeter(sdk.NewInfiniteGasMeter())
-
-	for _, signer := range signers {
-		//TODO it may be optimizate by cache blockedAddressList
-		if ok := abvd.evmKeeper.IsAddressBlocked(ctx, signer); ok {
-			ctx = ctx.WithGasMeter(currentGasMeter)
-			return ctx, sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "address: %s has been blocked", signer.String())
-		}
-	}
-	ctx = ctx.WithGasMeter(currentGasMeter)
-	return next(ctx, tx, simulate)
-}
-
-// getSigners get signers of tx(contains cosmos-tx and eth-tx.
-func getSigners(tx sdk.Tx) ([]sdk.AccAddress, error) {
-	signers := make([]sdk.AccAddress, 0)
-	switch tx.(type) {
-	case auth.StdTx:
-		sigTx, ok := tx.(authante.SigVerifiableTx)
-		if !ok {
-			return signers, sdkerrors.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
-		}
-		signers = append(signers, sigTx.GetSigners()...)
-	case evmtypes.MsgEthereumTx:
-		msgEthTx, ok := tx.(evmtypes.MsgEthereumTx)
-		if !ok {
-			return signers, sdkerrors.Wrapf(sdkerrors.ErrTxDecode, "invalid transaction type: %T", tx)
-		}
-		signers = append(signers, msgEthTx.GetSigners()...)
-
-	default:
-		return signers, sdkerrors.Wrapf(sdkerrors.ErrTxDecode, "invalid transaction type: %T", tx)
-	}
-	return signers, nil
 }

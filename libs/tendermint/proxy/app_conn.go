@@ -16,10 +16,13 @@ type AppConnConsensus interface {
 
 	BeginBlockSync(types.RequestBeginBlock) (*types.ResponseBeginBlock, error)
 	DeliverTxAsync(types.RequestDeliverTx) *abcicli.ReqRes
+	PreDeliverRealTxAsync(req []byte) types.TxEssentials
+	DeliverRealTxAsync(essentials types.TxEssentials) *abcicli.ReqRes
 	EndBlockSync(types.RequestEndBlock) (*types.ResponseEndBlock, error)
-	CommitSync() (*types.ResponseCommit, error)
+	CommitSync(types.RequestCommit) (*types.ResponseCommit, error)
 	SetOptionAsync(req types.RequestSetOption) *abcicli.ReqRes
-	ParallelTxs([][]byte) []*types.ResponseDeliverTx
+	ParallelTxs([][]byte, bool) []*types.ResponseDeliverTx
+	SetOptionSync(req types.RequestSetOption) (*types.ResponseSetOption, error)
 }
 
 type AppConnMempool interface {
@@ -79,16 +82,28 @@ func (app *appConnConsensus) DeliverTxAsync(req types.RequestDeliverTx) *abcicli
 	return app.appConn.DeliverTxAsync(req)
 }
 
+func (app *appConnConsensus) PreDeliverRealTxAsync(req []byte) types.TxEssentials {
+	return app.appConn.PreDeliverRealTxAsync(req)
+}
+
+func (app *appConnConsensus) DeliverRealTxAsync(req types.TxEssentials) *abcicli.ReqRes {
+	return app.appConn.DeliverRealTxAsync(req)
+}
+
 func (app *appConnConsensus) EndBlockSync(req types.RequestEndBlock) (*types.ResponseEndBlock, error) {
 	return app.appConn.EndBlockSync(req)
 }
 
-func (app *appConnConsensus) CommitSync() (*types.ResponseCommit, error) {
-	return app.appConn.CommitSync()
+func (app *appConnConsensus) CommitSync(req types.RequestCommit) (*types.ResponseCommit, error) {
+	return app.appConn.CommitSync(req)
 }
 
 func (app *appConnConsensus) SetOptionAsync(req types.RequestSetOption) *abcicli.ReqRes {
 	return app.appConn.SetOptionAsync(req)
+}
+
+func (app *appConnConsensus) SetOptionSync(req types.RequestSetOption) (*types.ResponseSetOption, error) {
+	return app.appConn.SetOptionSync(req)
 }
 
 //------------------------------------------------
@@ -132,8 +147,8 @@ func (app *appConnMempool) QuerySync(req types.RequestQuery) (*types.ResponseQue
 	return app.appConn.QuerySync(req)
 }
 
-func (app *appConnConsensus) ParallelTxs(txs [][]byte) []*types.ResponseDeliverTx {
-	return app.appConn.ParallelTxs(txs)
+func (app *appConnConsensus) ParallelTxs(txs [][]byte, onlyCalSender bool) []*types.ResponseDeliverTx {
+	return app.appConn.ParallelTxs(txs, onlyCalSender)
 }
 
 //------------------------------------------------

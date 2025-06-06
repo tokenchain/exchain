@@ -2,13 +2,18 @@ package types
 
 import (
 	"fmt"
-	"github.com/okex/exchain/libs/tendermint/libs/log"
 	"io"
 
+	"github.com/okex/exchain/libs/iavl"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	tmkv "github.com/okex/exchain/libs/tendermint/libs/kv"
+	"github.com/okex/exchain/libs/tendermint/libs/log"
 	tmstrings "github.com/okex/exchain/libs/tendermint/libs/strings"
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/okex/exchain/libs/tm-db"
+)
+
+const (
+	FlagLoadVersionAsync = "enable-store-load-async"
 )
 
 type Store interface { //nolint
@@ -18,8 +23,12 @@ type Store interface { //nolint
 
 // something that can persist to disk
 type Committer interface {
-	Commit() CommitID
+	CommitterCommit(*iavl.TreeDelta) (CommitID, *iavl.TreeDelta) // CommitterCommit
+	//for add module to init store version eg:ibc/erc20/capabilty module
+	SetUpgradeVersion(int64)
+
 	LastCommitID() CommitID
+	LastCommitVersion() int64
 
 	// TODO: Deprecate after 0.38.5
 	SetPruning(PruningOptions)
@@ -31,6 +40,10 @@ type Analyser interface {
 	GetDBWriteCount() int
 	GetDBReadCount() int
 	GetNodeReadCount() int
+	GetFlatKVReadTime() int
+	GetFlatKVWriteTime() int
+	GetFlatKVReadCount() int
+	GetFlatKVWriteCount() int
 	ResetCount()
 }
 
@@ -138,12 +151,21 @@ type CacheMultiStore interface {
 	MultiStore
 	CacheManager
 	Write() // Writes operations to underlying KVStore
+	WriteGetMultiSnapshotWSet() MultiSnapshotWSet
+	RevertDBWithMultiSnapshotRWSet(set MultiSnapshotWSet)
+}
+
+type CacheMultiStoreResetter interface {
+	CacheMultiStore
+	Reset(MultiStore) bool
 }
 
 // A non-cache MultiStore.
 type CommitMultiStore interface {
 	Committer
 	MultiStore
+	CommitMultiStorePipeline
+	CommitterCommitMap(iavl.TreeDeltaMap) (CommitID, iavl.TreeDeltaMap) // CommitterCommit
 
 	// Mount a store of type using the given db.
 	// If db == nil, the new store will use the CommitMultiStore db.
@@ -174,6 +196,7 @@ type CommitMultiStore interface {
 	// must be idempotent (return the same commit id). Otherwise the behavior is
 	// undefined.
 	LoadVersion(ver int64) error
+	GetCommitVersion() (int64, error)
 
 	// Set an inter-block (persistent) cache that maintains a mapping from
 	// StoreKeys to CommitKVStores.
@@ -220,7 +243,11 @@ type KVStore interface {
 }
 
 type CacheManager interface {
-	IteratorCache(cb func(key, value []byte, isDirty bool) bool) bool
+	IteratorCache(isdirty bool, cb func(key string, value []byte, isDirty bool, isDelete bool, storeKey StoreKey) bool, sKey StoreKey) bool
+	// Clear the cache without writing
+	Clear()
+	DisableCacheReadList()
+	GetRWSet(set MsRWSet)
 }
 
 // Alias iterator to db's Iterator for convenience.
@@ -234,6 +261,8 @@ type CacheKVStore interface {
 	CacheManager
 	// Writes operations to underlying KVStore
 	Write()
+	WriteWithSnapshotWSet() SnapshotWSet
+	RevertDBWithSnapshotRWSet(set SnapshotWSet)
 }
 
 // Stores of MultiStore must implement CommitStore.
@@ -253,6 +282,8 @@ type CacheWrap interface {
 	CacheManager
 	// Write syncs with the underlying store.
 	Write()
+	WriteWithSnapshotWSet() SnapshotWSet
+	RevertDBWithSnapshotRWSet(set SnapshotWSet)
 
 	// CacheWrap recursively wraps again.
 	CacheWrap() CacheWrap
@@ -273,11 +304,6 @@ type CacheWrapper interface { //nolint
 // CommitID
 
 // CommitID contains the tree version number and its merkle root.
-type CommitID struct {
-	Version int64
-	Hash    []byte
-}
-
 func (cid CommitID) IsZero() bool { //nolint
 	return cid.Version == 0 && len(cid.Hash) == 0
 }
@@ -298,6 +324,8 @@ const (
 	StoreTypeDB
 	StoreTypeIAVL
 	StoreTypeTransient
+	StoreTypeMPT
+	StoreTypeMemory
 )
 
 //----------------------------------------
@@ -354,6 +382,25 @@ func (key *TransientStoreKey) String() string {
 	return fmt.Sprintf("TransientStoreKey{%p, %s}", key, key.name)
 }
 
+// MemoryStoreKey defines a typed key to be used with an in-memory KVStore.
+type MemoryStoreKey struct {
+	name string
+}
+
+func NewMemoryStoreKey(name string) *MemoryStoreKey {
+	return &MemoryStoreKey{name: name}
+}
+
+// Name returns the name of the MemoryStoreKey.
+func (key *MemoryStoreKey) Name() string {
+	return key.name
+}
+
+// String returns a stringified representation of the MemoryStoreKey.
+func (key *MemoryStoreKey) String() string {
+	return fmt.Sprintf("MemoryStoreKey{%p, %s}", key, key.name)
+}
+
 //----------------------------------------
 
 // key-value result for iterator queries
@@ -377,4 +424,71 @@ type MultiStorePersistentCache interface {
 
 	// Reset the entire set of internal caches.
 	Reset()
+}
+
+type DirtyValue struct {
+	Deleted bool
+	Value   []byte
+}
+type CacheKVRWSet struct {
+	Read  map[string][]byte
+	Write map[string]DirtyValue
+}
+
+func NewCacheKvRWSet() CacheKVRWSet {
+	return CacheKVRWSet{
+		Read:  make(map[string][]byte),
+		Write: make(map[string]DirtyValue),
+	}
+}
+
+type MsRWSet = map[StoreKey]CacheKVRWSet
+
+func ClearMsRWSet(m MsRWSet) {
+	for _, v := range m {
+		for kk := range v.Read {
+			delete(v.Read, kk)
+		}
+		for kk := range v.Write {
+			delete(v.Write, kk)
+		}
+	}
+}
+
+// value == nil, add new key
+// value != nil, update or delete key
+type RevertWriteChange struct {
+	PrevValue []byte
+}
+
+type SnapshotWSet struct {
+	Write map[string]RevertWriteChange
+}
+
+func NewSnapShotWSet() SnapshotWSet {
+	return SnapshotWSet{
+		Write: make(map[string]RevertWriteChange),
+	}
+}
+
+type MultiSnapshotWSet struct {
+	Root   SnapshotWSet
+	Stores map[StoreKey]SnapshotWSet
+}
+
+func NewMultiSnapshotWSet() MultiSnapshotWSet {
+	return MultiSnapshotWSet{
+		Root:   NewSnapShotWSet(),
+		Stores: make(map[StoreKey]SnapshotWSet),
+	}
+}
+
+func RevertSnapshotWSet(store KVStore, set SnapshotWSet) {
+	for k, v := range set.Write {
+		if v.PrevValue == nil {
+			store.Delete([]byte(k))
+		} else {
+			store.Set([]byte(k), v.PrevValue)
+		}
+	}
 }

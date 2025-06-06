@@ -7,9 +7,9 @@ import (
 	"sort"
 	"testing"
 
+	db "github.com/okex/exchain/libs/tm-db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	db "github.com/tendermint/tm-db"
 )
 
 func TestBasic(t *testing.T) {
@@ -34,7 +34,7 @@ func TestBasic(t *testing.T) {
 
 	// Test 0x00
 	{
-		idx, val := tree.Get([]byte{0x00})
+		idx, val := tree.GetWithIndex([]byte{0x00})
 		if val != nil {
 			t.Errorf("Expected no value to exist")
 		}
@@ -48,7 +48,7 @@ func TestBasic(t *testing.T) {
 
 	// Test "1"
 	{
-		idx, val := tree.Get([]byte("1"))
+		idx, val := tree.GetWithIndex([]byte("1"))
 		if val == nil {
 			t.Errorf("Expected value to exist")
 		}
@@ -62,7 +62,7 @@ func TestBasic(t *testing.T) {
 
 	// Test "2"
 	{
-		idx, val := tree.Get([]byte("2"))
+		idx, val := tree.GetWithIndex([]byte("2"))
 		if val == nil {
 			t.Errorf("Expected value to exist")
 		}
@@ -76,7 +76,7 @@ func TestBasic(t *testing.T) {
 
 	// Test "4"
 	{
-		idx, val := tree.Get([]byte("4"))
+		idx, val := tree.GetWithIndex([]byte("4"))
 		if val != nil {
 			t.Errorf("Expected no value to exist")
 		}
@@ -90,7 +90,7 @@ func TestBasic(t *testing.T) {
 
 	// Test "6"
 	{
-		idx, val := tree.Get([]byte("6"))
+		idx, val := tree.GetWithIndex([]byte("6"))
 		if val != nil {
 			t.Errorf("Expected no value to exist")
 		}
@@ -209,7 +209,7 @@ func TestRemove(t *testing.T) {
 			key := keys[mrand.Int31n(l)]
 			t1.Remove(key)
 		}
-		t1.SaveVersion()
+		t1.SaveVersion(false)
 	}
 }
 
@@ -251,7 +251,7 @@ func TestIntegration(t *testing.T) {
 		if has := tree.Has([]byte(randstr(12))); has {
 			t.Error("Table has extra key")
 		}
-		if _, val := tree.Get([]byte(r.key)); string(val) != r.value {
+		if _, val := tree.GetWithIndex([]byte(r.key)); string(val) != r.value {
 			t.Error("wrong value")
 		}
 	}
@@ -269,7 +269,7 @@ func TestIntegration(t *testing.T) {
 			if has := tree.Has([]byte(randstr(12))); has {
 				t.Error("Table has extra key")
 			}
-			_, val := tree.Get([]byte(r.key))
+			_, val := tree.GetWithIndex([]byte(r.key))
 			if string(val) != r.value {
 				t.Error("wrong value")
 			}
@@ -366,7 +366,7 @@ func TestIterateRange(t *testing.T) {
 }
 
 func TestPersistence(t *testing.T) {
-	db := db.NewMemDB()
+	db := db.NewPrefixDB(db.NewMemDB(), []byte(randstr(32)))
 
 	// Create some random key value pairs
 	records := make(map[string]string)
@@ -380,14 +380,14 @@ func TestPersistence(t *testing.T) {
 	for key, value := range records {
 		t1.Set([]byte(key), []byte(value))
 	}
-	t1.SaveVersion()
+	t1.SaveVersion(false)
 
 	// Load a tree
 	t2, err := NewMutableTree(db, 0)
 	require.NoError(t, err)
 	t2.Load()
 	for key, value := range records {
-		_, t2value := t2.Get([]byte(key))
+		_, t2value := t2.GetWithIndex([]byte(key))
 		if string(t2value) != value {
 			t.Fatalf("Invalid value. Expected %v, got %v", value, t2value)
 		}
@@ -405,7 +405,7 @@ func TestProof(t *testing.T) {
 	}
 
 	// Persist the items so far
-	tree.SaveVersion()
+	tree.SaveVersion(false)
 
 	// Add more items so it's not all persisted
 	for i := 0; i < 10; i++ {
@@ -426,8 +426,7 @@ func TestProof(t *testing.T) {
 }
 
 func TestTreeProof(t *testing.T) {
-	db := db.NewMemDB()
-	tree, err := NewMutableTree(db, 100)
+	tree, err := getTestTree(100)
 	require.NoError(t, err)
 	assert.Equal(t, tree.Hash(), []byte(nil))
 
@@ -446,7 +445,7 @@ func TestTreeProof(t *testing.T) {
 		keys[i] = []byte(key)
 	}
 
-	tree.SaveVersion()
+	tree.SaveVersion(false)
 
 	// query random key fails
 	value, proof, err = tree.GetWithProof([]byte("foo"))

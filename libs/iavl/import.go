@@ -5,7 +5,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	db "github.com/tendermint/tm-db"
+	db "github.com/okex/exchain/libs/tm-db"
 )
 
 // maxBatchSize is the maximum size of the import batch before flushing it to the database
@@ -37,8 +37,8 @@ func newImporter(tree *MutableTree, version int64) (*Importer, error) {
 	if version < 0 {
 		return nil, errors.New("imported version cannot be negative")
 	}
-	if tree.ndb.latestVersion > 0 {
-		return nil, errors.Errorf("found database at version %d, must be 0", tree.ndb.latestVersion)
+	if tree.ndb.latestPersistedVersion > 0 {
+		return nil, errors.Errorf("found database at version %d, must be 0", tree.ndb.latestPersistedVersion)
 	}
 	if !tree.IsEmpty() {
 		return nil, errors.New("tree must be empty")

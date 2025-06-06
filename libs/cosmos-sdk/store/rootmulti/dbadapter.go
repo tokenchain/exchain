@@ -3,6 +3,7 @@ package rootmulti
 import (
 	"github.com/okex/exchain/libs/cosmos-sdk/store/dbadapter"
 	"github.com/okex/exchain/libs/cosmos-sdk/store/types"
+	"github.com/okex/exchain/libs/iavl"
 )
 
 var commithash = []byte("FAKE_HASH")
@@ -16,11 +17,18 @@ type commitDBStoreAdapter struct {
 	dbadapter.Store
 }
 
-func (cdsa commitDBStoreAdapter) Commit() types.CommitID {
+func (cdsa commitDBStoreAdapter) Commit(*iavl.TreeDelta, []byte) (types.CommitID, iavl.TreeDelta, []byte) {
 	return types.CommitID{
 		Version: -1,
 		Hash:    commithash,
-	}
+	}, iavl.TreeDelta{}, nil
+}
+
+func (cdsa commitDBStoreAdapter) CommitterCommit(*iavl.TreeDelta) (types.CommitID, *iavl.TreeDelta) {
+	return types.CommitID{
+		Version: -1,
+		Hash:    commithash,
+	}, &iavl.TreeDelta{}
 }
 
 func (cdsa commitDBStoreAdapter) LastCommitID() types.CommitID {
@@ -28,6 +36,10 @@ func (cdsa commitDBStoreAdapter) LastCommitID() types.CommitID {
 		Version: -1,
 		Hash:    commithash,
 	}
+}
+
+func (cdsa commitDBStoreAdapter) LastCommitVersion() (v int64) {
+	return -1
 }
 
 func (cdsa commitDBStoreAdapter) SetPruning(_ types.PruningOptions) {}
@@ -39,3 +51,9 @@ func (cdsa commitDBStoreAdapter) GetDBReadCount() int   { return 0 }
 func (cdsa commitDBStoreAdapter) GetNodeReadCount() int { return 0 }
 
 func (cdsa commitDBStoreAdapter) ResetCount() {}
+
+func (cdsa commitDBStoreAdapter) GetFlatKVReadTime() int   { return 0 }
+func (cdsa commitDBStoreAdapter) GetFlatKVWriteTime() int  { return 0 }
+func (cdsa commitDBStoreAdapter) GetFlatKVReadCount() int  { return 0 }
+func (cdsa commitDBStoreAdapter) GetFlatKVWriteCount() int { return 0 }
+func (cdsa commitDBStoreAdapter) SetUpgradeVersion(int64)  {}

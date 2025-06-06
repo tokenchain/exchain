@@ -3,15 +3,15 @@ package staking
 import (
 	"testing"
 
+	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
 
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
-	keep "github.com/okex/exchain/x/staking/keeper"
-	"github.com/okex/exchain/x/staking/types"
 	abci "github.com/okex/exchain/libs/tendermint/abci/types"
 	tmtypes "github.com/okex/exchain/libs/tendermint/types"
+	keep "github.com/okex/exchain/x/staking/keeper"
+	"github.com/okex/exchain/x/staking/types"
 )
 
 //______________________________________________________________________
@@ -147,7 +147,7 @@ func TestInvalidPubKeyTypeMsgCreateValidator(t *testing.T) {
 	got, err := handleMsgCreateValidator(ctx, msgCreateValidator, keeper)
 	require.NotNil(t, err, "%v", got)
 
-	ctx = ctx.WithConsensusParams(&abci.ConsensusParams{
+	ctx.SetConsensusParams(&abci.ConsensusParams{
 		Validator: &abci.ValidatorParams{PubKeyTypes: []string{tmtypes.ABCIPubKeyTypeSecp256k1}},
 	})
 

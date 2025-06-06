@@ -1,8 +1,11 @@
 package types
 
 import (
+	"fmt"
 	"math/big"
 	"strings"
+
+	"github.com/tendermint/go-amino"
 
 	"gopkg.in/yaml.v2"
 
@@ -151,6 +154,109 @@ func (cc ChainConfig) Validate() error {
 		return sdkerrors.Wrap(err, "eWASMBlock")
 	}
 
+	return nil
+}
+
+func (config *ChainConfig) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) == 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			err = config.HomesteadBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 2:
+			err = config.DAOForkBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 3:
+			if data[0] != 0 && data[0] != 1 {
+				return fmt.Errorf("invalid DAO fork switch")
+			}
+			config.DAOForkSupport = data[0] == 1
+			dataLen = 1
+		case 4:
+			err = config.EIP150Block.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 5:
+			config.EIP150Hash = string(subData)
+		case 6:
+			err = config.EIP155Block.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 7:
+			err = config.EIP158Block.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 8:
+			err = config.ByzantiumBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 9:
+			err = config.ConstantinopleBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 10:
+			err = config.PetersburgBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 11:
+			err = config.IstanbulBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 12:
+			err = config.MuirGlacierBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 13:
+			err = config.YoloV2Block.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		case 14:
+			err = config.EWASMBlock.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
 	return nil
 }
 

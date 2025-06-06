@@ -1,11 +1,14 @@
 package types
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
 
-	yaml "gopkg.in/yaml.v2"
+	"github.com/tendermint/go-amino"
+
+	"gopkg.in/yaml.v2"
 
 	"github.com/okex/exchain/libs/tendermint/crypto"
 
@@ -34,6 +37,126 @@ type ModuleAccount struct {
 
 	Name        string   `json:"name" yaml:"name"`               // name of the module
 	Permissions []string `json:"permissions" yaml:"permissions"` // permissions of module account
+}
+
+func (acc *ModuleAccount) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) <= 0 {
+			break
+		}
+
+		pos, pbType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		if pbType != amino.Typ3_ByteLength {
+			return fmt.Errorf("invalid type byte: %v", pbType)
+		}
+		data = data[1:]
+
+		var n int
+		dataLen, n, err = amino.DecodeUvarint(data)
+		if err != nil {
+			return err
+		}
+
+		data = data[n:]
+		if uint64(len(data)) < dataLen {
+			return fmt.Errorf("invalid data length: %v", dataLen)
+		}
+		subData := data[:dataLen]
+
+		switch pos {
+		case 1:
+			base := new(authtypes.BaseAccount)
+			err = base.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+			acc.BaseAccount = base
+		case 2:
+			acc.Name = string(subData)
+		case 3:
+			acc.Permissions = append(acc.Permissions, string(subData))
+		default:
+			return fmt.Errorf("unexpect feild num %d", pos)
+		}
+	}
+	return nil
+}
+
+func (acc ModuleAccount) Copy() sdk.Account {
+	return NewModuleAccount(authtypes.NewBaseAccount(acc.Address, acc.Coins, acc.PubKey, acc.AccountNumber, acc.Sequence), acc.Name, acc.Permissions...)
+}
+
+func (acc ModuleAccount) AminoSize(cdc *amino.Codec) int {
+	size := 0
+	if acc.BaseAccount != nil {
+		baccSize := acc.BaseAccount.AminoSize(cdc)
+		size += 1 + amino.UvarintSize(uint64(baccSize)) + baccSize
+	}
+	if acc.Name != "" {
+		size += 1 + amino.EncodedStringSize(acc.Name)
+	}
+	for _, p := range acc.Permissions {
+		size += 1 + amino.EncodedStringSize(p)
+	}
+	return size
+}
+
+func (acc ModuleAccount) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(acc.AminoSize(cdc))
+	err := acc.MarshalAminoTo(cdc, &buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (acc ModuleAccount) MarshalAminoTo(cdc *amino.Codec, buf *bytes.Buffer) error {
+	// field 1
+	if acc.BaseAccount != nil {
+		const pbKey = 1<<3 | 2
+		buf.WriteByte(pbKey)
+		baccSize := acc.BaseAccount.AminoSize(cdc)
+		err := amino.EncodeUvarintToBuffer(buf, uint64(baccSize))
+		if err != nil {
+			return err
+		}
+		lenBeforeData := buf.Len()
+		err = acc.BaseAccount.MarshalAminoTo(cdc, buf)
+		if err != nil {
+			return err
+		}
+		if buf.Len()-lenBeforeData != baccSize {
+			return amino.NewSizerError(acc.BaseAccount, baccSize, buf.Len()-lenBeforeData)
+		}
+	}
+
+	// field 2
+	if acc.Name != "" {
+		const pbKey = 2<<3 | 2
+		err := amino.EncodeStringWithKeyToBuffer(buf, acc.Name, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	// field 3
+	for _, perm := range acc.Permissions {
+		const pbKey = 3<<3 | 2
+		err := amino.EncodeStringWithKeyToBuffer(buf, perm, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // NewModuleAddress creates an AccAddress from the hash of the module's name

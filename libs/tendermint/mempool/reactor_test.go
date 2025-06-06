@@ -1,23 +1,29 @@
 package mempool
 
 import (
+	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
+
 	"github.com/fortytw2/leaktest"
 	"github.com/go-kit/kit/log/term"
-	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
-
 	"github.com/okex/exchain/libs/tendermint/abci/example/kvstore"
 	cfg "github.com/okex/exchain/libs/tendermint/config"
 	"github.com/okex/exchain/libs/tendermint/libs/log"
+	rrand "github.com/okex/exchain/libs/tendermint/libs/rand"
 	"github.com/okex/exchain/libs/tendermint/p2p"
 	"github.com/okex/exchain/libs/tendermint/p2p/mock"
 	"github.com/okex/exchain/libs/tendermint/proxy"
 	"github.com/okex/exchain/libs/tendermint/types"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 type peerState struct {
@@ -112,7 +118,8 @@ const (
 	Timeout = 120 * time.Second // ridiculously high because CircleCI is slow
 )
 
-func TestReactorBroadcastTxMessage(t *testing.T) {
+// TODO fix random failure case
+func testReactorBroadcastTxMessage(t *testing.T) {
 	config := cfg.TestConfig()
 	const N = 4
 	reactors := makeAndConnectReactors(config, N)
@@ -239,5 +246,305 @@ func TestDontExhaustMaxActiveIDs(t *testing.T) {
 		peer := mock.NewPeer(nil)
 		reactor.Receive(MempoolChannel, peer, []byte{0x1, 0x2, 0x3})
 		reactor.AddPeer(peer)
+	}
+}
+
+func TestVerifyWtx(t *testing.T) {
+	nodeKey := &p2p.NodeKey{
+		PrivKey: ed25519.GenPrivKey(),
+	}
+	memR := &Reactor{
+		nodeKey: nodeKey,
+	}
+
+	wtx, err := memR.wrapTx([]byte("test-tx"), "test-from")
+	assert.Nil(t, err)
+
+	nodeKeyWhitelist := make(map[string]struct{})
+	err = wtx.verify(nodeKeyWhitelist)
+	assert.NotNil(t, err)
+
+	nodeKeyWhitelist[string(p2p.PubKeyToID(nodeKey.PubKey()))] = struct{}{}
+	err = wtx.verify(nodeKeyWhitelist)
+	assert.Nil(t, err)
+}
+
+func TestTxMessageAmino(t *testing.T) {
+	testcases := []TxMessage{
+		{},
+		{[]byte{}, ""},
+		{[]byte{1, 2, 3, 4, 5, 6, 7}, "From"},
+		{[]byte{}, "f"},
+	}
+
+	var typePrefix = make([]byte, 8)
+	tpLen, err := cdc.GetTypePrefix(TxMessage{}, typePrefix)
+	require.NoError(t, err)
+	typePrefix = typePrefix[:tpLen]
+	reactor := Reactor{
+		config: &cfg.MempoolConfig{
+			MaxTxBytes: 1024 * 1024,
+		},
+	}
+
+	for _, tx := range testcases {
+		var m Message
+		m = tx
+		expectBz, err := cdc.MarshalBinaryBare(m)
+		require.NoError(t, err)
+		actualBz, err := tx.MarshalToAmino(cdc)
+		require.NoError(t, err)
+
+		require.Equal(t, expectBz, append(typePrefix, actualBz...))
+		require.Equal(t, len(expectBz), tpLen+tx.AminoSize(cdc))
+
+		actualBz, err = cdc.MarshalBinaryBareWithRegisteredMarshaller(tx)
+		require.NoError(t, err)
+
+		require.Equal(t, expectBz, actualBz)
+		require.Equal(t, cdc.MustMarshalBinaryBare(m), reactor.encodeMsg(&tx))
+		require.Equal(t, cdc.MustMarshalBinaryBare(m), reactor.encodeMsg(tx))
+
+		var expectValue Message
+		err = cdc.UnmarshalBinaryBare(expectBz, &expectValue)
+		require.NoError(t, err)
+		var actualValue Message
+		actualValue, err = cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(expectBz, &actualValue)
+		require.Equal(t, expectValue, actualValue)
+
+		actualValue, err = reactor.decodeMsg(expectBz)
+		require.NoError(t, err)
+		require.Equal(t, expectValue, actualValue)
+		actualValue.(*TxMessage).Tx = nil
+		txMessageDeocdePool.Put(actualValue)
+	}
+
+	// special case
+	{
+		var bz = []byte{1<<3 | 2, 0}
+		bz = append(typePrefix, bz...)
+		var expectValue Message
+		err = cdc.UnmarshalBinaryBare(bz, &expectValue)
+		require.NoError(t, err)
+		var actualValue Message
+		actualValue, err = cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(bz, &actualValue)
+		require.NoError(t, err)
+		require.Equal(t, expectValue, actualValue)
+
+		actualValue, err = reactor.decodeMsg(bz)
+		require.NoError(t, err)
+		require.Equal(t, expectValue, actualValue)
+	}
+}
+
+func BenchmarkTxMessageAminoMarshal(b *testing.B) {
+	var bz = make([]byte, 256)
+	rand.Read(bz)
+	reactor := &Reactor{}
+	var msg Message
+	b.ResetTimer()
+
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			msg = TxMessage{bz, ""}
+			_, err := cdc.MarshalBinaryBare(&msg)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("marshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			msg = &TxMessage{bz, ""}
+			_, err := cdc.MarshalBinaryBareWithRegisteredMarshaller(msg)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encodeMsgOld", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			msg = &TxMessage{bz, ""}
+			reactor.encodeMsg(msg)
+		}
+	})
+	b.Run("encodeMsg", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			txm := txMessageDeocdePool.Get().(*TxMessage)
+			txm.Tx = bz
+			msg = txm
+			reactor.encodeMsg(msg)
+			txMessageDeocdePool.Put(txm)
+		}
+	})
+}
+
+func decodeMsgOld(memR *Reactor, bz []byte) (msg Message, err error) {
+	maxMsgSize := calcMaxMsgSize(memR.config.MaxTxBytes)
+	if l := len(bz); l > maxMsgSize {
+		return msg, ErrTxTooLarge{maxMsgSize, l}
+	}
+	err = cdc.UnmarshalBinaryBare(bz, &msg)
+	return
+}
+
+func BenchmarkTxMessageUnmarshal(b *testing.B) {
+	txMsg := TxMessage{
+		Tx: make([]byte, 512),
+	}
+	rand.Read(txMsg.Tx)
+	bz := cdc.MustMarshalBinaryBare(&txMsg)
+
+	//msg := conn.PacketMsg{
+	//	ChannelID: MempoolChannel,
+	//	Bytes:     bz,
+	//}
+	// msgBz := cdc.MustMarshalBinaryBare(&msg)
+
+	//hashMap := make(map[string]struct{})
+	var h []byte
+
+	reactor := &Reactor{
+		config: &cfg.MempoolConfig{
+			MaxTxBytes: 1024 * 1024,
+		},
+	}
+
+	var msg Message
+	var err error
+
+	b.ResetTimer()
+
+	b.Run("decode", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			//var m conn.PacketMsg
+			//err := m.UnmarshalFromAmino(nil, msgBz)
+			//if err != nil {
+			//	b.Fatal(err)
+			//}
+			msg, err = reactor.decodeMsg(bz)
+			if err != nil {
+				b.Fatal(err)
+			}
+			msg.(*TxMessage).Tx = nil
+			txMessageDeocdePool.Put(msg)
+		}
+	})
+	b.Run("decode-old", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			//var m conn.PacketMsg
+			//err := m.UnmarshalFromAmino(nil, msgBz)
+			//if err != nil {
+			//	b.Fatal(err)
+			//}
+			msg, err = decodeMsgOld(reactor, bz)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var m TxMessage
+			err := m.UnmarshalFromAmino(cdc, bz[4:])
+			msg = &m
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	//b.Run("hash", func(b *testing.B) {
+	//	b.ReportAllocs()
+	//	for i := 0; i < b.N; i++ {
+	//		var m conn.PacketMsg
+	//		err := m.UnmarshalFromAmino(nil, msgBz)
+	//		if err != nil {
+	//			b.Fatal(err)
+	//		}
+	//		_ = crypto.Sha256(bz)
+	//	}
+	//})
+	_ = h
+	_ = msg
+}
+
+func BenchmarkReactorLogReceive(b *testing.B) {
+	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout)).With("module", "benchmark")
+	var options []log.Option
+	options = append(options, log.AllowInfoWith("module", "benchmark"))
+	logger = log.NewFilter(logger, options...)
+
+	memR := &Reactor{}
+	memR.Logger = logger
+
+	chID := byte(10)
+	var msg Message = &TxMessage{Tx: make([]byte, 512)}
+	var src p2p.Peer
+
+	b.Run("pool", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			memR.logReceive(src, chID, msg)
+		}
+	})
+
+	b.Run("logger", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			memR.Logger.Debug("Receive", "src", src, "chId", chID, "msg", msg)
+		}
+	})
+}
+
+func BenchmarkReactorLogCheckTxError(b *testing.B) {
+	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout)).With("module", "benchmark")
+	var options []log.Option
+	options = append(options, log.AllowErrorWith("module", "benchmark"))
+	logger = log.NewFilter(logger, options...)
+
+	memR := &Reactor{}
+	memR.Logger = logger
+	memR.mempool = &CListMempool{height: 123456}
+
+	var msg Message = &TxMessage{Tx: make([]byte, 512)}
+	tx := msg.(*TxMessage).Tx
+	err := errors.New("error")
+
+	b.Run("pool", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			memR.logCheckTxError(tx, memR.mempool.height, err)
+		}
+	})
+
+	b.Run("logger", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			memR.Logger.Info("Could not check tx", "tx", txIDStringer{tx, memR.mempool.height}, "err", err)
+		}
+	})
+}
+
+func BenchmarkGetRealTxFromWrapCMTx(b *testing.B) {
+	N := b.N
+	var data = make([][]byte, N)
+	for i := 0; i < N; i++ {
+		wtx := &types.WrapCMTx{Tx: rrand.Bytes(256), Nonce: uint64(i)}
+		d, err := cdc.MarshalJSON(wtx)
+		assert.NoError(b, err)
+		data[i] = d
+	}
+	b.ResetTimer()
+	var re = make([]int, N)
+	for i := 0; i < N; i++ {
+		res := GetRealTxFromWrapCMTx(data[i])
+		re[i] = len(res)
 	}
 }

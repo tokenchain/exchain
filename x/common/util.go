@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/okex/exchain/x/params/subspace"
 	"math/big"
 	"math/rand"
 	"net/http"
@@ -15,12 +14,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/okex/exchain/x/params/subspace"
+
 	sdkerrors "github.com/okex/exchain/libs/cosmos-sdk/types/errors"
 
+	apptypes "github.com/okex/exchain/app/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/client/context"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/types/rest"
-	apptypes "github.com/okex/exchain/app/types"
 )
 
 const (
@@ -325,4 +326,12 @@ func ValidateUint16Positive(param string) subspace.ValueValidatorFn {
 
 		return nil
 	}
+}
+
+// CheckSignerAddress delegators must be the same as to the signers and amount only one
+func CheckSignerAddress(signers, delegators []sdk.AccAddress) bool {
+	if len(signers) == 1 && len(delegators) == 1 {
+		return signers[0].Equals(delegators[0])
+	}
+	return false
 }

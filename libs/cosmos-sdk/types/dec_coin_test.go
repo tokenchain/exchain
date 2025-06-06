@@ -1,8 +1,13 @@
 package types
 
 import (
+	"fmt"
+	"math"
+	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/okex/exchain/libs/cosmos-sdk/codec"
 
 	"github.com/stretchr/testify/require"
 )
@@ -96,6 +101,57 @@ func TestAddDecCoins(t *testing.T) {
 	}
 }
 
+func TestFilteredZeroDecCoins(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    DecCoins
+		original string
+		expected string
+	}{
+		{
+			name: "all greater than zero",
+			input: DecCoins{
+				{"testa", NewDec(1)},
+				{"testb", NewDec(2)},
+				{"testc", NewDec(3)},
+				{"testd", NewDec(4)},
+				{"teste", NewDec(5)},
+			},
+			original: "1.000000000000000000testa,2.000000000000000000testb,3.000000000000000000testc,4.000000000000000000testd,5.000000000000000000teste",
+			expected: "1.000000000000000000testa,2.000000000000000000testb,3.000000000000000000testc,4.000000000000000000testd,5.000000000000000000teste",
+		},
+		{
+			name: "zero coin in middle",
+			input: DecCoins{
+				{"testa", NewDec(1)},
+				{"testb", NewDec(2)},
+				{"testc", NewDec(0)},
+				{"testd", NewDec(4)},
+				{"teste", NewDec(5)},
+			},
+			original: "1.000000000000000000testa,2.000000000000000000testb,0.000000000000000000testc,4.000000000000000000testd,5.000000000000000000teste",
+			expected: "1.000000000000000000testa,2.000000000000000000testb,4.000000000000000000testd,5.000000000000000000teste",
+		},
+		{
+			name: "zero coin end (unordered)",
+			input: DecCoins{
+				{"teste", NewDec(5)},
+				{"testc", NewDec(3)},
+				{"testa", NewDec(1)},
+				{"testd", NewDec(4)},
+				{"testb", NewDec(0)},
+			},
+			original: "5.000000000000000000teste,3.000000000000000000testc,1.000000000000000000testa,4.000000000000000000testd,0.000000000000000000testb",
+			expected: "1.000000000000000000testa,3.000000000000000000testc,4.000000000000000000testd,5.000000000000000000teste",
+		},
+	}
+
+	for _, tt := range cases {
+		undertest := NewDecCoins(tt.input...)
+		require.Equal(t, tt.expected, undertest.String(), "NewDecCoins must return expected results")
+		require.Equal(t, tt.original, tt.input.String(), "input must be unmodified and match original")
+	}
+}
 func TestIsValid(t *testing.T) {
 	tests := []struct {
 		coin       DecCoin
@@ -396,6 +452,295 @@ func TestDecCoinsTruncateDecimal(t *testing.T) {
 	}
 }
 
+func TestDecCoinsTruncatePrecision(t *testing.T) {
+	decCoinA := NewDecCoinFromDec("a", MustNewDecFromStr("5.4123123455435"))
+	decCoinB := NewDecCoinFromDec("b", MustNewDecFromStr("6.00"))
+	decCoinC := NewDecCoinFromDec("c", MustNewDecFromStr("0.1235"))
+	decCoinD := NewDecCoinFromDec("d", MustNewDecFromStr("1234567890123456.123456789012345678"))
+
+	testCases := []struct {
+		name           string
+		input          DecCoins
+		truncatedCoins Coins
+		changeCoins    DecCoins
+		prec           int64
+		expectPanics   bool
+	}{
+		{"prec-1, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			-1, false,
+		}, {
+			"prec-1, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins(nil),
+			Coins(nil),
+			-1, true,
+		}, {
+			"prec-1, A",
+			DecCoins{decCoinA},
+			Coins{NewInt64Coin(decCoinA.Denom, 5)},
+			Coins(nil),
+			-1, true,
+		}, {
+			"prec-1, B",
+			DecCoins{decCoinB},
+			DecCoins(nil),
+			DecCoins(nil),
+			-1, true,
+		}, {
+			"prec-1, C",
+			DecCoins{decCoinC},
+			Coins(nil),
+			Coins(nil),
+			-1, true,
+		}, {
+			"prec-1, D",
+			DecCoins{decCoinD},
+			Coins(nil),
+			Coins(nil),
+			-1, true,
+		},
+
+		{"prec0, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			0, false},
+		{
+			"prec0, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins{NewInt64Coin(decCoinA.Denom, 5), NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.4123123455435"))},
+			0, false,
+		},
+		{
+			"prec0, A",
+			DecCoins{decCoinA},
+			Coins{NewInt64Coin(decCoinA.Denom, 5)},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.4123123455435"))},
+			0, false,
+		},
+		{
+			"prec0, B",
+			DecCoins{decCoinB},
+			Coins{NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			0, false,
+		},
+		{
+			"prec0, C",
+			DecCoins{decCoinC},
+			Coins(nil),
+			DecCoins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.1235"))},
+			0, false,
+		}, {
+			"prec0, D",
+			DecCoins{decCoinD},
+			Coins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("1234567890123456"))},
+			DecCoins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("0.123456789012345678"))},
+			0, false,
+		},
+
+		{"prec1, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			1, false},
+		{
+			"prec1, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4")), NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.0123123455435"))},
+			1, false,
+		},
+		{
+			"prec1, A",
+			DecCoins{decCoinA},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4"))},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.0123123455435"))},
+			1, false,
+		},
+		{
+			"prec1, B",
+			DecCoins{decCoinB},
+			Coins{NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			1, false,
+		},
+		{
+			"prec1, C",
+			DecCoins{decCoinC},
+			Coins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.1"))},
+			DecCoins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.0235"))},
+			1, false,
+		}, {
+			"prec1, D",
+			DecCoins{decCoinD},
+			Coins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("1234567890123456.1"))},
+			DecCoins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("0.023456789012345678"))},
+			1, false,
+		},
+
+		{"prec3, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			3, false},
+		{
+			"prec3, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.412")), NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.0003123455435"))},
+			3, false,
+		},
+		{
+			"prec3, A",
+			DecCoins{decCoinA},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.412"))},
+			DecCoins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("0.0003123455435"))},
+			3, false,
+		},
+		{
+			"prec3, B",
+			DecCoins{decCoinB},
+			Coins{NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			3, false,
+		},
+		{
+			"prec3, C",
+			DecCoins{decCoinC},
+			Coins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.123"))},
+			DecCoins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.0005"))},
+			3, false,
+		}, {
+			"prec3, D",
+			DecCoins{decCoinD},
+			Coins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("1234567890123456.123"))},
+			DecCoins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("0.000456789012345678"))},
+			3, false,
+		},
+
+		{"prec13, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			13, false},
+		{
+			"prec13, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4123123455435")), NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			13, false,
+		},
+		{
+			"prec13, A",
+			DecCoins{decCoinA},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4123123455435"))},
+			DecCoins(nil),
+			13, false,
+		},
+		{
+			"prec13, B",
+			DecCoins{decCoinB},
+			Coins{NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			13, false,
+		},
+		{
+			"prec13, C",
+			DecCoins{decCoinC},
+			Coins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.1235"))},
+			DecCoins(nil),
+			13, false,
+		}, {
+			"prec13, D",
+			DecCoins{decCoinD},
+			Coins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("1234567890123456.1234567890123"))},
+			DecCoins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("0.000000000000045678"))},
+			13, false,
+		},
+
+		{"prec18, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			18, false},
+		{
+			"prec18, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4123123455435")), NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			18, false,
+		},
+		{
+			"prec18, A",
+			DecCoins{decCoinA},
+			Coins{NewDecCoinFromDec(decCoinA.Denom, MustNewDecFromStr("5.4123123455435"))},
+			DecCoins(nil),
+			18, false,
+		},
+		{
+			"prec18, B",
+			DecCoins{decCoinB},
+			Coins{NewInt64Coin(decCoinB.Denom, 6)},
+			DecCoins(nil),
+			18, false,
+		},
+		{
+			"prec18, C",
+			DecCoins{decCoinC},
+			Coins{NewDecCoinFromDec(decCoinC.Denom, MustNewDecFromStr("0.1235"))},
+			DecCoins(nil),
+			18, false,
+		}, {
+			"prec18, D",
+			DecCoins{decCoinD},
+			Coins{NewDecCoinFromDec(decCoinD.Denom, MustNewDecFromStr("1234567890123456.123456789012345678"))},
+			DecCoins(nil),
+			18, false,
+		},
+
+		{"prec19, nil", DecCoins{}, Coins(nil), DecCoins(nil),
+			19, false},
+		{
+			"prec19, A,B",
+			DecCoins{decCoinA, decCoinB},
+			Coins(nil),
+			Coins(nil),
+			19, true,
+		},
+		{
+			"prec19, A",
+			DecCoins{decCoinA},
+			Coins{NewInt64Coin(decCoinA.Denom, 5)},
+			Coins(nil),
+			19, true,
+		},
+		{
+			"prec19, B",
+			DecCoins{decCoinB},
+			DecCoins(nil),
+			DecCoins(nil),
+			19, true,
+		},
+		{
+			"prec19, C",
+			DecCoins{decCoinC},
+			Coins(nil),
+			Coins(nil),
+			19, true,
+		}, {
+			"prec19, D",
+			DecCoins{decCoinD},
+			Coins(nil),
+			Coins(nil),
+			19, true,
+		},
+	}
+
+	for i, tc := range testCases {
+		if tc.expectPanics {
+			require.Panics(t, func() { tc.input.TruncateWithPrec(tc.prec) })
+			continue
+		}
+
+		truncatedCoins, changeCoins := tc.input.TruncateWithPrec(tc.prec)
+		require.Equal(
+			t, tc.truncatedCoins, truncatedCoins,
+			"unexpected truncated coins; tc #%d, input: %s", i, tc.input,
+		)
+		require.Equal(
+			t, tc.changeCoins, changeCoins,
+			"unexpected change coins; tc #%d, input: %s", i, tc.input,
+		)
+	}
+}
+
 func TestDecCoinsQuoDecTruncate(t *testing.T) {
 	x := MustNewDecFromStr("1.00")
 	y := MustNewDecFromStr("10000000000000000000.00")
@@ -492,4 +837,83 @@ func TestDecCoins_AddDecCoinWithIsValid(t *testing.T) {
 			require.False(t, tc.coin.IsValid(), tc.msg)
 		}
 	}
+}
+
+func TestDecCoinAmino(t *testing.T) {
+	cdc := codec.New()
+	amount := Dec{big.NewInt(1234567890123456)}
+	amount = amount.Mul(Dec{big.NewInt(1234567890)})
+	tests := []DecCoin{
+		{},
+		{"test", Dec{}},
+		{"test", amount},
+		{"test", Dec{big.NewInt(100000)}},
+		{"", Dec{big.NewInt(math.MinInt64)}},
+	}
+
+	for i, test := range tests {
+		expect, err := cdc.MarshalBinaryBare(test)
+		require.NoError(t, err)
+		actual, err := test.MarshalToAmino(cdc)
+		require.NoError(t, err)
+		require.EqualValues(t, expect, actual)
+
+		require.Equal(t, len(expect), test.AminoSize(cdc))
+
+		t.Log(fmt.Sprintf("%d marshal pass", i))
+
+		var dc DecCoin
+		err = cdc.UnmarshalBinaryBare(expect, &dc)
+		require.NoError(t, err)
+		var actualDc DecCoin
+		err = actualDc.UnmarshalFromAmino(cdc, expect)
+		require.NoError(t, err)
+		require.EqualValues(t, dc, actualDc)
+
+		t.Log(fmt.Sprintf("%d unmarshal pass", i))
+	}
+}
+
+func BenchmarkDecCoinAmino(b *testing.B) {
+	cdc := codec.New()
+	coin := DecCoin{"my coin", Dec{big.NewInt(1234567890123456)}}
+	coin.Amount.Mul(Dec{big.NewInt(1234567890)})
+	b.ResetTimer()
+
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = cdc.MarshalBinaryBare(coin)
+		}
+	})
+
+	b.Run("marshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = coin.MarshalToAmino(cdc)
+		}
+	})
+}
+
+func BenchmarkDecCoinString(b *testing.B) {
+	amount := Dec{new(big.Int).SetInt64(math.MaxInt64)}
+	amount.Int.Mul(amount.Int, big.NewInt(2))
+	dc := DecCoin{"okt", amount}
+
+	b.Run("opt", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = dc.String()
+		}
+	})
+
+	b.Run("origin", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = fmt.Sprintf("%v%v", dc.Amount, dc.Denom)
+		}
+	})
+
+	require.Equal(b, fmt.Sprintf("%v%v", dc.Amount, dc.Denom), dc.String())
+	b.Log(dc.String())
 }

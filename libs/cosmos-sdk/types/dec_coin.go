@@ -1,9 +1,12 @@
 package types
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/tendermint/go-amino"
 
 	"github.com/pkg/errors"
 )
@@ -15,6 +18,50 @@ import (
 type DecCoin struct {
 	Denom  string `json:"denom"`
 	Amount Dec    `json:"amount"`
+}
+
+func (coin *DecCoin) UnmarshalFromAmino(cdc *amino.Codec, data []byte) error {
+	var dataLen uint64 = 0
+	var subData []byte
+
+	for {
+		data = data[dataLen:]
+
+		if len(data) <= 0 {
+			break
+		}
+
+		pos, aminoType, err := amino.ParseProtoPosAndTypeMustOneByte(data[0])
+		if err != nil {
+			return err
+		}
+		data = data[1:]
+
+		if aminoType == amino.Typ3_ByteLength {
+			var n int
+			dataLen, n, err = amino.DecodeUvarint(data)
+			if err != nil {
+				return err
+			}
+
+			data = data[n:]
+			if uint64(len(data)) < dataLen {
+				return errors.New("not enough data")
+			}
+			subData = data[:dataLen]
+		}
+
+		switch pos {
+		case 1:
+			coin.Denom = string(subData)
+		case 2:
+			err = coin.Amount.UnmarshalFromAmino(cdc, subData)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // NewDecCoin creates a new DecCoin instance from an Int.
@@ -125,6 +172,19 @@ func (coin DecCoin) TruncateDecimal() (Coin, DecCoin) {
 	return NewCoin(coin.Denom, truncated), NewDecCoinFromDec(coin.Denom, change)
 }
 
+// TruncateWithPrec returns a Coin with a truncated coin and a DecCoin for the
+// change with prec, Note, the change may be zero.
+func (coin DecCoin) TruncateWithPrec(prec int64) (Coin, DecCoin) {
+	if prec < 0 || prec > Precision {
+		panic(fmt.Sprintf("prec range error, %d", prec))
+	}
+
+	tempTruncated := coin.Amount.TruncateWithPrec(prec)
+	truncated := NewDecFromIntWithPrec(tempTruncated, prec)
+	change := coin.Amount.Sub(truncated)
+	return NewCoin(coin.Denom, truncated), NewDecCoinFromDec(coin.Denom, change)
+}
+
 // IsPositive returns true if coin amount is positive.
 //
 // TODO: Remove once unsigned integers are used.
@@ -142,7 +202,11 @@ func (coin DecCoin) IsNegative() bool {
 // String implements the Stringer interface for DecCoin. It returns a
 // human-readable representation of a decimal coin.
 func (coin DecCoin) String() string {
-	return fmt.Sprintf("%v%v", coin.Amount, coin.Denom)
+	amountStr := coin.Amount.String()
+	coinStr := make([]byte, len(amountStr)+len(coin.Denom))
+	copy(coinStr, amountStr)
+	copy(coinStr[len(amountStr):], coin.Denom)
+	return amino.BytesToStr(coinStr)
 }
 
 // IsValid returns true if the DecCoin has a non-negative amount and the denom is vaild.
@@ -151,6 +215,51 @@ func (coin DecCoin) IsValid() bool {
 		return false
 	}
 	return !coin.IsNegative()
+}
+
+func (coin DecCoin) MarshalToAmino(cdc *amino.Codec) ([]byte, error) {
+	buf := bytes.NewBuffer(make([]byte, 0, coin.AminoSize(cdc)))
+	err := coin.MarshalAminoTo(cdc, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (coin DecCoin) MarshalAminoTo(cdc *amino.Codec, buf *bytes.Buffer) error {
+	// field 1
+	if coin.Denom != "" {
+		const pbKey = 1<<3 | 2
+		err := amino.EncodeStringWithKeyToBuffer(buf, coin.Denom, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+	// field 2
+	{
+		const pbKey = 2<<3 | 2
+		data, err := coin.Amount.MarshalToAmino(cdc)
+		if err != nil {
+			return err
+		}
+		err = amino.EncodeByteSliceWithKeyToBuffer(buf, data, pbKey)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (coin DecCoin) AminoSize(cdc *amino.Codec) int {
+	size := 0
+	if coin.Denom != "" {
+		size += 1 + amino.EncodedStringSize(coin.Denom)
+	}
+	coinSize := coin.Amount.AminoSize(cdc)
+	// coinSize must greater than 0 if coin.Amount.MarshalToAmino() is success
+	size += 1 + amino.UvarintSize(uint64(coinSize)) + coinSize
+	return size
 }
 
 // ----------------------------------------------------------------------------
@@ -200,6 +309,9 @@ func (coins DecCoins) String() string {
 	if len(coins) == 0 {
 		return ""
 	}
+	if len(coins) == 1 {
+		return coins[0].String()
+	}
 
 	out := ""
 	for _, coin := range coins {
@@ -215,6 +327,22 @@ func (coins DecCoins) String() string {
 func (coins DecCoins) TruncateDecimal() (truncatedCoins Coins, changeCoins DecCoins) {
 	for _, coin := range coins {
 		truncated, change := coin.TruncateDecimal()
+		if !truncated.IsZero() {
+			truncatedCoins = truncatedCoins.Add(truncated)
+		}
+		if !change.IsZero() {
+			changeCoins = changeCoins.Add(change)
+		}
+	}
+
+	return truncatedCoins, changeCoins
+}
+
+// TruncateWithPrec returns the coins with truncated fix coins and returns the
+// change with prec. Note, it will not return any zero-amount coins in either the truncated or change coins.
+func (coins DecCoins) TruncateWithPrec(prec int64) (truncatedCoins Coins, changeCoins DecCoins) {
+	for _, coin := range coins {
+		truncated, change := coin.TruncateWithPrec(prec)
 		if !truncated.IsZero() {
 			truncatedCoins = truncatedCoins.Add(truncated)
 		}
@@ -564,18 +692,24 @@ func (coins DecCoins) IsAllPositive() bool {
 }
 
 func removeZeroDecCoins(coins DecCoins) DecCoins {
-	i, l := 0, len(coins)
-	for i < l {
+	for i := 0; i < len(coins); i++ {
 		if coins[i].IsZero() {
-			// remove coin
-			coins = append(coins[:i], coins[i+1:]...)
-			l--
-		} else {
-			i++
+			break
+		} else if i == len(coins)-1 {
+			return coins
 		}
 	}
+	var result []DecCoin
+	if len(coins) > 0 {
+		result = make([]DecCoin, 0, len(coins)-1)
+	}
 
-	return coins[:i]
+	for _, coin := range coins {
+		if !coin.IsZero() {
+			result = append(result, coin)
+		}
+	}
+	return result
 }
 
 //-----------------------------------------------------------------------------
@@ -583,7 +717,7 @@ func removeZeroDecCoins(coins DecCoins) DecCoins {
 
 var _ sort.Interface = Coins{}
 
-//nolint
+// nolint
 func (coins DecCoins) Len() int           { return len(coins) }
 func (coins DecCoins) Less(i, j int) bool { return coins[i].Denom < coins[j].Denom }
 func (coins DecCoins) Swap(i, j int)      { coins[i], coins[j] = coins[j], coins[i] }
@@ -604,6 +738,9 @@ func ParseDecCoin(coinStr string) (coin DecCoin, err error) {
 
 	matches := reDecCoin.FindStringSubmatch(coinStr)
 	if matches == nil {
+		if strings.Contains(coinStr, "ibc/") {
+			return IBCParseDecCoin(coinStr)
+		}
 		return DecCoin{}, fmt.Errorf("invalid decimal coin expression: %s", coinStr)
 	}
 
@@ -651,4 +788,3 @@ func ParseDecCoins(coinsStr string) (DecCoins, error) {
 
 	return coins, nil
 }
-

@@ -2,7 +2,6 @@ package v2
 
 import (
 	"fmt"
-
 	"github.com/okex/exchain/libs/tendermint/p2p"
 	tmState "github.com/okex/exchain/libs/tendermint/state"
 	"github.com/okex/exchain/libs/tendermint/types"

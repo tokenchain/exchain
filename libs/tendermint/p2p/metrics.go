@@ -4,6 +4,7 @@ import (
 	"github.com/go-kit/kit/metrics"
 	"github.com/go-kit/kit/metrics/discard"
 	"github.com/go-kit/kit/metrics/prometheus"
+	"github.com/okex/exchain/libs/tendermint/libs/fastmetrics"
 	stdprometheus "github.com/prometheus/client_golang/prometheus"
 )
 
@@ -27,6 +28,11 @@ type Metrics struct {
 	NumTxs metrics.Gauge
 }
 
+type peerChMetric struct {
+	PeerReceiveBytesTotal map[byte]metrics.Counter
+	PeerSendBytesTotal    map[byte]metrics.Counter
+}
+
 // PrometheusMetrics returns Metrics build using Prometheus client library.
 // Optionally, labels can be provided along with their values ("foo",
 // "fooValue").
@@ -42,13 +48,13 @@ func PrometheusMetrics(namespace string, labelsAndValues ...string) *Metrics {
 			Name:      "peers",
 			Help:      "Number of peers.",
 		}, labels).With(labelsAndValues...),
-		PeerReceiveBytesTotal: prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		PeerReceiveBytesTotal: fastmetrics.NewCounterFrom(stdprometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: MetricsSubsystem,
 			Name:      "peer_receive_bytes_total",
 			Help:      "Number of bytes received from a given peer.",
 		}, append(labels, "peer_id", "chID")).With(labelsAndValues...),
-		PeerSendBytesTotal: prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		PeerSendBytesTotal: fastmetrics.NewCounterFrom(stdprometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: MetricsSubsystem,
 			Name:      "peer_send_bytes_total",

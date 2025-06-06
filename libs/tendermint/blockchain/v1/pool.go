@@ -280,7 +280,6 @@ func (pool *BlockPool) BlockAndPeerAtHeight(height int64) (bData *BlockData, err
 	}
 
 	return &BlockData{peer: peer, block: block}, nil
-
 }
 
 // FirstTwoBlocksAndPeers returns the blocks and the delivery peers at pool's height H and H+1.

@@ -1,20 +1,29 @@
-package types_test
+package types
 
 import (
 	"encoding/json"
 	"fmt"
+	authtypes "github.com/okex/exchain/libs/cosmos-sdk/x/auth/types"
+	"math/big"
 	"testing"
+
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/okex/exchain/libs/cosmos-sdk/x/auth/exported"
+	tmcrypto "github.com/okex/exchain/libs/tendermint/crypto"
+	"github.com/stretchr/testify/require"
 
 	"github.com/stretchr/testify/suite"
 
 	tmamino "github.com/okex/exchain/libs/tendermint/crypto/encoding/amino"
 	"github.com/okex/exchain/libs/tendermint/crypto/secp256k1"
 
+	"github.com/okex/exchain/app/crypto/ethsecp256k1"
 	sdk "github.com/okex/exchain/libs/cosmos-sdk/types"
 	"github.com/okex/exchain/libs/cosmos-sdk/x/auth"
 
-	"github.com/okex/exchain/app/crypto/ethsecp256k1"
-	"github.com/okex/exchain/app/types"
+	"github.com/okex/exchain/libs/cosmos-sdk/codec"
+	"github.com/okex/exchain/libs/tendermint/crypto/ed25519"
+	"github.com/okex/exchain/libs/tendermint/crypto/sr25519"
 )
 
 func init() {
@@ -25,15 +34,15 @@ func init() {
 type AccountTestSuite struct {
 	suite.Suite
 
-	account *types.EthAccount
+	account *EthAccount
 }
 
 func (suite *AccountTestSuite) SetupTest() {
 	pubkey := secp256k1.GenPrivKey().PubKey()
 	addr := sdk.AccAddress(pubkey.Address())
-	balance := sdk.NewCoins(types.NewPhotonCoin(sdk.OneInt()))
+	balance := sdk.NewCoins(NewPhotonCoin(sdk.OneInt()))
 	baseAcc := auth.NewBaseAccount(addr, balance, pubkey, 10, 50)
-	suite.account = &types.EthAccount{
+	suite.account = &EthAccount{
 		BaseAccount: baseAcc,
 		CodeHash:    []byte{1, 2},
 	}
@@ -51,10 +60,10 @@ func (suite *AccountTestSuite) TestEthAccount_Balance() {
 		initialCoins sdk.Coins
 		amount       sdk.Int
 	}{
-		{"positive diff", types.NativeToken, sdk.Coins{}, sdk.OneInt()},
-		{"zero diff, same coin", types.NativeToken, sdk.NewCoins(types.NewPhotonCoin(sdk.ZeroInt())), sdk.ZeroInt()},
-		{"zero diff, other coin", sdk.DefaultBondDenom, sdk.NewCoins(types.NewPhotonCoin(sdk.ZeroInt())), sdk.ZeroInt()},
-		{"negative diff", types.NativeToken, sdk.NewCoins(types.NewPhotonCoin(sdk.NewInt(10))), sdk.NewInt(1)},
+		{"positive diff", NativeToken, sdk.Coins{}, sdk.OneInt()},
+		{"zero diff, same coin", NativeToken, sdk.NewCoins(NewPhotonCoin(sdk.ZeroInt())), sdk.ZeroInt()},
+		{"zero diff, other coin", sdk.DefaultBondDenom, sdk.NewCoins(NewPhotonCoin(sdk.ZeroInt())), sdk.ZeroInt()},
+		{"negative diff", NativeToken, sdk.NewCoins(NewPhotonCoin(sdk.NewInt(10))), sdk.NewInt(1)},
 	}
 
 	for _, tc := range testCases {
@@ -77,7 +86,7 @@ func (suite *AccountTestSuite) TestEthermintAccountJSON() {
 	suite.Require().NoError(err)
 	suite.Require().Equal(string(bz1), string(bz))
 
-	var a types.EthAccount
+	var a EthAccount
 	suite.Require().NoError(a.UnmarshalJSON(bz))
 	suite.Require().Equal(suite.account.String(), a.String())
 	suite.Require().Equal(suite.account.PubKey, a.PubKey)
@@ -104,7 +113,7 @@ func (suite *AccountTestSuite) TestSecpPubKeyJSON() {
 
 func (suite *AccountTestSuite) TestEthermintAccount_String() {
 	config := sdk.GetConfig()
-	types.SetBech32Prefixes(config)
+	SetBech32Prefixes(config)
 
 	bech32pubkey, err := sdk.Bech32ifyPubKey(sdk.Bech32PubKeyTypeAccPub, suite.account.PubKey)
 	suite.Require().NoError(err)
@@ -138,7 +147,7 @@ func (suite *AccountTestSuite) TestEthermintAccount_MarshalJSON() {
 	suite.Require().NoError(err)
 	suite.Require().Contains(string(bz), suite.account.EthAddress().String())
 
-	res := new(types.EthAccount)
+	res := new(EthAccount)
 	err = res.UnmarshalJSON(bz)
 	suite.Require().NoError(err)
 	suite.Require().Equal(suite.account, res)
@@ -152,7 +161,7 @@ func (suite *AccountTestSuite) TestEthermintAccount_MarshalJSON() {
 		suite.account.EthAddress().String(), bech32pubkey,
 	)
 
-	res = new(types.EthAccount)
+	res = new(EthAccount)
 	err = res.UnmarshalJSON([]byte(jsonAcc))
 	suite.Require().NoError(err)
 	suite.Require().Equal(suite.account.Address.String(), res.Address.String())
@@ -162,7 +171,7 @@ func (suite *AccountTestSuite) TestEthermintAccount_MarshalJSON() {
 		bech32pubkey,
 	)
 
-	res = new(types.EthAccount)
+	res = new(EthAccount)
 	err = res.UnmarshalJSON([]byte(jsonAcc))
 	suite.Require().Error(err, "should fail if both address are empty")
 
@@ -172,7 +181,235 @@ func (suite *AccountTestSuite) TestEthermintAccount_MarshalJSON() {
 		suite.account.Address.String(), bech32pubkey,
 	)
 
-	res = new(types.EthAccount)
+	res = new(EthAccount)
 	err = res.UnmarshalJSON([]byte(jsonAcc))
 	suite.Require().Error(err, "should fail if addresses mismatch")
+}
+
+func TestEthAccountAmino(t *testing.T) {
+	cdc := codec.New()
+	cdc.RegisterInterface((*exported.Account)(nil), nil)
+	RegisterCodec(cdc)
+
+	cdc.RegisterInterface((*tmcrypto.PubKey)(nil), nil)
+	cdc.RegisterConcrete(ed25519.PubKeyEd25519{},
+		ed25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(sr25519.PubKeySr25519{},
+		sr25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(secp256k1.PubKeySecp256k1{},
+		secp256k1.PubKeyAminoName, nil)
+
+	privKey := secp256k1.GenPrivKey()
+	pubKey := privKey.PubKey()
+	addr := sdk.AccAddress(pubKey.Address())
+
+	accounts := []EthAccount{
+		{},
+		{
+			auth.NewBaseAccount(
+				addr,
+				sdk.NewCoins(NewPhotonCoin(sdk.OneInt()), sdk.Coin{"heco", sdk.Dec{big.NewInt(1)}}),
+				pubKey,
+				1,
+				1,
+			),
+			ethcrypto.Keccak256(nil),
+		},
+		{
+			auth.NewBaseAccount(
+				addr,
+				sdk.NewCoins(NewPhotonCoin(sdk.ZeroInt()), sdk.Coin{"heco", sdk.Dec{big.NewInt(0)}}),
+				pubKey,
+				0,
+				0,
+			),
+			ethcrypto.Keccak256(nil),
+		},
+		{
+			auth.NewBaseAccount(
+				nil,
+				nil,
+				nil,
+				0,
+				0,
+			),
+			ethcrypto.Keccak256(nil),
+		},
+		{
+			BaseAccount: &auth.BaseAccount{},
+		},
+	}
+
+	for _, testAccount := range accounts {
+		data, err := cdc.MarshalBinaryBare(&testAccount)
+		if err != nil {
+			t.Fatal("marshal error")
+		}
+		require.Equal(t, len(data), 4+testAccount.AminoSize(cdc))
+
+		var accountFromAmino exported.Account
+
+		err = cdc.UnmarshalBinaryBare(data, &accountFromAmino)
+		if err != nil {
+			t.Fatal("unmarshal error")
+		}
+
+		var accountFromUnmarshaller exported.Account
+		v, err := cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(data, (*exported.Account)(nil))
+		require.NoError(t, err)
+		accountFromUnmarshaller, ok := v.(exported.Account)
+		require.True(t, ok)
+
+		require.EqualValues(t, accountFromAmino, accountFromUnmarshaller)
+
+		var ethAccount EthAccount
+		err = ethAccount.UnmarshalFromAmino(cdc, data[4:])
+		require.NoError(t, err)
+		require.EqualValues(t, accountFromAmino, &ethAccount)
+
+		dataFromMarshaller, err := cdc.MarshalBinaryBareWithRegisteredMarshaller(&testAccount)
+		require.NoError(t, err)
+		require.EqualValues(t, data, dataFromMarshaller)
+
+		dataFromSizer, err := cdc.MarshalBinaryWithSizer(&testAccount, false)
+		require.NoError(t, err)
+		require.EqualValues(t, data, dataFromSizer)
+
+		dataFromMarshaller, err = ethAccount.MarshalToAmino(cdc)
+		if dataFromMarshaller == nil {
+			dataFromMarshaller = []byte{}
+		}
+		require.Equal(t, data[4:], dataFromMarshaller)
+	}
+}
+
+func BenchmarkEthAccountAminoUnmarshal(b *testing.B) {
+	cdc := codec.New()
+	cdc.RegisterInterface((*exported.Account)(nil), nil)
+	RegisterCodec(cdc)
+
+	cdc.RegisterInterface((*tmcrypto.PubKey)(nil), nil)
+	cdc.RegisterConcrete(ed25519.PubKeyEd25519{},
+		ed25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(sr25519.PubKeySr25519{},
+		sr25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(secp256k1.PubKeySecp256k1{},
+		secp256k1.PubKeyAminoName, nil)
+
+	privKey := secp256k1.GenPrivKey()
+	pubKey := privKey.PubKey()
+	addr := sdk.AccAddress(pubKey.Address())
+
+	balance := sdk.NewCoins(NewPhotonCoin(sdk.OneInt()))
+	testAccount := EthAccount{
+		BaseAccount: auth.NewBaseAccount(addr, balance, pubKey, 1, 1),
+		CodeHash:    ethcrypto.Keccak256(nil),
+	}
+
+	data, _ := cdc.MarshalBinaryBare(&testAccount)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var account exported.Account
+			_ = cdc.UnmarshalBinaryBare(data, &account)
+		}
+	})
+
+	b.Run("unmarshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			// var account exported.Account
+			_, _ = cdc.UnmarshalBinaryBareWithRegisteredUnmarshaller(data, (*exported.Account)(nil))
+		}
+	})
+}
+
+func BenchmarkEthAccountAminoMarshal(b *testing.B) {
+	cdc := codec.New()
+	cdc.RegisterInterface((*exported.Account)(nil), nil)
+	RegisterCodec(cdc)
+
+	cdc.RegisterInterface((*tmcrypto.PubKey)(nil), nil)
+	cdc.RegisterConcrete(ed25519.PubKeyEd25519{},
+		ed25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(sr25519.PubKeySr25519{},
+		sr25519.PubKeyAminoName, nil)
+	cdc.RegisterConcrete(secp256k1.PubKeySecp256k1{},
+		secp256k1.PubKeyAminoName, nil)
+
+	privKey := secp256k1.GenPrivKey()
+	pubKey := privKey.PubKey()
+	addr := sdk.AccAddress(pubKey.Address())
+
+	balance := sdk.NewCoins(NewPhotonCoin(sdk.OneInt()))
+	testAccount := EthAccount{
+		BaseAccount: auth.NewBaseAccount(addr, balance, pubKey, 1, 1),
+		CodeHash:    ethcrypto.Keccak256(nil),
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.Run("amino", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			data, _ := cdc.MarshalBinaryBare(&testAccount)
+			_ = data
+		}
+	})
+
+	b.Run("marshaller", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			data, _ := cdc.MarshalBinaryBareWithRegisteredMarshaller(&testAccount)
+			_ = data
+		}
+	})
+
+	b.Run("sizer", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			data, _ := cdc.MarshalBinaryWithSizer(&testAccount, false)
+			_ = data
+		}
+	})
+}
+
+func (acc EthAccount) utOldCopy() sdk.Account {
+	return &EthAccount{
+		authtypes.NewBaseAccount(acc.Address, acc.Coins, acc.PubKey, acc.AccountNumber, acc.Sequence),
+		acc.CodeHash,
+	}
+}
+
+func BenchmarkEthAccountCopy(b *testing.B) {
+	privKey := secp256k1.GenPrivKey()
+	pubKey := privKey.PubKey()
+	addr := sdk.AccAddress(pubKey.Address())
+
+	balance := sdk.NewCoins(NewPhotonCoin(sdk.OneInt()))
+	testAccount := EthAccount{
+		BaseAccount: auth.NewBaseAccount(addr, balance, pubKey, 1, 1),
+		CodeHash:    ethcrypto.Keccak256(nil),
+	}
+
+	var copied sdk.Account
+
+	b.Run("copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			copied = testAccount.Copy()
+		}
+	})
+	b.Run("old", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			copied = testAccount.utOldCopy()
+		}
+	})
+	_ = copied
 }
